@@ -27,16 +27,17 @@ app = FastAPI(title="Asymmetric AI Backend", version="0.9.0")
 ENV = os.getenv("ENV", "dev").lower().strip()  # dev | prod
 IS_PROD = ENV == "prod"
 
-# Vercel URL(s) here
-# Example: FRONTEND_ORIGINS="https://asymmetric-ai.vercel.app,http://localhost:5173"
-FRONTEND_ORIGINS_RAW = os.getenv("FRONTEND_ORIGINS", "")
-if FRONTEND_ORIGINS_RAW.strip():
+# FRONTEND_ORIGINS should be comma-separated (IMPORTANT for cookies with Vercel)
+# Example:
+# FRONTEND_ORIGINS="http://localhost:5173,http://127.0.0.1:5173,https://yourapp.vercel.app,https://yourapp-git-main-xxx.vercel.app"
+DEFAULT_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+if FRONTEND_ORIGINS_RAW:
     FRONTEND_ORIGINS = [x.strip() for x in FRONTEND_ORIGINS_RAW.split(",") if x.strip()]
 else:
-    FRONTEND_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+    FRONTEND_ORIGINS = DEFAULT_ORIGINS
 
 # =========================
-# CORS
+# CORS (NO WILDCARDS when using credentials)
 # =========================
 app.add_middleware(
     CORSMiddleware,
@@ -52,41 +53,50 @@ app.add_middleware(
 DB_PATH = os.getenv("ASYM_DB_PATH", "asymmetric_demo.db")
 DB_LOCK = threading.Lock()
 
+
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
+
 def now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
 
 def _column_exists(cur: sqlite3.Cursor, table: str, col: str) -> bool:
     cur.execute(f"PRAGMA table_info({table})")
     cols = [r[1] for r in cur.fetchall()]
     return col in cols
 
+
 def init_db() -> None:
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
 
-        cur.execute("""
+        cur.execute(
+            """
         CREATE TABLE IF NOT EXISTS users (
             email TEXT PRIMARY KEY,
             password_hash TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
-        """)
+        """
+        )
 
-        cur.execute("""
+        cur.execute(
+            """
         CREATE TABLE IF NOT EXISTS sessions (
             token TEXT PRIMARY KEY,
             email TEXT NOT NULL,
             created_at INTEGER NOT NULL
         )
-        """)
+        """
+        )
 
-        cur.execute("""
+        cur.execute(
+            """
         CREATE TABLE IF NOT EXISTS exchange_keys (
             email TEXT PRIMARY KEY,
             exchange TEXT NOT NULL,
@@ -95,17 +105,21 @@ def init_db() -> None:
             passphrase TEXT,
             created_at TEXT NOT NULL
         )
-        """)
+        """
+        )
 
-        cur.execute("""
+        cur.execute(
+            """
         CREATE TABLE IF NOT EXISTS user_state (
             email TEXT PRIMARY KEY,
             equity REAL NOT NULL,
             session_id INTEGER NOT NULL DEFAULT 0
         )
-        """)
+        """
+        )
 
-        cur.execute("""
+        cur.execute(
+            """
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT NOT NULL,
@@ -125,25 +139,30 @@ def init_db() -> None:
             reason TEXT,
             session_id INTEGER NOT NULL DEFAULT 0
         )
-        """)
+        """
+        )
 
-        cur.execute("""
+        cur.execute(
+            """
         CREATE TABLE IF NOT EXISTS admin_settings (
             k TEXT PRIMARY KEY,
             v TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
-        """)
+        """
+        )
 
         # Password reset tokens (demo)
-        cur.execute("""
+        cur.execute(
+            """
         CREATE TABLE IF NOT EXISTS password_resets (
             token TEXT PRIMARY KEY,
             email TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             used INTEGER NOT NULL DEFAULT 0
         )
-        """)
+        """
+        )
 
         # safe migrations
         if not _column_exists(cur, "trades", "reason"):
@@ -154,7 +173,7 @@ def init_db() -> None:
             cur.execute("ALTER TABLE user_state ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
 
         # seed defaults if missing
-        def _set_default(key: str, value: str):
+        def _set_default(key: str, value: str) -> None:
             cur.execute("SELECT v FROM admin_settings WHERE k=?", (key,))
             if not cur.fetchone():
                 cur.execute(
@@ -167,6 +186,7 @@ def init_db() -> None:
 
         conn.commit()
         conn.close()
+
 
 init_db()
 
@@ -189,21 +209,26 @@ TF_MAP: Dict[str, str] = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
 
 DUBAI_TZ = timezone(timedelta(hours=4))
 
+
 def now_dubai() -> datetime:
     return datetime.now(tz=DUBAI_TZ)
+
 
 def dubai_day_key(dt: Optional[datetime] = None) -> str:
     d = dt or now_dubai()
     return d.strftime("%Y-%m-%d")
 
+
 def hash_pw(pw: str) -> str:
     return hashlib.sha256(pw.encode()).hexdigest()
+
 
 def mask_key(s: str) -> str:
     s = (s or "").strip()
     if len(s) <= 8:
         return "*" * len(s)
     return s[:4] + ("*" * (len(s) - 8)) + s[-4:]
+
 
 def ensure_user_state(email: str) -> None:
     with DB_LOCK:
@@ -219,6 +244,7 @@ def ensure_user_state(email: str) -> None:
             conn.commit()
         conn.close()
 
+
 def get_equity(email: str) -> float:
     ensure_user_state(email)
     with DB_LOCK:
@@ -229,6 +255,7 @@ def get_equity(email: str) -> float:
         conn.close()
     return float(row["equity"])
 
+
 def set_equity(email: str, equity: float) -> None:
     ensure_user_state(email)
     with DB_LOCK:
@@ -237,6 +264,7 @@ def set_equity(email: str, equity: float) -> None:
         cur.execute("UPDATE user_state SET equity = ? WHERE email = ?", (float(equity), email))
         conn.commit()
         conn.close()
+
 
 def get_session_id(email: str) -> int:
     ensure_user_state(email)
@@ -248,6 +276,7 @@ def get_session_id(email: str) -> int:
         conn.close()
     return int(row["session_id"] or 0)
 
+
 def set_session_id(email: str, sid: int) -> None:
     ensure_user_state(email)
     with DB_LOCK:
@@ -257,6 +286,7 @@ def set_session_id(email: str, sid: int) -> None:
         conn.commit()
         conn.close()
 
+
 def get_exchange(email: str) -> Optional[sqlite3.Row]:
     with DB_LOCK:
         conn = db()
@@ -265,6 +295,7 @@ def get_exchange(email: str) -> Optional[sqlite3.Row]:
         row = cur.fetchone()
         conn.close()
     return row
+
 
 def require_user(session: Optional[str] = Cookie(default=None)) -> Dict[str, str]:
     if not session:
@@ -279,29 +310,28 @@ def require_user(session: Optional[str] = Cookie(default=None)) -> Dict[str, str
         raise HTTPException(status_code=401, detail="Unauthorized")
     return {"email": row["email"]}
 
+
 # =========================
-# ADMIN (Option B)
+# ADMIN
 # =========================
 DEMO_EMAIL = "admin@demo.com"
 DEMO_PASS = "demo123"
 
-# Example Render env:
-# ADMIN_EMAILS="admin@demo.com,devio@gmail.com"
 ADMIN_EMAILS = set(
     e.strip().lower()
     for e in os.getenv("ADMIN_EMAILS", DEMO_EMAIL).split(",")
     if e.strip()
 )
 
-# One-time emergency token to reset admin password from API
-# ADMIN_FORCE_RESET_TOKEN="something-long"
 ADMIN_FORCE_RESET_TOKEN = os.getenv("ADMIN_FORCE_RESET_TOKEN", "")
+
 
 def require_admin(user=Depends(require_user)) -> str:
     email = user["email"].strip().lower()
     if email not in ADMIN_EMAILS:
         raise HTTPException(status_code=403, detail="Admin access only")
     return email
+
 
 def admin_get_setting(key: str, default: str) -> str:
     with DB_LOCK:
@@ -311,6 +341,7 @@ def admin_get_setting(key: str, default: str) -> str:
         row = cur.fetchone()
         conn.close()
     return (row["v"] if row else default)
+
 
 def admin_set_setting(key: str, value: str) -> None:
     with DB_LOCK:
@@ -328,14 +359,17 @@ def admin_set_setting(key: str, value: str) -> None:
         conn.commit()
         conn.close()
 
+
 def signup_is_enabled() -> bool:
     return admin_get_setting("signup_enabled", "true").lower() == "true"
+
 
 def seat_capacity() -> int:
     try:
         return int(admin_get_setting("seat_capacity", "50"))
     except Exception:
         return 50
+
 
 def seats_used() -> int:
     with DB_LOCK:
@@ -346,7 +380,8 @@ def seats_used() -> int:
         conn.close()
     return n
 
-# Seed demo admin user if missing (local/demo only)
+
+# Seed demo admin user if missing
 with DB_LOCK:
     conn = db()
     cur = conn.cursor()
@@ -372,9 +407,11 @@ def config():
         "frontend_origins": FRONTEND_ORIGINS,
     }
 
+
 @app.get("/health")
 def health():
     return {"health": "green", "binance_env": BINANCE_ENV, "db_path": DB_PATH, "env": ENV}
+
 
 # =========================
 # AUTH MODELS
@@ -383,36 +420,39 @@ class AuthIn(BaseModel):
     email: str
     password: str
 
+
 class SessionOut(BaseModel):
     ok: bool
     email: Optional[str] = None
 
+
 # =========================
-# COOKIE SETTINGS
+# COOKIE SETTINGS (FIXED FOR VERCEL)
 # =========================
 def set_session_cookie(response: Response, token: str) -> None:
     """
     Dev: samesite=lax, secure=False
-    Prod (Vercel->Render cross-site): samesite=none, secure=True
+    Prod (Vercel -> Render cross-site cookies): samesite=none, secure=True
     """
+    base = dict(
+        key="session",
+        value=token,
+        httponly=True,
+        max_age=60 * 60 * 24 * 7,
+        path="/",
+    )
     if IS_PROD:
-        response.set_cookie(
-            key="session",
-            value=token,
-            httponly=True,
-            samesite="none",
-            secure=True,
-            max_age=60 * 60 * 24 * 7,
-        )
+        response.set_cookie(**base, samesite="none", secure=True)
     else:
-        response.set_cookie(
-            key="session",
-            value=token,
-            httponly=True,
-            samesite="lax",
-            secure=False,
-            max_age=60 * 60 * 24 * 7,
-        )
+        response.set_cookie(**base, samesite="lax", secure=False)
+
+
+def clear_session_cookie(response: Response) -> None:
+    if IS_PROD:
+        response.delete_cookie("session", path="/", samesite="none", secure=True)
+    else:
+        response.delete_cookie("session", path="/", samesite="lax", secure=False)
+
 
 # =========================
 # AUTH ENDPOINTS
@@ -445,6 +485,7 @@ def signup(payload: AuthIn):
 
     return {"ok": True}
 
+
 @app.post("/auth/login", response_model=SessionOut)
 def login(payload: AuthIn, response: Response):
     email = payload.email.strip().lower()
@@ -460,18 +501,19 @@ def login(payload: AuthIn, response: Response):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = secrets.token_urlsafe(32)
-    now = int(time.time())
+    now_ts = int(time.time())
 
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("INSERT INTO sessions(token, email, created_at) VALUES(?, ?, ?)", (token, email, now))
+        cur.execute("INSERT INTO sessions(token, email, created_at) VALUES(?, ?, ?)", (token, email, now_ts))
         conn.commit()
         conn.close()
 
     set_session_cookie(response, token)
     ensure_user_state(email)
     return {"ok": True, "email": email}
+
 
 @app.post("/auth/logout")
 def logout(response: Response, session: Optional[str] = Cookie(default=None)):
@@ -483,8 +525,9 @@ def logout(response: Response, session: Optional[str] = Cookie(default=None)):
             conn.commit()
             conn.close()
 
-    response.delete_cookie("session")
+    clear_session_cookie(response)
     return {"ok": True}
+
 
 @app.get("/session", response_model=SessionOut)
 def session_me(session: Optional[str] = Cookie(default=None)):
@@ -498,15 +541,18 @@ def session_me(session: Optional[str] = Cookie(default=None)):
         conn.close()
     return {"ok": bool(row), "email": row["email"] if row else None}
 
+
 # =========================
 # FORGOT PASSWORD (DEMO)
 # =========================
 class ForgotIn(BaseModel):
     email: str
 
+
 class ResetIn(BaseModel):
     token: str
     new_password: str
+
 
 @app.post("/auth/forgot")
 def auth_forgot(payload: ForgotIn):
@@ -525,8 +571,7 @@ def auth_forgot(payload: ForgotIn):
         u = cur.fetchone()
         if not u:
             conn.close()
-            # do not leak if user exists
-            return {"ok": True}
+            return {"ok": True}  # don't leak existence
 
         token = secrets.token_urlsafe(32)
         cur.execute(
@@ -537,6 +582,7 @@ def auth_forgot(payload: ForgotIn):
         conn.close()
 
     return {"ok": True, "reset_token": token}
+
 
 @app.post("/auth/reset")
 def auth_reset(payload: ResetIn):
@@ -558,7 +604,6 @@ def auth_reset(payload: ResetIn):
             conn.close()
             raise HTTPException(status_code=400, detail="Token already used")
 
-        # expire after 30 minutes
         created_at = int(row["created_at"])
         if int(time.time()) - created_at > 1800:
             conn.close()
@@ -567,18 +612,18 @@ def auth_reset(payload: ResetIn):
         email = row["email"]
         cur.execute("UPDATE users SET password_hash=? WHERE email=?", (hash_pw(new_pw), email))
         cur.execute("UPDATE password_resets SET used=1 WHERE token=?", (token,))
-        # kill sessions
         cur.execute("DELETE FROM sessions WHERE email=?", (email,))
         conn.commit()
         conn.close()
 
     return {"ok": True}
 
-# Emergency admin force reset (if you forget admin pass)
+
 class AdminForceResetIn(BaseModel):
     token: str
     email: str
     new_password: str
+
 
 @app.post("/admin/force-reset-password")
 def admin_force_reset(payload: AdminForceResetIn):
@@ -590,7 +635,6 @@ def admin_force_reset(payload: AdminForceResetIn):
         raise HTTPException(status_code=400, detail="email required")
     if email not in ADMIN_EMAILS:
         raise HTTPException(status_code=400, detail="email is not an admin")
-
     if not payload.new_password or len(payload.new_password) < 4:
         raise HTTPException(status_code=400, detail="new_password min 4 chars")
 
@@ -612,6 +656,7 @@ def admin_force_reset(payload: AdminForceResetIn):
 
     return {"ok": True}
 
+
 # =========================
 # EXCHANGE CONNECT
 # =========================
@@ -620,6 +665,7 @@ class ExchangeConnectIn(BaseModel):
     api_key: str
     api_secret: str
     passphrase: Optional[str] = None
+
 
 @app.get("/exchange/status")
 def exchange_status(user=Depends(require_user)):
@@ -633,6 +679,7 @@ def exchange_status(user=Depends(require_user)):
         "api_key_masked": mask_key(row["api_key"]),
         "created_at": row["created_at"],
     }
+
 
 @app.post("/exchange/connect")
 def exchange_connect(payload: ExchangeConnectIn, user=Depends(require_user)):
@@ -669,6 +716,7 @@ def exchange_connect(payload: ExchangeConnectIn, user=Depends(require_user)):
 
     return {"ok": True, "binance_env": BINANCE_ENV}
 
+
 @app.post("/exchange/disconnect")
 def exchange_disconnect(user=Depends(require_user)):
     email = user["email"]
@@ -680,6 +728,7 @@ def exchange_disconnect(user=Depends(require_user)):
         conn.close()
     return {"ok": True}
 
+
 @app.get("/exchange/test")
 def exchange_test(user=Depends(require_user)):
     email = user["email"]
@@ -687,6 +736,7 @@ def exchange_test(user=Depends(require_user)):
     if not row:
         raise HTTPException(status_code=400, detail="No exchange connected.")
     return {"ok": True, "canTrade": False, "accountType": "DEMO", "note": "Demo mode only."}
+
 
 @app.get("/exchange/balance")
 def exchange_balance(user=Depends(require_user)):
@@ -696,6 +746,7 @@ def exchange_balance(user=Depends(require_user)):
         raise HTTPException(status_code=400, detail="No exchange connected.")
     eq = get_equity(email)
     return {"ok": True, "balances": [{"asset": "USDT", "free": eq, "locked": 0.0}], "note": "Demo balances only."}
+
 
 # =========================
 # MARKET (PUBLIC)
@@ -707,9 +758,11 @@ async def binance_price(symbol: str) -> float:
             raise HTTPException(status_code=400, detail=f"Binance price error: {r.text}")
         return float(r.json()["price"])
 
+
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
     return {"symbol": symbol.upper(), "price": await binance_price(symbol)}
+
 
 def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
     if tf not in TF_MAP:
@@ -724,11 +777,19 @@ def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str,
         out: List[Dict[str, Any]] = []
         for k in raw:
             out.append(
-                {"t": int(k[0]), "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])}
+                {
+                    "t": int(k[0]),
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "volume": float(k[5]),
+                }
             )
         return out
     except Exception:
         return []
+
 
 @app.get("/klines/{symbol}")
 def klines(symbol: str, tf: TF = Query("1h"), limit: int = Query(200, ge=20, le=1000)):
@@ -736,6 +797,7 @@ def klines(symbol: str, tf: TF = Query("1h"), limit: int = Query(200, ge=20, le=
     if not rows:
         raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or Binance blocked).")
     return {"symbol": symbol.upper(), "tf": tf, "klines": rows}
+
 
 # =========================
 # TRADING + RISK ENGINE (sandbox)
@@ -757,8 +819,10 @@ class Trade:
     equity_after: float
     reason: Optional[str] = None
 
+
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
 
 def presets_for_mode(mode: RiskMode) -> Dict[str, float]:
     return {
@@ -769,8 +833,10 @@ def presets_for_mode(mode: RiskMode) -> Dict[str, float]:
         "AGGRESSIVE": dict(size=0.85, sl=0.70, tp=1.50, leverage=8),
     }[mode]
 
+
 def default_max_trades_per_day(mode: RiskMode) -> int:
     return {"ULTRA_SAFE": 1, "SAFE": 2, "NORMAL": 3, "MINI_ASYM": 3, "AGGRESSIVE": 5}[mode]
+
 
 def build_reason(mode: RiskMode, equity: float, computed: Dict[str, float], extra: Optional[str] = None) -> str:
     growth = (equity - START_EQUITY) / START_EQUITY
@@ -793,6 +859,7 @@ def build_reason(mode: RiskMode, equity: float, computed: Dict[str, float], extr
     lines.append("Note: Demo sandbox trade PnL is simulated. No real orders placed.")
     return "\n".join(lines)
 
+
 def mini_asym_risk_engine(mode: RiskMode, equity: float) -> Dict[str, Any]:
     p = presets_for_mode(mode).copy()
     growth = (equity - START_EQUITY) / START_EQUITY
@@ -807,6 +874,7 @@ def mini_asym_risk_engine(mode: RiskMode, equity: float) -> Dict[str, Any]:
     }
     return {"allowed": True, "computed": computed, "reason": build_reason(mode, equity, computed)}
 
+
 class TradeIn(BaseModel):
     symbol: str
     side: Side
@@ -816,6 +884,7 @@ class TradeIn(BaseModel):
     tp: float
     leverage: float
 
+
 class RiskPreviewIn(BaseModel):
     symbol: str
     side: Side
@@ -824,6 +893,7 @@ class RiskPreviewIn(BaseModel):
     sl: float
     tp: float
     leverage: float
+
 
 @app.post("/risk/preview")
 def risk_preview(payload: RiskPreviewIn, user=Depends(require_user)):
@@ -845,6 +915,7 @@ def risk_preview(payload: RiskPreviewIn, user=Depends(require_user)):
         },
     }
 
+
 @app.get("/balance")
 def balance(user=Depends(require_user)):
     email = user["email"]
@@ -856,6 +927,7 @@ def balance(user=Depends(require_user)):
         row = cur.fetchone()
         conn.close()
     return {"total": equity, "equity_after_last_trade": equity, "last_trade": row["time"] if row else None}
+
 
 @app.get("/trades")
 def trades(
@@ -888,6 +960,7 @@ def trades(
         conn.close()
 
     return {"trades": [dict(r) for r in rows]}
+
 
 async def _place_trade_internal(
     email: str,
@@ -966,11 +1039,13 @@ async def _place_trade_internal(
     set_equity(email, equity_after)
     return {"ok": True, "trade": asdict(tr), "pnl_pct": float(tr.unreal_pnl_percent)}
 
+
 # =========================
 # AUTO AI TRADER (V3)
 # =========================
 AUTO_LOCK = threading.Lock()
 AUTO_RUNNERS: Dict[str, "AutoRunner"] = {}
+
 
 def _ema(series: List[float], period: int) -> List[float]:
     if not series:
@@ -980,6 +1055,7 @@ def _ema(series: List[float], period: int) -> List[float]:
     for x in series[1:]:
         out.append((x - out[-1]) * k + out[-1])
     return out
+
 
 @dataclass
 class AutoState:
@@ -1004,6 +1080,7 @@ class AutoState:
     trend_filter: bool
     chop_min_sep_pct: float
 
+
 class AutoStartIn(BaseModel):
     symbol: str
     tf: TF = "15m"
@@ -1014,6 +1091,7 @@ class AutoStartIn(BaseModel):
     duration_days: int = 0
     trend_filter: bool = True
     chop_min_sep_pct: float = 0.005
+
 
 class AutoRunner:
     def __init__(
@@ -1199,6 +1277,7 @@ class AutoRunner:
 
                 if should_trade:
                     import asyncio
+
                     out = asyncio.run(
                         _place_trade_internal(
                             self.email,
@@ -1228,6 +1307,7 @@ class AutoRunner:
             finally:
                 time.sleep(self.interval_sec)
 
+
 @app.post("/trade")
 async def place_trade(payload: TradeIn, user=Depends(require_user)):
     email = user["email"]
@@ -1237,6 +1317,7 @@ async def place_trade(payload: TradeIn, user=Depends(require_user)):
             raise HTTPException(status_code=400, detail="Manual trading disabled while AI is running.")
     return await _place_trade_internal(email, payload.symbol, payload.side, payload.mode, extra_reason="Manual trade request.")
 
+
 @app.post("/reset")
 def reset_sandbox(user=Depends(require_user)):
     email = user["email"]
@@ -1245,6 +1326,7 @@ def reset_sandbox(user=Depends(require_user)):
     set_session_id(email, new_sid)
     set_equity(email, START_EQUITY)
     return {"ok": True, "equity": START_EQUITY, "new_session_id": new_sid}
+
 
 @app.get("/auto/status")
 def auto_status(user=Depends(require_user)):
@@ -1256,6 +1338,7 @@ def auto_status(user=Depends(require_user)):
         st = r.status()
         return {"ok": True, **asdict(st)}
 
+
 @app.get("/auto/history")
 def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1, le=200)):
     email = user["email"]
@@ -1264,6 +1347,7 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
         if not r:
             return {"ok": True, "events": []}
         return {"ok": True, "events": list(r.history)[: int(limit)]}
+
 
 @app.post("/auto/start")
 def auto_start(payload: AutoStartIn, user=Depends(require_user)):
@@ -1309,6 +1393,7 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         "max_trades_per_day": int(max_trades),
     }
 
+
 @app.post("/auto/stop")
 def auto_stop(user=Depends(require_user)):
     email = user["email"]
@@ -1319,12 +1404,14 @@ def auto_stop(user=Depends(require_user)):
             del AUTO_RUNNERS[email]
     return {"ok": True, "running": False}
 
+
 # =========================
 # ADMIN ENDPOINTS
 # =========================
 class AdminSettingsIn(BaseModel):
     signup_enabled: bool
     seat_capacity: int
+
 
 @app.get("/admin/status")
 def admin_status(admin=Depends(require_admin)):
@@ -1338,6 +1425,7 @@ def admin_status(admin=Depends(require_admin)):
         "auto_runners": list(AUTO_RUNNERS.keys()),
     }
 
+
 @app.get("/admin/settings")
 def admin_settings(admin=Depends(require_admin)):
     return {
@@ -1347,12 +1435,14 @@ def admin_settings(admin=Depends(require_admin)):
         "seats_remaining": max(0, seat_capacity() - seats_used()),
     }
 
+
 @app.post("/admin/settings")
 def admin_update_settings(payload: AdminSettingsIn, admin=Depends(require_admin)):
     sc = int(max(1, min(100000, payload.seat_capacity)))
     admin_set_setting("signup_enabled", "true" if payload.signup_enabled else "false")
     admin_set_setting("seat_capacity", str(sc))
     return {"ok": True, **admin_settings(admin)}
+
 
 @app.post("/admin/stop-all-ai")
 def admin_stop_all_ai(admin=Depends(require_admin)):
@@ -1364,6 +1454,7 @@ def admin_stop_all_ai(admin=Depends(require_admin)):
             del AUTO_RUNNERS[email]
     return {"ok": True, "stopped_ai_for": stopped}
 
+
 @app.post("/admin/reset-user")
 def admin_reset_user(email: str, admin=Depends(require_admin)):
     email = (email or "").strip().lower()
@@ -1373,6 +1464,7 @@ def admin_reset_user(email: str, admin=Depends(require_admin)):
     set_equity(email, START_EQUITY)
     set_session_id(email, get_session_id(email) + 1)
     return {"ok": True, "reset_user": email, "equity": START_EQUITY}
+
 
 @app.get("/admin/users")
 def admin_users(
@@ -1444,6 +1536,7 @@ def admin_users(
 
     return {"ok": True, "users": out}
 
+
 @app.get("/admin/user/{email}")
 def admin_user_details(
     email: str,
@@ -1489,7 +1582,11 @@ def admin_user_details(
         "ok": True,
         "user": {"email": u["email"], "created_at": u["created_at"]},
         "state": {"equity": equity, "session_id": session_id},
-        "exchange": {"connected": bool(ex), "exchange": ex["exchange"] if ex else None, "connected_at": ex["created_at"] if ex else None},
+        "exchange": {
+            "connected": bool(ex),
+            "exchange": ex["exchange"] if ex else None,
+            "connected_at": ex["created_at"] if ex else None,
+        },
         "trades": {"count": tcount, "recent": trows},
         "ai": {"running": running, "status": auto_status_obj},
     }
