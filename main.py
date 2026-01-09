@@ -67,7 +67,6 @@ def db() -> sqlite3.Connection:
 def now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-
 def _column_exists(cur: sqlite3.Cursor, table: str, col: str) -> bool:
     cur.execute(f"PRAGMA table_info({table})")
     cols = [r[1] for r in cur.fetchall()]
