@@ -29,8 +29,8 @@ IS_PROD = ENV == "prod"
 
 # FRONTEND_ORIGINS should be comma-separated (IMPORTANT for cookies with Vercel)
 # Example:
-# FRONTEND_ORIGINS="http://localhost:5173,http://127.0.0.1:5173,https://yourapp.vercel.app"
-DEFAULT_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+# FRONTEND_ORIGINS="http://localhost:5173,http://127.0.0.1:5173,https://asymmetric-ai-frontend-23yi.vercel.app"
+DEFAULT_ORIGINS = ["http://localhost:5173", "https://asymmetric-ai-frontend-23yi.vercel.app"]
 
 # ✅ FIX: define it before use
 FRONTEND_ORIGINS_RAW = os.getenv("FRONTEND_ORIGINS", "").strip()
