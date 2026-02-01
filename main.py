@@ -22,16 +22,6 @@ from pydantic import BaseModel
 app = FastAPI(title="Asymmetric AI Backend", version="0.9.0")
 
 # =========================
-# ✅ IMPORTANT: support /api/* paths used by frontend
-# This keeps your existing routes unchanged.
-# /api/auth/login -> /auth/login
-# /api/health -> /health
-# =========================
-@app.get("/api/health")
-def health():
-    return {"status": "ok"}
- 
-# =========================
 # ENV / PROD SETTINGS
 # =========================
 ENV = os.getenv("ENV", "dev").lower().strip()  # dev | prod
@@ -59,6 +49,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# =========================
+# ✅ IMPORTANT: Support /api/* paths used by frontend
+# This keeps all your existing routes unchanged.
+# /api/auth/login -> /auth/login
+# /api/health -> /health
+# =========================
+@app.middleware("http")
+async def strip_api_prefix(request: Request, call_next):
+    path = request.scope.get("path", "")
+    if path == "/api":
+        request.scope["path"] = "/"
+    elif path.startswith("/api/"):
+        request.scope["path"] = path[4:]  # remove "/api"
+    return await call_next(request)
+
+# ✅ Optional: define root so Render root doesn't show {"detail":"Not Found"}
+@app.get("/")
+def root():
+    return {"ok": True, "service": "Asymmetric AI Backend", "env": ENV}
 
 # =========================
 # SQLITE (DEMO PERSISTENCE)
@@ -425,6 +435,10 @@ def config():
 def health():
     return {"health": "green", "binance_env": BINANCE_ENV, "db_path": DB_PATH, "env": ENV}
 
+# (Not required, but harmless) explicit /api/health for easy testing
+@app.get("/api/health")
+def api_health():
+    return health()
 
 # =========================
 # AUTH MODELS
@@ -553,10 +567,6 @@ def session_me(session: Optional[str] = Cookie(default=None)):
         row = cur.fetchone()
         conn.close()
     return {"ok": bool(row), "email": row["email"] if row else None}
-
-# -------------------------
-# (rest of your file continues)
-# -------------------------
 
 
 # =========================
