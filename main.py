@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Literal, Any, Deque
 from collections import deque
 
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query
+from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -21,6 +21,16 @@ from pydantic import BaseModel
 # =========================
 app = FastAPI(title="Asymmetric AI Backend", version="0.9.0")
 
+# =========================
+# ✅ IMPORTANT: support /api/* paths used by frontend
+# This keeps your existing routes unchanged.
+# /api/auth/login -> /auth/login
+# /api/health -> /health
+# =========================
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+ 
 # =========================
 # ENV / PROD SETTINGS
 # =========================
@@ -32,7 +42,6 @@ IS_PROD = ENV == "prod"
 # FRONTEND_ORIGINS="https://asymmetric-ai-frontend-23yi.vercel.app"
 DEFAULT_ORIGINS = ["https://asymmetric-ai-frontend-23yi.vercel.app"]
 
-# ✅ FIX: define it before use
 FRONTEND_ORIGINS_RAW = os.getenv("FRONTEND_ORIGINS", "").strip()
 
 if FRONTEND_ORIGINS_RAW:
@@ -66,6 +75,7 @@ def db() -> sqlite3.Connection:
 
 def now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
 
 def _column_exists(cur: sqlite3.Cursor, table: str, col: str) -> bool:
     cur.execute(f"PRAGMA table_info({table})")
@@ -543,6 +553,10 @@ def session_me(session: Optional[str] = Cookie(default=None)):
         row = cur.fetchone()
         conn.close()
     return {"ok": bool(row), "email": row["email"] if row else None}
+
+# -------------------------
+# (rest of your file continues)
+# -------------------------
 
 
 # =========================
