@@ -770,121 +770,155 @@ def exchange_balance(user=Depends(require_user)):
     eq = get_equity(email)
     return {"ok": True, "balances": [{"asset": "USDT", "free": eq, "locked": 0.0}], "note": "Demo balances only."}
 
-
 # =========================
-# MARKET (PUBLIC) - BYBIT
+# MARKET (PUBLIC) - COINGECKO (NO BLOCKS)
 # =========================
-BYBIT_BASE = "https://api.bybit.com"
 
-# Bybit interval is in minutes as strings, and "D" for daily is also supported.
-# We’ll use minutes for simplicity.
-BYBIT_TF_MAP = {
-    "15m": "15",
-    "1h": "60",
-    "4h": "240",
-    "1d": "1440",
+COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+
+# Map your symbols (BTCUSDT etc) to CoinGecko coin IDs
+SYMBOL_TO_COINGECKO_ID: Dict[str, str] = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+    "XRP": "ripple",
+    "BNB": "binancecoin",
+    "DOGE": "dogecoin",
+    "ADA": "cardano",
+    "AVAX": "avalanche-2",
+    "LINK": "chainlink",
+    "MATIC": "polygon-pos",
 }
 
+def _base_asset(symbol: str) -> str:
+    s = (symbol or "").upper().strip()
+    # you use BTCUSDT style – base is BTC
+    if s.endswith("USDT"):
+        s = s[:-4]
+    return s
 
-async def bybit_price(symbol: str) -> float:
-    """
-    Bybit v5 tickers. category=linear for USDT perpetual style symbols like BTCUSDT.
-    """
-    sym = symbol.upper().strip()
+def _coin_id_for_symbol(symbol: str) -> str:
+    base = _base_asset(symbol)
+    cid = SYMBOL_TO_COINGECKO_ID.get(base)
+    if not cid:
+        raise HTTPException(status_code=400, detail=f"Unsupported symbol for market data: {symbol}")
+    return cid
 
+async def coingecko_price(symbol: str) -> float:
+    """
+    Fast & stable price from CoinGecko.
+    """
+    cid = _coin_id_for_symbol(symbol)
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(
-            f"{BYBIT_BASE}/v5/market/tickers",
-            params={"category": "linear", "symbol": sym},
+            f"{COINGECKO_BASE}/simple/price",
+            params={"ids": cid, "vs_currencies": "usd"},
+            headers={"accept": "application/json"},
         )
 
     if r.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"Bybit price error: {r.text}")
+        raise HTTPException(status_code=400, detail=f"CoinGecko price error: {r.text}")
 
-    data = r.json()
-    result = (data or {}).get("result") or {}
-    lst = result.get("list") or []
-
-    if not lst:
-        raise HTTPException(status_code=400, detail=f"Bybit price error: no ticker for {sym}")
-
-    last = lst[0].get("lastPrice")
-    if last is None:
-        raise HTTPException(status_code=400, detail=f"Bybit price error: missing lastPrice for {sym}")
+    data = r.json() or {}
+    usd = (data.get(cid) or {}).get("usd")
+    if usd is None:
+        raise HTTPException(status_code=400, detail=f"CoinGecko price error: missing usd for {cid}")
 
     try:
-        return float(last)
+        return float(usd)
     except Exception:
-        raise HTTPException(status_code=400, detail=f"Bybit price error: invalid lastPrice {last}")
-
+        raise HTTPException(status_code=400, detail=f"CoinGecko price error: invalid usd={usd}")
 
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
-    return {"symbol": symbol.upper(), "price": await bybit_price(symbol)}
+    return {"symbol": symbol.upper(), "price": await coingecko_price(symbol)}
 
+# We convert OHLC to your expected format:
+# {"t": ms, "open": float, "high": float, "low": float, "close": float, "volume": 0.0}
+TF_SECONDS = {"15m": 15 * 60, "1h": 60 * 60, "4h": 4 * 60 * 60, "1d": 24 * 60 * 60}
+
+def _choose_days_for_tf(tf: str) -> int:
+    # CoinGecko OHLC supports: 1 / 7 / 14 / 30 / 90 / 180 / 365
+    # We choose a good default per timeframe so data is dense enough.
+    if tf == "15m":
+        return 1
+    if tf == "1h":
+        return 7
+    if tf == "4h":
+        return 30
+    return 90  # 1d
 
 def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
-    sym = symbol.upper().strip()
     tf_str = str(tf)
-
-    interval = BYBIT_TF_MAP.get(tf_str)
-    if not interval:
+    if tf_str not in TF_MAP:
         return []
 
-    url = f"{BYBIT_BASE}/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol": sym,
-        "interval": interval,
-        "limit": int(limit),
-    }
+    cid = _coin_id_for_symbol(symbol)
+    days = _choose_days_for_tf(tf_str)
+
+    # CoinGecko OHLC endpoint:
+    # GET /coins/{id}/ohlc?vs_currency=usd&days=1
+    url = f"{COINGECKO_BASE}/coins/{cid}/ohlc"
+    params = {"vs_currency": "usd", "days": int(days)}
 
     try:
-        r = httpx.get(url, params=params, timeout=12)
+        r = httpx.get(url, params=params, timeout=12, headers={"accept": "application/json"})
         if r.status_code != 200:
             return []
 
-        data = r.json()
-        if (data or {}).get("retCode") != 0:
+        raw = r.json()
+        if not isinstance(raw, list) or not raw:
             return []
 
-        result = (data or {}).get("result") or {}
-        rows = result.get("list") or []
+        # raw rows: [t, open, high, low, close]
+        # Sort oldest -> newest
+        raw.sort(key=lambda x: x[0] if isinstance(x, list) and x else 0)
 
-        # Bybit returns list rows like:
-        # [ startTime, open, high, low, close, volume, turnover ]
+        # Downsample to requested tf seconds
+        step_ms = TF_SECONDS.get(tf_str, 3600) * 1000
         out: List[Dict[str, Any]] = []
-        for k in rows:
-            t = int(k[0])  # ms timestamp string
+        last_bucket = None
+
+        for row in raw:
+            if not isinstance(row, list) or len(row) < 5:
+                continue
+            t = int(row[0])
+            bucket = t // step_ms
+            if last_bucket is None:
+                last_bucket = bucket
+            # keep 1 candle per bucket (OHLC already candle-like; we just bucket it)
+            if bucket != last_bucket:
+                last_bucket = bucket
+
             out.append(
                 {
-                    "t": t,
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4]),
-                    "volume": float(k[5]),
+                    "t": int(t),
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": 0.0,
                 }
             )
 
-        # Bybit usually returns newest -> oldest; chart wants oldest -> newest
-        out.reverse()
+        # ensure last N points
+        if len(out) > limit:
+            out = out[-int(limit):]
+
         return out
 
     except Exception:
         return []
 
-
 @app.get("/klines/{symbol}")
 def klines(symbol: str, tf: TF = Query("1h"), limit: int = Query(200, ge=20, le=1000)):
     rows = _fetch_klines_sync(symbol, str(tf), limit=limit)
     if not rows:
-        raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or Bybit blocked).")
+        raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or CoinGecko error).")
     return {"symbol": symbol.upper(), "tf": str(tf), "klines": rows}
 
-
-# ✅ keep compatibility with existing code references
-binance_price = bybit_price
+# IMPORTANT: keep this alias so your trading engine code doesn't need to change
+binance_price = coingecko_price
 
 # =========================
 # TRADING + RISK ENGINE (sandbox)
