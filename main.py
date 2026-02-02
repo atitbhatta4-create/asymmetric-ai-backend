@@ -947,8 +947,8 @@ def mini_asym_risk_engine(mode: RiskMode, equity: float) -> Dict[str, Any]:
 
 class TradeIn(BaseModel):
     symbol: str
-    side: Side
-    mode: RiskMode
+    side: str
+    mode: str
     size: Optional[float] = None
     sl: Optional[float] = None
     tp: Optional[float] = None
@@ -1380,11 +1380,36 @@ class AutoRunner:
 @app.post("/trade")
 async def place_trade(payload: TradeIn, user=Depends(require_user)):
     email = user["email"]
+
     with AUTO_LOCK:
         r = AUTO_RUNNERS.get(email)
         if r and r.is_running():
             raise HTTPException(status_code=400, detail="Manual trading disabled while AI is running.")
-    return await _place_trade_internal(email, payload.symbol, payload.side, payload.mode, extra_reason="Manual trade request.")
+
+    # Normalize strings coming from frontend (prevents 422 enum issues)
+    symbol = (payload.symbol or "").upper().strip()
+    side_raw = (payload.side or "").upper().strip()
+    mode_raw = (payload.mode or "").upper().strip()
+
+    # Validate side
+    if side_raw not in ("LONG", "SHORT"):
+        raise HTTPException(status_code=400, detail=f"Invalid side: {payload.side}")
+
+    # Validate mode
+    allowed_modes = {"ULTRA_SAFE", "SAFE", "NORMAL", "MINI_ASYM", "AGGRESSIVE"}
+    if mode_raw not in allowed_modes:
+        raise HTTPException(status_code=400, detail=f"Invalid mode: {payload.mode}")
+
+    side: Side = "LONG" if side_raw == "LONG" else "SHORT"
+    mode: RiskMode = mode_raw  # type: ignore
+
+    return await _place_trade_internal(
+        email,
+        symbol,
+        side,
+        mode,
+        extra_reason="Manual trade request.",
+    )
 
 
 @app.post("/reset")
