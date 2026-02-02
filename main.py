@@ -33,7 +33,6 @@ IS_PROD = ENV == "prod"
 DEFAULT_ORIGINS = ["https://asymmetric-ai-frontend-23yi.vercel.app"]
 
 FRONTEND_ORIGINS_RAW = os.getenv("FRONTEND_ORIGINS", "").strip()
-
 if FRONTEND_ORIGINS_RAW:
     FRONTEND_ORIGINS = [x.strip() for x in FRONTEND_ORIGINS_RAW.split(",") if x.strip()]
 else:
@@ -65,7 +64,6 @@ async def strip_api_prefix(request: Request, call_next):
         request.scope["path"] = path[4:]  # remove "/api"
     return await call_next(request)
 
-# ✅ Optional: define root so Render root doesn't show {"detail":"Not Found"}
 @app.get("/")
 def root():
     return {"ok": True, "service": "Asymmetric AI Backend", "env": ENV}
@@ -100,91 +98,90 @@ def init_db() -> None:
 
         cur.execute(
             """
-        CREATE TABLE IF NOT EXISTS users (
-            email TEXT PRIMARY KEY,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-        """
+            CREATE TABLE IF NOT EXISTS users (
+                email TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
         )
 
         cur.execute(
             """
-        CREATE TABLE IF NOT EXISTS sessions (
-            token TEXT PRIMARY KEY,
-            email TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-        )
-        """
+            CREATE TABLE IF NOT EXISTS sessions (
+                token TEXT PRIMARY KEY,
+                email TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
         )
 
         cur.execute(
             """
-        CREATE TABLE IF NOT EXISTS exchange_keys (
-            email TEXT PRIMARY KEY,
-            exchange TEXT NOT NULL,
-            api_key TEXT NOT NULL,
-            api_secret TEXT NOT NULL,
-            passphrase TEXT,
-            created_at TEXT NOT NULL
-        )
-        """
+            CREATE TABLE IF NOT EXISTS exchange_keys (
+                email TEXT PRIMARY KEY,
+                exchange TEXT NOT NULL,
+                api_key TEXT NOT NULL,
+                api_secret TEXT NOT NULL,
+                passphrase TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
         )
 
         cur.execute(
             """
-        CREATE TABLE IF NOT EXISTS user_state (
-            email TEXT PRIMARY KEY,
-            equity REAL NOT NULL,
-            session_id INTEGER NOT NULL DEFAULT 0
-        )
-        """
+            CREATE TABLE IF NOT EXISTS user_state (
+                email TEXT PRIMARY KEY,
+                equity REAL NOT NULL,
+                session_id INTEGER NOT NULL DEFAULT 0
+            )
+            """
         )
 
         cur.execute(
             """
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT NOT NULL,
-            time TEXT NOT NULL,
-            side TEXT NOT NULL,
-            symbol TEXT NOT NULL,
-            mode TEXT NOT NULL,
-            size REAL NOT NULL,
-            sl REAL NOT NULL,
-            tp REAL NOT NULL,
-            leverage REAL NOT NULL,
-            entry_price REAL NOT NULL,
-            current_price REAL NOT NULL,
-            unreal_pnl_percent REAL NOT NULL,
-            unreal_pnl_value REAL NOT NULL,
-            equity_after REAL NOT NULL,
-            reason TEXT,
-            session_id INTEGER NOT NULL DEFAULT 0
-        )
-        """
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                time TEXT NOT NULL,
+                side TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                size REAL NOT NULL,
+                sl REAL NOT NULL,
+                tp REAL NOT NULL,
+                leverage REAL NOT NULL,
+                entry_price REAL NOT NULL,
+                current_price REAL NOT NULL,
+                unreal_pnl_percent REAL NOT NULL,
+                unreal_pnl_value REAL NOT NULL,
+                equity_after REAL NOT NULL,
+                reason TEXT,
+                session_id INTEGER NOT NULL DEFAULT 0
+            )
+            """
         )
 
         cur.execute(
             """
-        CREATE TABLE IF NOT EXISTS admin_settings (
-            k TEXT PRIMARY KEY,
-            v TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-        """
+            CREATE TABLE IF NOT EXISTS admin_settings (
+                k TEXT PRIMARY KEY,
+                v TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
         )
 
-        # Password reset tokens (demo)
         cur.execute(
             """
-        CREATE TABLE IF NOT EXISTS password_resets (
-            token TEXT PRIMARY KEY,
-            email TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            used INTEGER NOT NULL DEFAULT 0
-        )
-        """
+            CREATE TABLE IF NOT EXISTS password_resets (
+                token TEXT PRIMARY KEY,
+                email TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                used INTEGER NOT NULL DEFAULT 0
+            )
+            """
         )
 
         # safe migrations
@@ -214,7 +211,7 @@ def init_db() -> None:
 init_db()
 
 # =========================
-# CONFIG (Binance)
+# CONFIG (Binance) - kept for compatibility
 # =========================
 BINANCE_ENV = os.getenv("BINANCE_ENV", "live").lower().strip()
 if BINANCE_ENV not in ("live", "testnet"):
@@ -228,6 +225,8 @@ START_EQUITY = 1000.0
 RiskMode = Literal["ULTRA_SAFE", "SAFE", "NORMAL", "MINI_ASYM", "AGGRESSIVE"]
 Side = Literal["LONG", "SHORT"]
 TF = Literal["15m", "1h", "4h", "1d"]
+
+# used for validation only in your code
 TF_MAP: Dict[str, str] = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
 
 DUBAI_TZ = timezone(timedelta(hours=4))
@@ -435,10 +434,11 @@ def config():
 def health():
     return {"health": "green", "binance_env": BINANCE_ENV, "db_path": DB_PATH, "env": ENV}
 
-# (Not required, but harmless) explicit /api/health for easy testing
+
 @app.get("/api/health")
 def api_health():
     return health()
+
 
 # =========================
 # AUTH MODELS
@@ -583,10 +583,6 @@ class ResetIn(BaseModel):
 
 @app.post("/auth/forgot")
 def auth_forgot(payload: ForgotIn):
-    """
-    Demo: returns a reset token in response.
-    In real product: email the token.
-    """
     email = payload.email.strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="email required")
@@ -598,7 +594,7 @@ def auth_forgot(payload: ForgotIn):
         u = cur.fetchone()
         if not u:
             conn.close()
-            return {"ok": True}  # don't leak existence
+            return {"ok": True}
 
         token = secrets.token_urlsafe(32)
         cur.execute(
@@ -774,18 +770,27 @@ def exchange_balance(user=Depends(require_user)):
     eq = get_equity(email)
     return {"ok": True, "balances": [{"asset": "USDT", "free": eq, "locked": 0.0}], "note": "Demo balances only."}
 
+
 # =========================
 # MARKET (PUBLIC) - BYBIT
 # =========================
-
 BYBIT_BASE = "https://api.bybit.com"
+
+# Bybit interval is in minutes as strings, and "D" for daily is also supported.
+# We’ll use minutes for simplicity.
+BYBIT_TF_MAP = {
+    "15m": "15",
+    "1h": "60",
+    "4h": "240",
+    "1d": "1440",
+}
+
 
 async def bybit_price(symbol: str) -> float:
     """
-    Bybit v5 tickers.
-    We use category=linear (USDT perpetual style symbols like BTCUSDT).
+    Bybit v5 tickers. category=linear for USDT perpetual style symbols like BTCUSDT.
     """
-    sym = symbol.upper()
+    sym = symbol.upper().strip()
 
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(
@@ -817,17 +822,9 @@ async def bybit_price(symbol: str) -> float:
 async def get_price(symbol: str):
     return {"symbol": symbol.upper(), "price": await bybit_price(symbol)}
 
-# Bybit interval is in minutes (as strings)
-# 15m=15, 1h=60, 4h=240, 1d=1440
-BYBIT_TF_MAP = {
-    "15m": "15",
-    "1h": "60",
-    "4h": "240",
-    "1d": "1440",
-}
 
 def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
-    sym = symbol.upper()
+    sym = symbol.upper().strip()
     tf_str = str(tf)
 
     interval = BYBIT_TF_MAP.get(tf_str)
@@ -848,6 +845,9 @@ def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str,
             return []
 
         data = r.json()
+        if (data or {}).get("retCode") != 0:
+            return []
+
         result = (data or {}).get("result") or {}
         rows = result.get("list") or []
 
@@ -855,8 +855,7 @@ def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str,
         # [ startTime, open, high, low, close, volume, turnover ]
         out: List[Dict[str, Any]] = []
         for k in rows:
-            # startTime is ms (string)
-            t = int(k[0])
+            t = int(k[0])  # ms timestamp string
             out.append(
                 {
                     "t": t,
@@ -868,7 +867,7 @@ def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str,
                 }
             )
 
-        # Bybit returns newest -> oldest sometimes; chart looks better oldest -> newest
+        # Bybit usually returns newest -> oldest; chart wants oldest -> newest
         out.reverse()
         return out
 
@@ -882,6 +881,9 @@ def klines(symbol: str, tf: TF = Query("1h"), limit: int = Query(200, ge=20, le=
     if not rows:
         raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or Bybit blocked).")
     return {"symbol": symbol.upper(), "tf": str(tf), "klines": rows}
+
+
+# ✅ keep compatibility with existing code references
 binance_price = bybit_price
 
 # =========================
@@ -932,7 +934,7 @@ def build_reason(mode: RiskMode, equity: float, computed: Dict[str, float], extr
     if growth >= 0.10:
         lines.append("- Equity growth ≥ 10% → reduce size and leverage by ~10% to protect profits.")
     else:
-        lines.append("- Equity growth < 10% → use default preset for the selected mode.")
+        lines.append("- Equity growth < 10% (or negative) → use default preset for the selected mode.")
     lines.append("Computed parameters:")
     lines.append(f"- Size%: {computed['size']:.2f}")
     lines.append(f"- SL%:   {computed['sl']:.2f}")
@@ -1064,7 +1066,7 @@ async def _place_trade_internal(
     c = out["computed"]
     reason_text = build_reason(mode, equity_before, c, extra=extra_reason)
 
-    entry = await binance_price(symbol)
+    entry = await binance_price(symbol)  # alias -> bybit_price
 
     move = ((int(time.time()) % 140) - 70) / 1000.0  # -0.07..+0.07
     pnl_pct = move * (c["leverage"] / 5.0)
@@ -1439,7 +1441,7 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
     email = user["email"]
     symbol = payload.symbol.upper().strip()
     if not symbol.endswith("USDT"):
-        raise HTTPException(status_code=400, detail="Use Binance symbol like BTCUSDT / ETHUSDT / SOLUSDT")
+        raise HTTPException(status_code=400, detail="Use symbol like BTCUSDT / ETHUSDT / SOLUSDT")
     if payload.tf not in TF_MAP:
         raise HTTPException(status_code=400, detail="Bad timeframe")
     if payload.interval_sec < 5 or payload.interval_sec > 3600:
