@@ -949,11 +949,10 @@ class TradeIn(BaseModel):
     symbol: str
     side: Side
     mode: RiskMode
-    size: float
-    sl: float
-    tp: float
-    leverage: float
-
+    size: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    leverage: Optional[float] = None
 
 class RiskPreviewIn(BaseModel):
     symbol: str
