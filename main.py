@@ -944,16 +944,15 @@ def mini_asym_risk_engine(mode: RiskMode, equity: float) -> Dict[str, Any]:
     }
     return {"allowed": True, "computed": computed, "reason": build_reason(mode, equity, computed)}
 
-
 class TradeIn(BaseModel):
     symbol: str
     side: str
     mode: str
-    size: Optional[float] = None
-    sl: Optional[float] = None
-    tp: Optional[float] = None
-    leverage: Optional[float] = None
-
+    size: float
+    sl: float
+    tp: float
+    leverage: float
+    
 class RiskPreviewIn(BaseModel):
     symbol: str
     side: Side
