@@ -774,38 +774,92 @@ def exchange_balance(user=Depends(require_user)):
     eq = get_equity(email)
     return {"ok": True, "balances": [{"asset": "USDT", "free": eq, "locked": 0.0}], "note": "Demo balances only."}
 
+# =========================
+# MARKET (PUBLIC) - BYBIT
+# =========================
 
-# =========================
-# MARKET (PUBLIC)
-# =========================
-async def binance_price(symbol: str) -> float:
+BYBIT_BASE = "https://api.bybit.com"
+
+async def bybit_price(symbol: str) -> float:
+    """
+    Bybit v5 tickers.
+    We use category=linear (USDT perpetual style symbols like BTCUSDT).
+    """
+    sym = symbol.upper()
+
     async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(f"{BINANCE_BASE}/api/v3/ticker/price", params={"symbol": symbol.upper()})
-        if r.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"Binance price error: {r.text}")
-        return float(r.json()["price"])
+        r = await client.get(
+            f"{BYBIT_BASE}/v5/market/tickers",
+            params={"category": "linear", "symbol": sym},
+        )
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Bybit price error: {r.text}")
+
+    data = r.json()
+    result = (data or {}).get("result") or {}
+    lst = result.get("list") or []
+
+    if not lst:
+        raise HTTPException(status_code=400, detail=f"Bybit price error: no ticker for {sym}")
+
+    last = lst[0].get("lastPrice")
+    if last is None:
+        raise HTTPException(status_code=400, detail=f"Bybit price error: missing lastPrice for {sym}")
+
+    try:
+        return float(last)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Bybit price error: invalid lastPrice {last}")
 
 
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
-    return {"symbol": symbol.upper(), "price": await binance_price(symbol)}
+    return {"symbol": symbol.upper(), "price": await bybit_price(symbol)}
 
+# Bybit interval is in minutes (as strings)
+# 15m=15, 1h=60, 4h=240, 1d=1440
+BYBIT_TF_MAP = {
+    "15m": "15",
+    "1h": "60",
+    "4h": "240",
+    "1d": "1440",
+}
 
 def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
-    if tf not in TF_MAP:
+    sym = symbol.upper()
+    tf_str = str(tf)
+
+    interval = BYBIT_TF_MAP.get(tf_str)
+    if not interval:
         return []
-    url = f"{BINANCE_BASE}/api/v3/klines"
-    params = {"symbol": symbol.upper(), "interval": TF_MAP[tf], "limit": int(limit)}
+
+    url = f"{BYBIT_BASE}/v5/market/kline"
+    params = {
+        "category": "linear",
+        "symbol": sym,
+        "interval": interval,
+        "limit": int(limit),
+    }
+
     try:
         r = httpx.get(url, params=params, timeout=12)
         if r.status_code != 200:
             return []
-        raw = r.json()
+
+        data = r.json()
+        result = (data or {}).get("result") or {}
+        rows = result.get("list") or []
+
+        # Bybit returns list rows like:
+        # [ startTime, open, high, low, close, volume, turnover ]
         out: List[Dict[str, Any]] = []
-        for k in raw:
+        for k in rows:
+            # startTime is ms (string)
+            t = int(k[0])
             out.append(
                 {
-                    "t": int(k[0]),
+                    "t": t,
                     "open": float(k[1]),
                     "high": float(k[2]),
                     "low": float(k[3]),
@@ -813,18 +867,22 @@ def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str,
                     "volume": float(k[5]),
                 }
             )
+
+        # Bybit returns newest -> oldest sometimes; chart looks better oldest -> newest
+        out.reverse()
         return out
+
     except Exception:
         return []
 
 
 @app.get("/klines/{symbol}")
 def klines(symbol: str, tf: TF = Query("1h"), limit: int = Query(200, ge=20, le=1000)):
-    rows = _fetch_klines_sync(symbol, tf, limit=limit)
+    rows = _fetch_klines_sync(symbol, str(tf), limit=limit)
     if not rows:
-        raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or Binance blocked).")
-    return {"symbol": symbol.upper(), "tf": tf, "klines": rows}
-
+        raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or Bybit blocked).")
+    return {"symbol": symbol.upper(), "tf": str(tf), "klines": rows}
+binance_price = bybit_price
 
 # =========================
 # TRADING + RISK ENGINE (sandbox)
