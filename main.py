@@ -7,6 +7,7 @@ import hashlib
 import sqlite3
 import threading
 import json
+from fastapi import Body
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Literal, Any, Deque
@@ -1502,17 +1503,37 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
 
 
 @app.post("/auto/start")
-def auto_start(payload: AutoStartIn, user=Depends(require_user)):
+def auto_start(payload: Any = Body(...), user=Depends(require_user)):
     email = user["email"]
-    symbol = payload.symbol.upper().strip()
+
+    # ✅ Option 2: accept either dict OR JSON string from frontend
+    data = payload
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid JSON body for auto/start (string not parseable).")
+
+    # Validate into AutoStartIn (supports pydantic v1 and v2)
+    try:
+        payload_obj = AutoStartIn.model_validate(data)  # pydantic v2
+    except AttributeError:
+        payload_obj = AutoStartIn.parse_obj(data)       # pydantic v1
+
+    symbol = payload_obj.symbol.upper().strip()
+
     if not symbol.endswith("USDT"):
         raise HTTPException(status_code=400, detail="Use symbol like BTCUSDT / ETHUSDT / SOLUSDT")
-    if payload.tf not in TF_MAP:
+    if payload_obj.tf not in TF_MAP:
         raise HTTPException(status_code=400, detail="Bad timeframe")
-    if payload.interval_sec < 5 or payload.interval_sec > 3600:
+    if payload_obj.interval_sec < 5 or payload_obj.interval_sec > 3600:
         raise HTTPException(status_code=400, detail="interval_sec must be 5..3600")
 
-    max_trades = payload.max_trades_per_day if payload.max_trades_per_day is not None else default_max_trades_per_day(payload.mode)
+    max_trades = (
+        payload_obj.max_trades_per_day
+        if payload_obj.max_trades_per_day is not None
+        else default_max_trades_per_day(payload_obj.mode)
+    )
 
     with AUTO_LOCK:
         old = AUTO_RUNNERS.get(email)
@@ -1523,14 +1544,14 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         runner = AutoRunner(
             email=email,
             symbol=symbol,
-            tf=payload.tf,
-            interval_sec=payload.interval_sec,
-            mode=payload.mode,
+            tf=payload_obj.tf,
+            interval_sec=payload_obj.interval_sec,
+            mode=payload_obj.mode,
             max_trades_per_day=int(max_trades),
-            stop_after_bad_trades=int(payload.stop_after_bad_trades),
-            duration_days=int(payload.duration_days),
-            trend_filter=bool(payload.trend_filter),
-            chop_min_sep_pct=float(payload.chop_min_sep_pct),
+            stop_after_bad_trades=int(payload_obj.stop_after_bad_trades),
+            duration_days=int(payload_obj.duration_days),
+            trend_filter=bool(payload_obj.trend_filter),
+            chop_min_sep_pct=float(payload_obj.chop_min_sep_pct),
         )
         AUTO_RUNNERS[email] = runner
         runner.start()
@@ -1539,9 +1560,9 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         "ok": True,
         "running": True,
         "symbol": symbol,
-        "tf": payload.tf,
-        "interval_sec": payload.interval_sec,
-        "mode": payload.mode,
+        "tf": payload_obj.tf,
+        "interval_sec": payload_obj.interval_sec,
+        "mode": payload_obj.mode,
         "max_trades_per_day": int(max_trades),
     }
 
