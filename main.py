@@ -6,13 +6,14 @@ import time
 import hashlib
 import sqlite3
 import threading
+import json
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Literal, Any, Deque
 from collections import deque
 
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query, Request
+from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -63,6 +64,7 @@ async def strip_api_prefix(request: Request, call_next):
     elif path.startswith("/api/"):
         request.scope["path"] = path[4:]  # remove "/api"
     return await call_next(request)
+
 
 @app.get("/")
 def root():
@@ -769,14 +771,16 @@ def exchange_balance(user=Depends(require_user)):
         raise HTTPException(status_code=400, detail="No exchange connected.")
     eq = get_equity(email)
     return {"ok": True, "balances": [{"asset": "USDT", "free": eq, "locked": 0.0}], "note": "Demo balances only."}
+
+
 # =========================
 # MARKET (PUBLIC) - OKX
 # =========================
-
 OKX_BASE = "https://www.okx.com"
 
 # OKX timeframes
 OKX_TF_MAP = {"15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}
+
 
 def to_okx_inst(symbol: str) -> str:
     # BTCUSDT -> BTC-USDT
@@ -787,6 +791,7 @@ def to_okx_inst(symbol: str) -> str:
         base = s[:-4]
         return f"{base}-USDT"
     return s
+
 
 async def okx_price(symbol: str) -> float:
     inst = to_okx_inst(symbol)
@@ -811,9 +816,11 @@ async def okx_price(symbol: str) -> float:
 
     return float(last)
 
+
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
     return {"symbol": symbol.upper().strip(), "price": await okx_price(symbol)}
+
 
 def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
     inst = to_okx_inst(symbol)
@@ -842,7 +849,7 @@ def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str,
         for k in rows:
             out.append(
                 {
-                    "t": int(k[0]),          # ms
+                    "t": int(k[0]),  # ms
                     "open": float(k[1]),
                     "high": float(k[2]),
                     "low": float(k[3]),
@@ -858,12 +865,14 @@ def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str,
     except Exception:
         return []
 
+
 @app.get("/klines/{symbol}")
 def klines(symbol: str, tf: TF = Query("1h"), limit: int = Query(200, ge=20, le=1000)):
     rows = _fetch_klines_sync(symbol, str(tf), limit=limit)
     if not rows:
         raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or OKX blocked).")
     return {"symbol": symbol.upper().strip(), "tf": str(tf), "klines": rows}
+
 
 # ✅ keep compatibility with your existing trading engine
 binance_price = okx_price
@@ -944,15 +953,17 @@ def mini_asym_risk_engine(mode: RiskMode, equity: float) -> Dict[str, Any]:
     }
     return {"allowed": True, "computed": computed, "reason": build_reason(mode, equity, computed)}
 
+
 class TradeIn(BaseModel):
     symbol: str
-    side: str
-    mode: str
-    size: float
-    sl: float
-    tp: float
-    leverage: float
-    
+    side: Side
+    mode: RiskMode
+    size: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    leverage: Optional[float] = None
+
+
 class RiskPreviewIn(BaseModel):
     symbol: str
     side: Side
@@ -1047,7 +1058,7 @@ async def _place_trade_internal(
     c = out["computed"]
     reason_text = build_reason(mode, equity_before, c, extra=extra_reason)
 
-    entry = await binance_price(symbol)  # alias -> bybit_price
+    entry = await binance_price(symbol)  # alias -> okx_price
 
     move = ((int(time.time()) % 140) - 70) / 1000.0  # -0.07..+0.07
     pnl_pct = move * (c["leverage"] / 5.0)
@@ -1376,37 +1387,85 @@ class AutoRunner:
                 time.sleep(self.interval_sec)
 
 
+# =========================
+# ✅ FIXED: /trade accepts dict OR stringified JSON OR [dict]
+# =========================
 @app.post("/trade")
-async def place_trade(payload: TradeIn, user=Depends(require_user)):
+async def place_trade(payload: Any = Body(...), user=Depends(require_user)):
     email = user["email"]
+
+    # ✅ OPTION 2 FIX:
+    # Frontend sometimes sends JSON as a string.
+    # Accept either dict OR stringified JSON.
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload (string)")
+
+    # If frontend wrapped it like { "payload": {...} } or { "data": {...} }
+    if isinstance(payload, dict):
+        if "payload" in payload and isinstance(payload["payload"], (dict, str)):
+            payload = payload["payload"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    raise HTTPException(status_code=400, detail="Invalid JSON payload inside 'payload'")
+        if "data" in payload and isinstance(payload["data"], (dict, str)):
+            payload = payload["data"]
+            if isinstance(payload, str):
+                try:
+                    payload = json.loads(payload)
+                except Exception:
+                    raise HTTPException(status_code=400, detail="Invalid JSON payload inside 'data'")
+
+    # Validate into your existing TradeIn model
+    try:
+        trade = TradeIn(**payload) if isinstance(payload, dict) else TradeIn.parse_raw(payload)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Bad trade payload: {str(e)}")
 
     with AUTO_LOCK:
         r = AUTO_RUNNERS.get(email)
         if r and r.is_running():
             raise HTTPException(status_code=400, detail="Manual trading disabled while AI is running.")
 
-    # Normalize strings coming from frontend (prevents 422 enum issues)
-    symbol = (payload.symbol or "").upper().strip()
-    side_raw = (payload.side or "").upper().strip()
-    mode_raw = (payload.mode or "").upper().strip()
+    return await _place_trade_internal(
+        email,
+        trade.symbol,
+        trade.side,
+        trade.mode,
+        extra_reason="Manual trade request.",
+    )
 
-    # Validate side
-    if side_raw not in ("LONG", "SHORT"):
-        raise HTTPException(status_code=400, detail=f"Invalid side: {payload.side}")
+    raw = payload
 
-    # Validate mode
-    allowed_modes = {"ULTRA_SAFE", "SAFE", "NORMAL", "MINI_ASYM", "AGGRESSIVE"}
-    if mode_raw not in allowed_modes:
-        raise HTTPException(status_code=400, detail=f"Invalid mode: {payload.mode}")
+    # if frontend sent: [ {...} ]  -> take first
+    if isinstance(raw, list) and raw:
+        raw = raw[0]
 
-    side: Side = "LONG" if side_raw == "LONG" else "SHORT"
-    mode: RiskMode = mode_raw  # type: ignore
+    # if frontend sent JSON as a STRING -> parse it
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Trade payload must be JSON object (got string).")
+
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="Trade payload must be a JSON object.")
+
+    # validate via Pydantic model
+    try:
+        payload_obj = TradeIn.parse_obj(raw)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
     return await _place_trade_internal(
         email,
-        symbol,
-        side,
-        mode,
+        payload_obj.symbol,
+        payload_obj.side,
+        payload_obj.mode,
         extra_reason="Manual trade request.",
     )
 
