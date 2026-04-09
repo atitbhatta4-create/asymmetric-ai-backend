@@ -4,19 +4,18 @@ import os
 import secrets
 import time
 import hashlib
-import sqlite3
 import threading
-import json
-from fastapi import Body
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Literal, Any, Deque
 from collections import deque
 
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query, Request, Body
+from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from database import db, USING_PG, column_exists, serial_pk
 
 # =========================
 # App
@@ -29,19 +28,14 @@ app = FastAPI(title="Asymmetric AI Backend", version="0.9.0")
 ENV = os.getenv("ENV", "dev").lower().strip()  # dev | prod
 IS_PROD = ENV == "prod"
 
-# FRONTEND_ORIGINS should be comma-separated (IMPORTANT for cookies with Vercel)
-# Example:
-# FRONTEND_ORIGINS="https://asymmetric-ai-frontend-23yi.vercel.app"
-DEFAULT_ORIGINS = ["https://asymmetric-ai-frontend-23yi.vercel.app"]
-
-FRONTEND_ORIGINS_RAW = os.getenv("FRONTEND_ORIGINS", "").strip()
-if FRONTEND_ORIGINS_RAW:
+FRONTEND_ORIGINS_RAW = os.getenv("FRONTEND_ORIGINS", "")
+if FRONTEND_ORIGINS_RAW.strip():
     FRONTEND_ORIGINS = [x.strip() for x in FRONTEND_ORIGINS_RAW.split(",") if x.strip()]
 else:
-    FRONTEND_ORIGINS = DEFAULT_ORIGINS
+    FRONTEND_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
 # =========================
-# CORS (NO WILDCARDS when using credentials)
+# CORS
 # =========================
 app.add_middleware(
     CORSMiddleware,
@@ -52,155 +46,110 @@ app.add_middleware(
 )
 
 # =========================
-# ✅ IMPORTANT: Support /api/* paths used by frontend
-# This keeps all your existing routes unchanged.
-# /api/auth/login -> /auth/login
-# /api/health -> /health
+# DB LOCK (thread safety)
 # =========================
-@app.middleware("http")
-async def strip_api_prefix(request: Request, call_next):
-    path = request.scope.get("path", "")
-    if path == "/api":
-        request.scope["path"] = "/"
-    elif path.startswith("/api/"):
-        request.scope["path"] = path[4:]  # remove "/api"
-    return await call_next(request)
-
-
-@app.get("/")
-def root():
-    return {"ok": True, "service": "Asymmetric AI Backend", "env": ENV}
-
-# =========================
-# SQLITE (DEMO PERSISTENCE)
-# =========================
-DB_PATH = os.getenv("ASYM_DB_PATH", "asymmetric_demo.db")
 DB_LOCK = threading.Lock()
-
-
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 def now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _column_exists(cur: sqlite3.Cursor, table: str, col: str) -> bool:
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = [r[1] for r in cur.fetchall()]
-    return col in cols
-
-
 def init_db() -> None:
+    _serial = serial_pk()
+
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS users (
-                email TEXT PRIMARY KEY,
-                password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            email TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )
+        """)
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sessions (
-                token TEXT PRIMARY KEY,
-                email TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            )
-            """
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            token TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            created_at INTEGER NOT NULL
         )
+        """)
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS exchange_keys (
-                email TEXT PRIMARY KEY,
-                exchange TEXT NOT NULL,
-                api_key TEXT NOT NULL,
-                api_secret TEXT NOT NULL,
-                passphrase TEXT,
-                created_at TEXT NOT NULL
-            )
-            """
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS exchange_keys (
+            email TEXT PRIMARY KEY,
+            exchange TEXT NOT NULL,
+            api_key TEXT NOT NULL,
+            api_secret TEXT NOT NULL,
+            passphrase TEXT,
+            created_at TEXT NOT NULL
         )
+        """)
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS user_state (
-                email TEXT PRIMARY KEY,
-                equity REAL NOT NULL,
-                session_id INTEGER NOT NULL DEFAULT 0
-            )
-            """
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_state (
+            email TEXT PRIMARY KEY,
+            equity REAL NOT NULL,
+            session_id INTEGER NOT NULL DEFAULT 0
         )
+        """)
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT NOT NULL,
-                time TEXT NOT NULL,
-                side TEXT NOT NULL,
-                symbol TEXT NOT NULL,
-                mode TEXT NOT NULL,
-                size REAL NOT NULL,
-                sl REAL NOT NULL,
-                tp REAL NOT NULL,
-                leverage REAL NOT NULL,
-                entry_price REAL NOT NULL,
-                current_price REAL NOT NULL,
-                unreal_pnl_percent REAL NOT NULL,
-                unreal_pnl_value REAL NOT NULL,
-                equity_after REAL NOT NULL,
-                reason TEXT,
-                session_id INTEGER NOT NULL DEFAULT 0
-            )
-            """
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS trades (
+            id {_serial},
+            email TEXT NOT NULL,
+            time TEXT NOT NULL,
+            side TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            size REAL NOT NULL,
+            sl REAL NOT NULL,
+            tp REAL NOT NULL,
+            leverage REAL NOT NULL,
+            entry_price REAL NOT NULL,
+            current_price REAL NOT NULL,
+            unreal_pnl_percent REAL NOT NULL,
+            unreal_pnl_value REAL NOT NULL,
+            equity_after REAL NOT NULL,
+            reason TEXT,
+            session_id INTEGER NOT NULL DEFAULT 0
         )
+        """)
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS admin_settings (
-                k TEXT PRIMARY KEY,
-                v TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS admin_settings (
+            k TEXT PRIMARY KEY,
+            v TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         )
+        """)
 
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS password_resets (
-                token TEXT PRIMARY KEY,
-                email TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                used INTEGER NOT NULL DEFAULT 0
-            )
-            """
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS password_resets (
+            token TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0
         )
+        """)
 
-        # safe migrations
-        if not _column_exists(cur, "trades", "reason"):
+        # Safe migrations for existing databases
+        if not column_exists(conn, "trades", "reason"):
             cur.execute("ALTER TABLE trades ADD COLUMN reason TEXT")
-        if not _column_exists(cur, "trades", "session_id"):
+        if not column_exists(conn, "trades", "session_id"):
             cur.execute("ALTER TABLE trades ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
-        if not _column_exists(cur, "user_state", "session_id"):
+        if not column_exists(conn, "user_state", "session_id"):
             cur.execute("ALTER TABLE user_state ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
 
-        # seed defaults if missing
-        def _set_default(key: str, value: str) -> None:
-            cur.execute("SELECT v FROM admin_settings WHERE k=?", (key,))
+        # Seed admin settings defaults
+        def _set_default(key: str, value: str):
+            cur.execute("SELECT v FROM admin_settings WHERE k=%s", (key,))
             if not cur.fetchone():
                 cur.execute(
-                    "INSERT INTO admin_settings(k,v,updated_at) VALUES(?,?,?)",
+                    "INSERT INTO admin_settings(k,v,updated_at) VALUES(%s,%s,%s)",
                     (key, value, now_utc_str()),
                 )
 
@@ -214,7 +163,7 @@ def init_db() -> None:
 init_db()
 
 # =========================
-# CONFIG (Binance) - kept for compatibility
+# CONFIG
 # =========================
 BINANCE_ENV = os.getenv("BINANCE_ENV", "live").lower().strip()
 if BINANCE_ENV not in ("live", "testnet"):
@@ -228,8 +177,6 @@ START_EQUITY = 1000.0
 RiskMode = Literal["ULTRA_SAFE", "SAFE", "NORMAL", "MINI_ASYM", "AGGRESSIVE"]
 Side = Literal["LONG", "SHORT"]
 TF = Literal["15m", "1h", "4h", "1d"]
-
-# used for validation only in your code
 TF_MAP: Dict[str, str] = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
 
 DUBAI_TZ = timezone(timedelta(hours=4))
@@ -259,11 +206,11 @@ def ensure_user_state(email: str) -> None:
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("SELECT equity, session_id FROM user_state WHERE email = ?", (email,))
+        cur.execute("SELECT equity, session_id FROM user_state WHERE email = %s", (email,))
         row = cur.fetchone()
         if not row:
             cur.execute(
-                "INSERT INTO user_state(email, equity, session_id) VALUES(?, ?, ?)",
+                "INSERT INTO user_state(email, equity, session_id) VALUES(%s, %s, %s)",
                 (email, START_EQUITY, 0),
             )
             conn.commit()
@@ -275,7 +222,7 @@ def get_equity(email: str) -> float:
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("SELECT equity FROM user_state WHERE email = ?", (email,))
+        cur.execute("SELECT equity FROM user_state WHERE email = %s", (email,))
         row = cur.fetchone()
         conn.close()
     return float(row["equity"])
@@ -286,7 +233,7 @@ def set_equity(email: str, equity: float) -> None:
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("UPDATE user_state SET equity = ? WHERE email = ?", (float(equity), email))
+        cur.execute("UPDATE user_state SET equity = %s WHERE email = %s", (float(equity), email))
         conn.commit()
         conn.close()
 
@@ -296,7 +243,7 @@ def get_session_id(email: str) -> int:
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("SELECT session_id FROM user_state WHERE email = ?", (email,))
+        cur.execute("SELECT session_id FROM user_state WHERE email = %s", (email,))
         row = cur.fetchone()
         conn.close()
     return int(row["session_id"] or 0)
@@ -307,16 +254,16 @@ def set_session_id(email: str, sid: int) -> None:
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("UPDATE user_state SET session_id = ? WHERE email = ?", (int(sid), email))
+        cur.execute("UPDATE user_state SET session_id = %s WHERE email = %s", (int(sid), email))
         conn.commit()
         conn.close()
 
 
-def get_exchange(email: str) -> Optional[sqlite3.Row]:
+def get_exchange(email: str) -> Optional[dict]:
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM exchange_keys WHERE email = ?", (email,))
+        cur.execute("SELECT * FROM exchange_keys WHERE email = %s", (email,))
         row = cur.fetchone()
         conn.close()
     return row
@@ -328,7 +275,7 @@ def require_user(session: Optional[str] = Cookie(default=None)) -> Dict[str, str
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("SELECT email FROM sessions WHERE token = ?", (session,))
+        cur.execute("SELECT email FROM sessions WHERE token = %s", (session,))
         row = cur.fetchone()
         conn.close()
     if not row:
@@ -362,7 +309,7 @@ def admin_get_setting(key: str, default: str) -> str:
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("SELECT v FROM admin_settings WHERE k=?", (key,))
+        cur.execute("SELECT v FROM admin_settings WHERE k=%s", (key,))
         row = cur.fetchone()
         conn.close()
     return (row["v"] if row else default)
@@ -374,7 +321,7 @@ def admin_set_setting(key: str, value: str) -> None:
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO admin_settings(k,v,updated_at) VALUES(?,?,?)
+            INSERT INTO admin_settings(k,v,updated_at) VALUES(%s,%s,%s)
             ON CONFLICT(k) DO UPDATE SET
                 v=excluded.v,
                 updated_at=excluded.updated_at
@@ -410,10 +357,10 @@ def seats_used() -> int:
 with DB_LOCK:
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT email FROM users WHERE email = ?", (DEMO_EMAIL,))
+    cur.execute("SELECT email FROM users WHERE email = %s", (DEMO_EMAIL,))
     if not cur.fetchone():
         cur.execute(
-            "INSERT INTO users(email, password_hash, created_at) VALUES(?, ?, ?)",
+            "INSERT INTO users(email, password_hash, created_at) VALUES(%s, %s, %s)",
             (DEMO_EMAIL, hash_pw(DEMO_PASS), now_utc_str()),
         )
         conn.commit()
@@ -430,17 +377,18 @@ def config():
         "timezone": "Asia/Dubai (UTC+4)",
         "env": ENV,
         "frontend_origins": FRONTEND_ORIGINS,
+        "db": "postgresql" if USING_PG else "sqlite",
     }
 
 
 @app.get("/health")
 def health():
-    return {"health": "green", "binance_env": BINANCE_ENV, "db_path": DB_PATH, "env": ENV}
-
-
-@app.get("/api/health")
-def api_health():
-    return health()
+    return {
+        "health": "green",
+        "binance_env": BINANCE_ENV,
+        "db": "postgresql" if USING_PG else "sqlite",
+        "env": ENV,
+    }
 
 
 # =========================
@@ -457,13 +405,9 @@ class SessionOut(BaseModel):
 
 
 # =========================
-# COOKIE SETTINGS (FIXED FOR VERCEL)
+# COOKIE SETTINGS
 # =========================
 def set_session_cookie(response: Response, token: str) -> None:
-    """
-    Dev: samesite=lax, secure=False
-    Prod (Vercel -> Render cross-site cookies): samesite=none, secure=True
-    """
     base = dict(
         key="session",
         value=token,
@@ -501,13 +445,13 @@ def signup(payload: AuthIn):
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("SELECT email FROM users WHERE email = ?", (email,))
+        cur.execute("SELECT email FROM users WHERE email = %s", (email,))
         if cur.fetchone():
             conn.close()
             raise HTTPException(status_code=400, detail="User already exists")
 
         cur.execute(
-            "INSERT INTO users(email, password_hash, created_at) VALUES(?, ?, ?)",
+            "INSERT INTO users(email, password_hash, created_at) VALUES(%s, %s, %s)",
             (email, hash_pw(payload.password), now_utc_str()),
         )
         conn.commit()
@@ -523,7 +467,7 @@ def login(payload: AuthIn, response: Response):
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("SELECT password_hash FROM users WHERE email = ?", (email,))
+        cur.execute("SELECT password_hash FROM users WHERE email = %s", (email,))
         row = cur.fetchone()
         conn.close()
 
@@ -531,12 +475,12 @@ def login(payload: AuthIn, response: Response):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = secrets.token_urlsafe(32)
-    now_ts = int(time.time())
+    now = int(time.time())
 
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("INSERT INTO sessions(token, email, created_at) VALUES(?, ?, ?)", (token, email, now_ts))
+        cur.execute("INSERT INTO sessions(token, email, created_at) VALUES(%s, %s, %s)", (token, email, now))
         conn.commit()
         conn.close()
 
@@ -551,7 +495,7 @@ def logout(response: Response, session: Optional[str] = Cookie(default=None)):
         with DB_LOCK:
             conn = db()
             cur = conn.cursor()
-            cur.execute("DELETE FROM sessions WHERE token = ?", (session,))
+            cur.execute("DELETE FROM sessions WHERE token = %s", (session,))
             conn.commit()
             conn.close()
 
@@ -566,14 +510,14 @@ def session_me(session: Optional[str] = Cookie(default=None)):
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("SELECT email FROM sessions WHERE token = ?", (session,))
+        cur.execute("SELECT email FROM sessions WHERE token = %s", (session,))
         row = cur.fetchone()
         conn.close()
     return {"ok": bool(row), "email": row["email"] if row else None}
 
 
 # =========================
-# FORGOT PASSWORD (DEMO)
+# FORGOT PASSWORD
 # =========================
 class ForgotIn(BaseModel):
     email: str
@@ -593,7 +537,7 @@ def auth_forgot(payload: ForgotIn):
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("SELECT email FROM users WHERE email=?", (email,))
+        cur.execute("SELECT email FROM users WHERE email=%s", (email,))
         u = cur.fetchone()
         if not u:
             conn.close()
@@ -601,7 +545,7 @@ def auth_forgot(payload: ForgotIn):
 
         token = secrets.token_urlsafe(32)
         cur.execute(
-            "INSERT INTO password_resets(token,email,created_at,used) VALUES(?,?,?,0)",
+            "INSERT INTO password_resets(token,email,created_at,used) VALUES(%s,%s,%s,0)",
             (token, email, int(time.time())),
         )
         conn.commit()
@@ -620,7 +564,7 @@ def auth_reset(payload: ResetIn):
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("SELECT email, used, created_at FROM password_resets WHERE token=?", (token,))
+        cur.execute("SELECT email, used, created_at FROM password_resets WHERE token=%s", (token,))
         row = cur.fetchone()
         if not row:
             conn.close()
@@ -636,9 +580,9 @@ def auth_reset(payload: ResetIn):
             raise HTTPException(status_code=400, detail="Token expired")
 
         email = row["email"]
-        cur.execute("UPDATE users SET password_hash=? WHERE email=?", (hash_pw(new_pw), email))
-        cur.execute("UPDATE password_resets SET used=1 WHERE token=?", (token,))
-        cur.execute("DELETE FROM sessions WHERE email=?", (email,))
+        cur.execute("UPDATE users SET password_hash=%s WHERE email=%s", (hash_pw(new_pw), email))
+        cur.execute("UPDATE password_resets SET used=1 WHERE token=%s", (token,))
+        cur.execute("DELETE FROM sessions WHERE email=%s", (email,))
         conn.commit()
         conn.close()
 
@@ -667,16 +611,16 @@ def admin_force_reset(payload: AdminForceResetIn):
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("SELECT email FROM users WHERE email=?", (email,))
+        cur.execute("SELECT email FROM users WHERE email=%s", (email,))
         u = cur.fetchone()
         if not u:
             cur.execute(
-                "INSERT INTO users(email, password_hash, created_at) VALUES(?,?,?)",
+                "INSERT INTO users(email, password_hash, created_at) VALUES(%s,%s,%s)",
                 (email, hash_pw(payload.new_password), now_utc_str()),
             )
         else:
-            cur.execute("UPDATE users SET password_hash=? WHERE email=?", (hash_pw(payload.new_password), email))
-        cur.execute("DELETE FROM sessions WHERE email=?", (email,))
+            cur.execute("UPDATE users SET password_hash=%s WHERE email=%s", (hash_pw(payload.new_password), email))
+        cur.execute("DELETE FROM sessions WHERE email=%s", (email,))
         conn.commit()
         conn.close()
 
@@ -720,7 +664,7 @@ def exchange_connect(payload: ExchangeConnectIn, user=Depends(require_user)):
         cur.execute(
             """
             INSERT INTO exchange_keys(email, exchange, api_key, api_secret, passphrase, created_at)
-            VALUES(?, ?, ?, ?, ?, ?)
+            VALUES(%s, %s, %s, %s, %s, %s)
             ON CONFLICT(email) DO UPDATE SET
                 exchange=excluded.exchange,
                 api_key=excluded.api_key,
@@ -749,7 +693,7 @@ def exchange_disconnect(user=Depends(require_user)):
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("DELETE FROM exchange_keys WHERE email = ?", (email,))
+        cur.execute("DELETE FROM exchange_keys WHERE email = %s", (email,))
         conn.commit()
         conn.close()
     return {"ok": True}
@@ -775,108 +719,45 @@ def exchange_balance(user=Depends(require_user)):
 
 
 # =========================
-# MARKET (PUBLIC) - OKX
+# MARKET (PUBLIC)
 # =========================
-OKX_BASE = "https://www.okx.com"
-
-# OKX timeframes
-OKX_TF_MAP = {"15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}
-
-
-def to_okx_inst(symbol: str) -> str:
-    # BTCUSDT -> BTC-USDT
-    s = (symbol or "").upper().strip()
-    if "-" in s:
-        return s
-    if s.endswith("USDT"):
-        base = s[:-4]
-        return f"{base}-USDT"
-    return s
-
-
-async def okx_price(symbol: str) -> float:
-    inst = to_okx_inst(symbol)
+async def binance_price(symbol: str) -> float:
     async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(
-            f"{OKX_BASE}/api/v5/market/ticker",
-            params={"instId": inst},
-            headers={"accept": "application/json"},
-        )
-
-    if r.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"OKX price error: {r.text[:200]}")
-
-    data = r.json()
-    arr = (data or {}).get("data") or []
-    if not arr:
-        raise HTTPException(status_code=400, detail=f"OKX price error: no ticker for {inst}")
-
-    last = arr[0].get("last")
-    if last is None:
-        raise HTTPException(status_code=400, detail=f"OKX price error: missing last for {inst}")
-
-    return float(last)
+        r = await client.get(f"{BINANCE_BASE}/api/v3/ticker/price", params={"symbol": symbol.upper()})
+        if r.status_code != 200:
+            raise HTTPException(status_code=400, detail=f"Binance price error: {r.text}")
+        return float(r.json()["price"])
 
 
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
-    return {"symbol": symbol.upper().strip(), "price": await okx_price(symbol)}
+    return {"symbol": symbol.upper(), "price": await binance_price(symbol)}
 
 
 def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
-    inst = to_okx_inst(symbol)
-    bar = OKX_TF_MAP.get(str(tf))
-    if not bar:
+    if tf not in TF_MAP:
         return []
-
+    url = f"{BINANCE_BASE}/api/v3/klines"
+    params = {"symbol": symbol.upper(), "interval": TF_MAP[tf], "limit": int(limit)}
     try:
-        r = httpx.get(
-            f"{OKX_BASE}/api/v5/market/candles",
-            params={"instId": inst, "bar": bar, "limit": int(limit)},
-            timeout=12,
-            headers={"accept": "application/json"},
-        )
+        r = httpx.get(url, params=params, timeout=12)
         if r.status_code != 200:
             return []
-
-        data = r.json()
-        rows = (data or {}).get("data") or []
-        if not rows:
-            return []
-
-        # OKX candle row:
-        # [ ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm ]
+        raw = r.json()
         out: List[Dict[str, Any]] = []
-        for k in rows:
-            out.append(
-                {
-                    "t": int(k[0]),  # ms
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4]),
-                    "volume": float(k[5]),
-                }
-            )
-
-        # OKX usually returns newest -> oldest
-        out.reverse()
+        for k in raw:
+            out.append({"t": int(k[0]), "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])})
         return out
-
     except Exception:
         return []
 
 
 @app.get("/klines/{symbol}")
 def klines(symbol: str, tf: TF = Query("1h"), limit: int = Query(200, ge=20, le=1000)):
-    rows = _fetch_klines_sync(symbol, str(tf), limit=limit)
+    rows = _fetch_klines_sync(symbol, tf, limit=limit)
     if not rows:
-        raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or OKX blocked).")
-    return {"symbol": symbol.upper().strip(), "tf": str(tf), "klines": rows}
-
-
-# ✅ keep compatibility with your existing trading engine
-binance_price = okx_price
+        raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or Binance blocked).")
+    return {"symbol": symbol.upper(), "tf": tf, "klines": rows}
 
 
 # =========================
@@ -925,9 +806,9 @@ def build_reason(mode: RiskMode, equity: float, computed: Dict[str, float], extr
     lines.append(f"Equity: ${equity:.2f} (start ${START_EQUITY:.2f}, growth {growth*100:.2f}%)")
     lines.append("Risk rules applied:")
     if growth >= 0.10:
-        lines.append("- Equity growth ≥ 10% → reduce size and leverage by ~10% to protect profits.")
+        lines.append("- Equity growth >= 10% -> reduce size and leverage by ~10% to protect profits.")
     else:
-        lines.append("- Equity growth < 10% (or negative) → use default preset for the selected mode.")
+        lines.append("- Equity growth < 10% -> use default preset for the selected mode.")
     lines.append("Computed parameters:")
     lines.append(f"- Size%: {computed['size']:.2f}")
     lines.append(f"- SL%:   {computed['sl']:.2f}")
@@ -959,10 +840,10 @@ class TradeIn(BaseModel):
     symbol: str
     side: Side
     mode: RiskMode
-    size: Optional[float] = None
-    sl: Optional[float] = None
-    tp: Optional[float] = None
-    leverage: Optional[float] = None
+    size: float
+    sl: float
+    tp: float
+    leverage: float
 
 
 class RiskPreviewIn(BaseModel):
@@ -1003,7 +884,7 @@ def balance(user=Depends(require_user)):
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute("SELECT time FROM trades WHERE email = ? ORDER BY id DESC LIMIT 1", (email,))
+        cur.execute("SELECT time FROM trades WHERE email = %s ORDER BY id DESC LIMIT 1", (email,))
         row = cur.fetchone()
         conn.close()
     return {"total": equity, "equity_after_last_trade": equity, "last_trade": row["time"] if row else None}
@@ -1017,19 +898,19 @@ def trades(
     limit: int = Query(default=500, ge=1, le=2000),
 ):
     email = user["email"]
-    where = ["email = ?"]
+    where = ["email = %s"]
     params: List[Any] = [email]
 
     if current_session:
         sid = get_session_id(email)
-        where.append("session_id = ?")
+        where.append("session_id = %s")
         params.append(sid)
 
     if symbol:
-        where.append("UPPER(symbol) = ?")
+        where.append("UPPER(symbol) = %s")
         params.append(symbol.strip().upper())
 
-    q = f"SELECT * FROM trades WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ?"
+    q = f"SELECT * FROM trades WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT %s"
     params.append(int(limit))
 
     with DB_LOCK:
@@ -1059,9 +940,9 @@ async def _place_trade_internal(
     c = out["computed"]
     reason_text = build_reason(mode, equity_before, c, extra=extra_reason)
 
-    entry = await binance_price(symbol)  # alias -> okx_price
+    entry = await binance_price(symbol)
 
-    move = ((int(time.time()) % 140) - 70) / 1000.0  # -0.07..+0.07
+    move = ((int(time.time()) % 140) - 70) / 1000.0
     pnl_pct = move * (c["leverage"] / 5.0)
     pnl_value = equity_before * (c["size"] / 100.0) * pnl_pct
     equity_after = equity_before + pnl_value
@@ -1092,25 +973,14 @@ async def _place_trade_internal(
                 email, time, side, symbol, mode, size, sl, tp, leverage,
                 entry_price, current_price, unreal_pnl_percent, unreal_pnl_value, equity_after,
                 reason, session_id
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """,
             (
-                email,
-                tr.time,
-                tr.side,
-                tr.symbol,
-                tr.mode,
-                float(tr.size),
-                float(tr.sl),
-                float(tr.tp),
-                float(tr.leverage),
-                float(tr.entry_price),
-                float(tr.current_price),
-                float(tr.unreal_pnl_percent),
-                float(tr.unreal_pnl_value),
-                float(tr.equity_after),
-                tr.reason,
-                int(sid),
+                email, tr.time, tr.side, tr.symbol, tr.mode,
+                float(tr.size), float(tr.sl), float(tr.tp), float(tr.leverage),
+                float(tr.entry_price), float(tr.current_price),
+                float(tr.unreal_pnl_percent), float(tr.unreal_pnl_value),
+                float(tr.equity_after), tr.reason, int(sid),
             ),
         )
         conn.commit()
@@ -1174,19 +1044,9 @@ class AutoStartIn(BaseModel):
 
 
 class AutoRunner:
-    def __init__(
-        self,
-        email: str,
-        symbol: str,
-        tf: str,
-        interval_sec: int,
-        mode: RiskMode,
-        max_trades_per_day: int,
-        stop_after_bad_trades: int,
-        duration_days: int,
-        trend_filter: bool,
-        chop_min_sep_pct: float,
-    ) -> None:
+    def __init__(self, email, symbol, tf, interval_sec, mode,
+                 max_trades_per_day, stop_after_bad_trades, duration_days,
+                 trend_filter, chop_min_sep_pct):
         self.email = email
         self.symbol = symbol.upper().strip()
         self.tf = tf
@@ -1197,43 +1057,38 @@ class AutoRunner:
         self.duration_days = int(max(0, duration_days))
         self.trend_filter = bool(trend_filter)
         self.chop_min_sep_pct = float(max(0.0, chop_min_sep_pct))
-
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
-
         self.last_signal: str = "-"
         self.last_side: Side = "LONG"
         self.last_trade_ts: float = 0.0
         self.last_run_ts: float = 0.0
         self.blocked_reason: Optional[str] = None
-
         self.day_key = dubai_day_key()
         self.trades_today = 0
         self.bad_trades_today = 0
-
         self.end_at_ts: Optional[float] = None
         if self.duration_days > 0:
             end_dt = now_dubai() + timedelta(days=self.duration_days)
             self.end_at_ts = end_dt.timestamp()
-
         self.history: Deque[Dict[str, str]] = deque(maxlen=120)
         self._prev_sig: str = ""
 
-    def is_running(self) -> bool:
+    def is_running(self):
         return not self.stop_event.is_set()
 
-    def log(self, msg: str) -> None:
+    def log(self, msg):
         self.history.appendleft({"t": now_utc_str(), "msg": msg})
 
-    def start(self) -> None:
+    def start(self):
         self.log("AI started.")
         self.thread.start()
 
-    def stop(self, reason: str = "Stopped by user.") -> None:
+    def stop(self, reason="Stopped by user."):
         self.log(reason)
         self.stop_event.set()
 
-    def _reset_if_new_day(self) -> None:
+    def _reset_if_new_day(self):
         k = dubai_day_key()
         if k != self.day_key:
             self.day_key = k
@@ -1241,7 +1096,7 @@ class AutoRunner:
             self.bad_trades_today = 0
             self.log("Daily counters reset (Dubai timezone).")
 
-    def _reset_in_sec(self) -> int:
+    def _reset_in_sec(self):
         now_dt = now_dubai()
         next_midnight = (now_dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         return int((next_midnight - now_dt).total_seconds())
@@ -1251,29 +1106,18 @@ class AutoRunner:
         last_trade = datetime.utcfromtimestamp(self.last_trade_ts).strftime("%Y-%m-%d %H:%M:%S") if self.last_trade_ts else "-"
         end_at = datetime.fromtimestamp(self.end_at_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if self.end_at_ts else None
         return AutoState(
-            running=self.is_running(),
-            email=self.email,
-            symbol=self.symbol,
-            tf=self.tf,
-            interval_sec=self.interval_sec,
-            mode=self.mode,
-            side=self.last_side,
-            last_signal=self.last_signal or "-",
-            blocked_reason=self.blocked_reason,
-            last_run_at=last_run,
-            last_trade_at=last_trade,
-            max_trades_per_day=self.max_trades_per_day,
-            trades_today=self.trades_today,
-            stop_after_bad_trades=self.stop_after_bad_trades,
-            bad_trades_today=self.bad_trades_today,
-            reset_in_sec=self._reset_in_sec(),
-            duration_days=self.duration_days,
-            end_at=end_at,
-            trend_filter=self.trend_filter,
-            chop_min_sep_pct=self.chop_min_sep_pct,
+            running=self.is_running(), email=self.email, symbol=self.symbol,
+            tf=self.tf, interval_sec=self.interval_sec, mode=self.mode,
+            side=self.last_side, last_signal=self.last_signal or "-",
+            blocked_reason=self.blocked_reason, last_run_at=last_run,
+            last_trade_at=last_trade, max_trades_per_day=self.max_trades_per_day,
+            trades_today=self.trades_today, stop_after_bad_trades=self.stop_after_bad_trades,
+            bad_trades_today=self.bad_trades_today, reset_in_sec=self._reset_in_sec(),
+            duration_days=self.duration_days, end_at=end_at,
+            trend_filter=self.trend_filter, chop_min_sep_pct=self.chop_min_sep_pct,
         )
 
-    def _signal_and_filters(self) -> Dict[str, Any]:
+    def _signal_and_filters(self):
         closes = [k["close"] for k in _fetch_klines_sync(self.symbol, self.tf, limit=260)]
         if len(closes) < 210:
             return {"ok": False, "blocked": "NO_DATA", "signal": "NO_DATA"}
@@ -1299,9 +1143,8 @@ class AutoRunner:
 
         return {"ok": True, "blocked": None, "signal": sig, "side": desired_side, "sep_pct": sep_pct}
 
-    def _run_loop(self) -> None:
+    def _run_loop(self):
         cooldown_sec = max(60, self.interval_sec)
-
         while not self.stop_event.is_set():
             try:
                 self._reset_if_new_day()
@@ -1357,19 +1200,14 @@ class AutoRunner:
 
                 if should_trade:
                     import asyncio
-
                     out = asyncio.run(
                         _place_trade_internal(
-                            self.email,
-                            self.symbol,
-                            desired_side,
-                            self.mode,
+                            self.email, self.symbol, desired_side, self.mode,
                             extra_reason=f"Auto AI Trader (V3): tf={self.tf}, interval={self.interval_sec}s, signal={self.last_signal}",
                         )
                     )
                     self.last_trade_ts = now_ts
                     self.trades_today += 1
-
                     pnl_pct = float(out.get("pnl_pct", 0.0))
                     if pnl_pct < 0:
                         self.bad_trades_today += 1
@@ -1388,87 +1226,14 @@ class AutoRunner:
                 time.sleep(self.interval_sec)
 
 
-# =========================
-# ✅ FIXED: /trade accepts dict OR stringified JSON OR [dict]
-# =========================
 @app.post("/trade")
-async def place_trade(payload: Any = Body(...), user=Depends(require_user)):
+async def place_trade(payload: TradeIn, user=Depends(require_user)):
     email = user["email"]
-
-    # ✅ OPTION 2 FIX:
-    # Frontend sometimes sends JSON as a string.
-    # Accept either dict OR stringified JSON.
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid JSON payload (string)")
-
-    # If frontend wrapped it like { "payload": {...} } or { "data": {...} }
-    if isinstance(payload, dict):
-        if "payload" in payload and isinstance(payload["payload"], (dict, str)):
-            payload = payload["payload"]
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except Exception:
-                    raise HTTPException(status_code=400, detail="Invalid JSON payload inside 'payload'")
-        if "data" in payload and isinstance(payload["data"], (dict, str)):
-            payload = payload["data"]
-            if isinstance(payload, str):
-                try:
-                    payload = json.loads(payload)
-                except Exception:
-                    raise HTTPException(status_code=400, detail="Invalid JSON payload inside 'data'")
-
-    # Validate into your existing TradeIn model
-    try:
-        trade = TradeIn(**payload) if isinstance(payload, dict) else TradeIn.parse_raw(payload)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=f"Bad trade payload: {str(e)}")
-
     with AUTO_LOCK:
         r = AUTO_RUNNERS.get(email)
         if r and r.is_running():
             raise HTTPException(status_code=400, detail="Manual trading disabled while AI is running.")
-
-    return await _place_trade_internal(
-        email,
-        trade.symbol,
-        trade.side,
-        trade.mode,
-        extra_reason="Manual trade request.",
-    )
-
-    raw = payload
-
-    # if frontend sent: [ {...} ]  -> take first
-    if isinstance(raw, list) and raw:
-        raw = raw[0]
-
-    # if frontend sent JSON as a STRING -> parse it
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Trade payload must be JSON object (got string).")
-
-    if not isinstance(raw, dict):
-        raise HTTPException(status_code=400, detail="Trade payload must be a JSON object.")
-
-    # validate via Pydantic model
-    try:
-        payload_obj = TradeIn.parse_obj(raw)
-    except Exception as e:
-        raise HTTPException(status_code=422, detail=str(e))
-
-    return await _place_trade_internal(
-        email,
-        payload_obj.symbol,
-        payload_obj.side,
-        payload_obj.mode,
-        extra_reason="Manual trade request.",
-    )
+    return await _place_trade_internal(email, payload.symbol, payload.side, payload.mode, extra_reason="Manual trade request.")
 
 
 @app.post("/reset")
@@ -1503,37 +1268,17 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
 
 
 @app.post("/auto/start")
-def auto_start(payload: Any = Body(...), user=Depends(require_user)):
+def auto_start(payload: AutoStartIn, user=Depends(require_user)):
     email = user["email"]
-
-    # ✅ Option 2: accept either dict OR JSON string from frontend
-    data = payload
-    if isinstance(data, str):
-        try:
-            data = json.loads(data)
-        except Exception:
-            raise HTTPException(status_code=422, detail="Invalid JSON body for auto/start (string not parseable).")
-
-    # Validate into AutoStartIn (supports pydantic v1 and v2)
-    try:
-        payload_obj = AutoStartIn.model_validate(data)  # pydantic v2
-    except AttributeError:
-        payload_obj = AutoStartIn.parse_obj(data)       # pydantic v1
-
-    symbol = payload_obj.symbol.upper().strip()
-
+    symbol = payload.symbol.upper().strip()
     if not symbol.endswith("USDT"):
-        raise HTTPException(status_code=400, detail="Use symbol like BTCUSDT / ETHUSDT / SOLUSDT")
-    if payload_obj.tf not in TF_MAP:
+        raise HTTPException(status_code=400, detail="Use Binance symbol like BTCUSDT / ETHUSDT / SOLUSDT")
+    if payload.tf not in TF_MAP:
         raise HTTPException(status_code=400, detail="Bad timeframe")
-    if payload_obj.interval_sec < 5 or payload_obj.interval_sec > 3600:
+    if payload.interval_sec < 5 or payload.interval_sec > 3600:
         raise HTTPException(status_code=400, detail="interval_sec must be 5..3600")
 
-    max_trades = (
-        payload_obj.max_trades_per_day
-        if payload_obj.max_trades_per_day is not None
-        else default_max_trades_per_day(payload_obj.mode)
-    )
+    max_trades = payload.max_trades_per_day if payload.max_trades_per_day is not None else default_max_trades_per_day(payload.mode)
 
     with AUTO_LOCK:
         old = AUTO_RUNNERS.get(email)
@@ -1542,29 +1287,20 @@ def auto_start(payload: Any = Body(...), user=Depends(require_user)):
             del AUTO_RUNNERS[email]
 
         runner = AutoRunner(
-            email=email,
-            symbol=symbol,
-            tf=payload_obj.tf,
-            interval_sec=payload_obj.interval_sec,
-            mode=payload_obj.mode,
+            email=email, symbol=symbol, tf=payload.tf,
+            interval_sec=payload.interval_sec, mode=payload.mode,
             max_trades_per_day=int(max_trades),
-            stop_after_bad_trades=int(payload_obj.stop_after_bad_trades),
-            duration_days=int(payload_obj.duration_days),
-            trend_filter=bool(payload_obj.trend_filter),
-            chop_min_sep_pct=float(payload_obj.chop_min_sep_pct),
+            stop_after_bad_trades=int(payload.stop_after_bad_trades),
+            duration_days=int(payload.duration_days),
+            trend_filter=bool(payload.trend_filter),
+            chop_min_sep_pct=float(payload.chop_min_sep_pct),
         )
         AUTO_RUNNERS[email] = runner
         runner.start()
 
-    return {
-        "ok": True,
-        "running": True,
-        "symbol": symbol,
-        "tf": payload_obj.tf,
-        "interval_sec": payload_obj.interval_sec,
-        "mode": payload_obj.mode,
-        "max_trades_per_day": int(max_trades),
-    }
+    return {"ok": True, "running": True, "symbol": symbol, "tf": payload.tf,
+            "interval_sec": payload.interval_sec, "mode": payload.mode,
+            "max_trades_per_day": int(max_trades)}
 
 
 @app.post("/auto/stop")
@@ -1589,8 +1325,7 @@ class AdminSettingsIn(BaseModel):
 @app.get("/admin/status")
 def admin_status(admin=Depends(require_admin)):
     return {
-        "ok": True,
-        "admin": admin,
+        "ok": True, "admin": admin,
         "signup_enabled": signup_is_enabled(),
         "seat_capacity": seat_capacity(),
         "seats_used": seats_used(),
@@ -1646,7 +1381,6 @@ def admin_users(
     limit: int = Query(default=100, ge=1, le=2000),
 ):
     qn = (q or "").strip().lower()
-
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
@@ -1655,13 +1389,13 @@ def admin_users(
             cur.execute(
                 """
                 SELECT u.email, u.created_at,
-                       COALESCE(s.equity, ?) AS equity,
+                       COALESCE(s.equity, %s) AS equity,
                        COALESCE(s.session_id, 0) AS session_id
                 FROM users u
                 LEFT JOIN user_state s ON s.email = u.email
-                WHERE LOWER(u.email) LIKE ?
+                WHERE LOWER(u.email) LIKE %s
                 ORDER BY u.created_at DESC
-                LIMIT ?
+                LIMIT %s
                 """,
                 (START_EQUITY, f"%{qn}%", int(limit)),
             )
@@ -1669,12 +1403,12 @@ def admin_users(
             cur.execute(
                 """
                 SELECT u.email, u.created_at,
-                       COALESCE(s.equity, ?) AS equity,
+                       COALESCE(s.equity, %s) AS equity,
                        COALESCE(s.session_id, 0) AS session_id
                 FROM users u
                 LEFT JOIN user_state s ON s.email = u.email
                 ORDER BY u.created_at DESC
-                LIMIT ?
+                LIMIT %s
                 """,
                 (START_EQUITY, int(limit)),
             )
@@ -1683,28 +1417,22 @@ def admin_users(
         out = []
         for r in rows:
             email = r["email"]
-            cur.execute("SELECT 1 FROM exchange_keys WHERE email=? LIMIT 1", (email,))
+            cur.execute("SELECT 1 FROM exchange_keys WHERE email=%s LIMIT 1", (email,))
             ex = bool(cur.fetchone())
-
-            cur.execute("SELECT COUNT(*) AS n FROM trades WHERE email=?", (email,))
+            cur.execute("SELECT COUNT(*) AS n FROM trades WHERE email=%s", (email,))
             tcount = int(cur.fetchone()["n"])
-
             with AUTO_LOCK:
                 rr = AUTO_RUNNERS.get(email)
                 running = bool(rr and rr.is_running())
-
-            out.append(
-                {
-                    "email": email,
-                    "created_at": r["created_at"],
-                    "equity": float(r["equity"]),
-                    "session_id": int(r["session_id"]),
-                    "exchange_connected": ex,
-                    "trades_count": tcount,
-                    "ai_running": running,
-                }
-            )
-
+            out.append({
+                "email": email,
+                "created_at": r["created_at"],
+                "equity": float(r["equity"]),
+                "session_id": int(r["session_id"]),
+                "exchange_connected": ex,
+                "trades_count": tcount,
+                "ai_running": running,
+            })
         conn.close()
 
     return {"ok": True, "users": out}
@@ -1724,26 +1452,25 @@ def admin_user_details(
         conn = db()
         cur = conn.cursor()
 
-        cur.execute("SELECT email, created_at FROM users WHERE email=?", (email,))
+        cur.execute("SELECT email, created_at FROM users WHERE email=%s", (email,))
         u = cur.fetchone()
         if not u:
             conn.close()
             raise HTTPException(status_code=404, detail="User not found")
 
-        cur.execute("SELECT equity, session_id FROM user_state WHERE email=?", (email,))
+        cur.execute("SELECT equity, session_id FROM user_state WHERE email=%s", (email,))
         st = cur.fetchone()
         equity = float(st["equity"]) if st else START_EQUITY
         session_id = int(st["session_id"]) if st else 0
 
-        cur.execute("SELECT exchange, created_at FROM exchange_keys WHERE email=?", (email,))
+        cur.execute("SELECT exchange, created_at FROM exchange_keys WHERE email=%s", (email,))
         ex = cur.fetchone()
 
-        cur.execute("SELECT COUNT(*) AS n FROM trades WHERE email=?", (email,))
+        cur.execute("SELECT COUNT(*) AS n FROM trades WHERE email=%s", (email,))
         tcount = int(cur.fetchone()["n"])
 
-        cur.execute("SELECT * FROM trades WHERE email=? ORDER BY id DESC LIMIT ?", (email, int(trades_limit)))
+        cur.execute("SELECT * FROM trades WHERE email=%s ORDER BY id DESC LIMIT %s", (email, int(trades_limit)))
         trows = [dict(r) for r in cur.fetchall()]
-
         conn.close()
 
     with AUTO_LOCK:
@@ -1755,11 +1482,7 @@ def admin_user_details(
         "ok": True,
         "user": {"email": u["email"], "created_at": u["created_at"]},
         "state": {"equity": equity, "session_id": session_id},
-        "exchange": {
-            "connected": bool(ex),
-            "exchange": ex["exchange"] if ex else None,
-            "connected_at": ex["created_at"] if ex else None,
-        },
+        "exchange": {"connected": bool(ex), "exchange": ex["exchange"] if ex else None, "connected_at": ex["created_at"] if ex else None},
         "trades": {"count": tcount, "recent": trows},
         "ai": {"running": running, "status": auto_status_obj},
     }
