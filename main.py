@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Literal, Any, Deque
 from collections import deque
 
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query
+from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -44,6 +44,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Strip /api prefix forwarded by Vercel
+@app.middleware("http")
+async def strip_api_prefix(request: Request, call_next):
+    path = request.scope.get("path", "")
+    if path == "/api":
+        request.scope["path"] = "/"
+    elif path.startswith("/api/"):
+        request.scope["path"] = path[4:]
+    return await call_next(request)
 
 # =========================
 # DB LOCK (thread safety)
