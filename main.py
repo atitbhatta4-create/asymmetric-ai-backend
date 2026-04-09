@@ -638,7 +638,7 @@ def admin_force_reset(payload: AdminForceResetIn):
 # EXCHANGE CONNECT
 # =========================
 class ExchangeConnectIn(BaseModel):
-    exchange: Literal["binance", "okx"]
+    exchange: Literal["binance", "okx", "bybit"]
     api_key: str
     api_secret: str
     passphrase: Optional[str] = None
@@ -756,15 +756,6 @@ async def okx_price(symbol: str) -> float:
     return float(last)
 
 
-# alias used by trade engine
-binance_price = okx_price
-
-
-@app.get("/price/{symbol}")
-async def get_price(symbol: str):
-    return {"symbol": symbol.upper().strip(), "price": await okx_price(symbol)}
-
-
 def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
     inst = to_okx_inst(symbol)
     bar = OKX_TF_MAP.get(str(tf))
@@ -792,12 +783,111 @@ def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str,
         return []
 
 
+# =========================
+# MARKET (PUBLIC) — BYBIT
+# =========================
+BYBIT_BASE = "https://api.bybit.com"
+BYBIT_TF_MAP = {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+
+
+def to_bybit_symbol(symbol: str) -> str:
+    """Bybit uses BTCUSDT format (no dash)."""
+    s = (symbol or "").upper().strip()
+    if "-" in s:
+        return s.replace("-", "")
+    return s
+
+
+async def bybit_price(symbol: str) -> float:
+    sym = to_bybit_symbol(symbol)
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(
+            f"{BYBIT_BASE}/v5/market/tickers",
+            params={"category": "linear", "symbol": sym},
+            headers={"accept": "application/json"},
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Bybit price error: {r.text[:200]}")
+    data = (r.json() or {})
+    items = (data.get("result") or {}).get("list") or []
+    if not items:
+        raise HTTPException(status_code=400, detail=f"Bybit: no ticker for {sym}")
+    last = items[0].get("lastPrice")
+    if last is None:
+        raise HTTPException(status_code=400, detail=f"Bybit: missing lastPrice for {sym}")
+    return float(last)
+
+
+def _fetch_klines_bybit_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
+    sym = to_bybit_symbol(symbol)
+    interval = BYBIT_TF_MAP.get(str(tf))
+    if not interval:
+        return []
+    try:
+        r = httpx.get(
+            f"{BYBIT_BASE}/v5/market/kline",
+            params={"category": "linear", "symbol": sym, "interval": interval, "limit": int(limit)},
+            timeout=12,
+            headers={"accept": "application/json"},
+        )
+        if r.status_code != 200:
+            return []
+        items = ((r.json() or {}).get("result") or {}).get("list") or []
+        if not items:
+            return []
+        out: List[Dict[str, Any]] = []
+        # Bybit returns: [startTime, open, high, low, close, volume, turnover]
+        for k in items:
+            out.append({
+                "t": int(k[0]),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+            })
+        out.reverse()
+        return out
+    except Exception:
+        return []
+
+
+# alias used by trade engine (OKX has no geo-restriction on Render)
+binance_price = okx_price
+
+
+async def _route_price(symbol: str, exchange: str) -> float:
+    ex = (exchange or "okx").lower()
+    if ex == "bybit":
+        return await bybit_price(symbol)
+    return await okx_price(symbol)  # okx + binance users both get OKX (Binance geo-blocked on Render)
+
+
+def _route_klines(symbol: str, tf: str, exchange: str, limit: int) -> List[Dict[str, Any]]:
+    ex = (exchange or "okx").lower()
+    if ex == "bybit":
+        return _fetch_klines_bybit_sync(symbol, tf, limit=limit)
+    return _fetch_klines_sync(symbol, tf, limit=limit)
+
+
+@app.get("/price/{symbol}")
+async def get_price(symbol: str, exchange: Optional[str] = Query(default=None)):
+    sym = symbol.upper().strip()
+    price = await _route_price(sym, exchange or "okx")
+    return {"symbol": sym, "price": price, "exchange": (exchange or "okx").lower()}
+
+
 @app.get("/klines/{symbol}")
-def klines(symbol: str, tf: TF = Query("1h"), limit: int = Query(200, ge=20, le=1000)):
-    rows = _fetch_klines_sync(symbol, tf, limit=limit)
+def klines(
+    symbol: str,
+    tf: TF = Query("1h"),
+    limit: int = Query(200, ge=20, le=1000),
+    exchange: Optional[str] = Query(default=None),
+):
+    rows = _route_klines(symbol, tf, exchange or "okx", limit)
     if not rows:
-        raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or OKX unavailable).")
-    return {"symbol": symbol.upper().strip(), "tf": tf, "klines": rows}
+        raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or exchange unavailable).")
+    return {"symbol": symbol.upper().strip(), "tf": tf, "klines": rows, "exchange": (exchange or "okx").lower()}
 
 
 # =========================
