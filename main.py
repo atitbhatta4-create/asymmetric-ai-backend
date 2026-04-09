@@ -175,10 +175,8 @@ init_db()
 # =========================
 # CONFIG
 # =========================
-BINANCE_ENV = os.getenv("BINANCE_ENV", "live").lower().strip()
-if BINANCE_ENV not in ("live", "testnet"):
-    BINANCE_ENV = "live"
-BINANCE_BASE = "https://api.binance.com" if BINANCE_ENV == "live" else "https://testnet.binance.vision"
+OKX_BASE = "https://www.okx.com"
+OKX_TF_MAP = {"15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}
 
 # =========================
 # HELPERS
@@ -382,8 +380,7 @@ with DB_LOCK:
 @app.get("/config")
 def config():
     return {
-        "binance_env": BINANCE_ENV,
-        "binance_base": BINANCE_BASE,
+        "market": "okx",
         "timezone": "Asia/Dubai (UTC+4)",
         "env": ENV,
         "frontend_origins": FRONTEND_ORIGINS,
@@ -395,7 +392,7 @@ def config():
 def health():
     return {
         "health": "green",
-        "binance_env": BINANCE_ENV,
+        "market": "okx",
         "db": "postgresql" if USING_PG else "sqlite",
         "env": ENV,
     }
@@ -729,34 +726,67 @@ def exchange_balance(user=Depends(require_user)):
 
 
 # =========================
-# MARKET (PUBLIC)
+# MARKET (PUBLIC) — OKX
 # =========================
-async def binance_price(symbol: str) -> float:
+def to_okx_inst(symbol: str) -> str:
+    s = (symbol or "").upper().strip()
+    if "-" in s:
+        return s
+    if s.endswith("USDT"):
+        return f"{s[:-4]}-USDT"
+    return s
+
+
+async def okx_price(symbol: str) -> float:
+    inst = to_okx_inst(symbol)
     async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(f"{BINANCE_BASE}/api/v3/ticker/price", params={"symbol": symbol.upper()})
-        if r.status_code != 200:
-            raise HTTPException(status_code=400, detail=f"Binance price error: {r.text}")
-        return float(r.json()["price"])
+        r = await client.get(
+            f"{OKX_BASE}/api/v5/market/ticker",
+            params={"instId": inst},
+            headers={"accept": "application/json"},
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"OKX price error: {r.text[:200]}")
+    arr = (r.json() or {}).get("data") or []
+    if not arr:
+        raise HTTPException(status_code=400, detail=f"OKX: no ticker for {inst}")
+    last = arr[0].get("last")
+    if last is None:
+        raise HTTPException(status_code=400, detail=f"OKX: missing last price for {inst}")
+    return float(last)
+
+
+# alias used by trade engine
+binance_price = okx_price
 
 
 @app.get("/price/{symbol}")
 async def get_price(symbol: str):
-    return {"symbol": symbol.upper(), "price": await binance_price(symbol)}
+    return {"symbol": symbol.upper().strip(), "price": await okx_price(symbol)}
 
 
 def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
-    if tf not in TF_MAP:
+    inst = to_okx_inst(symbol)
+    bar = OKX_TF_MAP.get(str(tf))
+    if not bar:
         return []
-    url = f"{BINANCE_BASE}/api/v3/klines"
-    params = {"symbol": symbol.upper(), "interval": TF_MAP[tf], "limit": int(limit)}
     try:
-        r = httpx.get(url, params=params, timeout=12)
+        r = httpx.get(
+            f"{OKX_BASE}/api/v5/market/candles",
+            params={"instId": inst, "bar": bar, "limit": int(limit)},
+            timeout=12,
+            headers={"accept": "application/json"},
+        )
         if r.status_code != 200:
             return []
-        raw = r.json()
+        rows = (r.json() or {}).get("data") or []
+        if not rows:
+            return []
         out: List[Dict[str, Any]] = []
-        for k in raw:
-            out.append({"t": int(k[0]), "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])})
+        for k in rows:
+            out.append({"t": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                        "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])})
+        out.reverse()
         return out
     except Exception:
         return []
@@ -766,8 +796,8 @@ def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str,
 def klines(symbol: str, tf: TF = Query("1h"), limit: int = Query(200, ge=20, le=1000)):
     rows = _fetch_klines_sync(symbol, tf, limit=limit)
     if not rows:
-        raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or Binance blocked).")
-    return {"symbol": symbol.upper(), "tf": tf, "klines": rows}
+        raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or OKX unavailable).")
+    return {"symbol": symbol.upper().strip(), "tf": tf, "klines": rows}
 
 
 # =========================
@@ -1281,8 +1311,8 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
 def auto_start(payload: AutoStartIn, user=Depends(require_user)):
     email = user["email"]
     symbol = payload.symbol.upper().strip()
-    if not symbol.endswith("USDT"):
-        raise HTTPException(status_code=400, detail="Use Binance symbol like BTCUSDT / ETHUSDT / SOLUSDT")
+    if not (symbol.endswith("USDT") or symbol.endswith("-USDT")):
+        raise HTTPException(status_code=400, detail="Use symbol like BTCUSDT / ETHUSDT / SOLUSDT")
     if payload.tf not in TF_MAP:
         raise HTTPException(status_code=400, detail="Bad timeframe")
     if payload.interval_sec < 5 or payload.interval_sec > 3600:
