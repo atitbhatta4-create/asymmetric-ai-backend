@@ -1299,6 +1299,30 @@ class AutoRunner:
 
         return {"ok": True, "blocked": None, "signal": sig, "side": desired_side, "sep_pct": sep_pct}
 
+    def _secs_until_dubai_midnight(self) -> int:
+        """Seconds remaining until next Dubai midnight."""
+        now_dt = now_dubai()
+        next_midnight = (now_dt + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return max(1, int((next_midnight - now_dt).total_seconds()))
+
+    def _sleep_until_dubai_midnight(self) -> None:
+        """Sleep in small chunks until Dubai midnight, checking stop_event."""
+        secs = self._secs_until_dubai_midnight()
+        self.log(f"Daily limit reached — pausing {secs // 3600}h {(secs % 3600) // 60}m until Dubai midnight.")
+        chunk = 60  # wake up every minute to check stop_event
+        while secs > 0 and not self.stop_event.is_set():
+            time.sleep(min(chunk, secs))
+            secs -= chunk
+        if not self.stop_event.is_set():
+            # New day — reload counters from DB and resume
+            self.trades_today, self.bad_trades_today = self._load_today_stats()
+            self.day_key = dubai_day_key()
+            self._prev_sig = ""  # reset signal memory so first trade waits for a real change
+            self.last_trade_ts = time.time()
+            self.log("New Dubai day — daily limits reset. Resuming AI.")
+
     def _run_loop(self):
         cooldown_sec = max(60, self.interval_sec)
         while not self.stop_event.is_set():
@@ -1308,7 +1332,7 @@ class AutoRunner:
 
                 if self.end_at_ts and time.time() >= self.end_at_ts:
                     self.blocked_reason = "DURATION_ENDED"
-                    self.log("Blocked: duration ended. Stopping AI.")
+                    self.log("Session complete — duration ended. AI stopped.")
                     self.stop_event.set()
                     break
 
@@ -1322,16 +1346,28 @@ class AutoRunner:
                 if self.max_trades_per_day > 0 and self.trades_today >= self.max_trades_per_day:
                     self.blocked_reason = f"MAX_TRADES_DAY: {self.trades_today}/{self.max_trades_per_day}"
                     self.last_signal = "BLOCKED: MAX_TRADES_DAY"
-                    self.log(f"Blocked: max trades/day reached ({self.trades_today}/{self.max_trades_per_day}).")
-                    time.sleep(self.interval_sec)
+                    if self.duration_days > 0:
+                        # Duration session — pause until midnight, then resume next day
+                        self._sleep_until_dubai_midnight()
+                    else:
+                        # No duration — stop fully, user restarts tomorrow
+                        self.log(f"Max trades/day reached ({self.trades_today}/{self.max_trades_per_day}). Stopping.")
+                        self.stop_event.set()
+                        break
                     continue
 
                 if self.stop_after_bad_trades > 0 and self.bad_trades_today >= self.stop_after_bad_trades:
                     self.blocked_reason = f"MAX_BAD_TRADES: {self.bad_trades_today}/{self.stop_after_bad_trades}"
                     self.last_signal = "BLOCKED: MAX_BAD_TRADES"
-                    self.log("Blocked: max bad trades reached. Stopping.")
-                    self.stop_event.set()
-                    break
+                    if self.duration_days > 0:
+                        # Duration session — pause until midnight, then resume next day
+                        self._sleep_until_dubai_midnight()
+                    else:
+                        # No duration — stop fully, user restarts tomorrow
+                        self.log(f"Bad trade limit reached ({self.bad_trades_today}/{self.stop_after_bad_trades}). Stopping.")
+                        self.stop_event.set()
+                        break
+                    continue
 
                 res = self._signal_and_filters()
                 self.last_signal = res.get("signal") or "-"
