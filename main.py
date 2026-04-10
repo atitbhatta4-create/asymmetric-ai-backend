@@ -927,24 +927,33 @@ def default_max_trades_per_day(mode: RiskMode) -> int:
 
 
 def build_reason(mode: RiskMode, equity: float, computed: Dict[str, float], extra: Optional[str] = None) -> str:
-    growth = (equity - START_EQUITY) / START_EQUITY
-    lines: List[str] = []
-    lines.append(f"Mode: {mode}")
-    lines.append(f"Equity: ${equity:.2f} (start ${START_EQUITY:.2f}, growth {growth*100:.2f}%)")
-    lines.append("Risk rules applied:")
-    if growth >= 0.10:
-        lines.append("- Equity growth >= 10% -> reduce size and leverage by ~10% to protect profits.")
-    else:
-        lines.append("- Equity growth < 10% -> use default preset for the selected mode.")
-    lines.append("Computed parameters:")
-    lines.append(f"- Size%: {computed['size']:.2f}")
-    lines.append(f"- SL%:   {computed['sl']:.2f}")
-    lines.append(f"- TP%:   {computed['tp']:.2f}")
-    lines.append(f"- Lev:   {computed['leverage']:.2f}")
+    from_start = equity - START_EQUITY
+    dir_word = "up" if from_start >= 0 else "down"
+    pct = abs(from_start / START_EQUITY * 100)
+    size_dollar = equity * computed["size"] / 100.0
+    effective = size_dollar * computed["leverage"]
+    reduced = pct >= 10.0
+
+    lines = [
+        f"{mode}  •  Manual trade",
+        "",
+        "Account",
+        f"  Equity:      ${equity:,.2f}  ({dir_word} {pct:.1f}% from ${START_EQUITY:.0f} start)",
+        "",
+        "Position",
+        f"  Size:        {computed['size']:.2f}% of equity  →  ${size_dollar:.2f} at risk",
+        f"  Leverage:    {computed['leverage']:.0f}×  →  ${effective:.2f} total exposure",
+        f"  Stop loss:   {computed['sl']:.2f}% from entry",
+        f"  Take profit: {computed['tp']:.2f}% from entry",
+    ]
+    if reduced:
+        lines.append("")
+        lines.append("Risk note: Equity up 10%+ — size & leverage reduced ~10% to protect profits.")
+
     if extra:
         lines.append("")
         lines.append(extra)
-    lines.append("Note: Demo sandbox trade PnL is simulated. No real orders placed.")
+
     return "\n".join(lines)
 
 
@@ -1122,6 +1131,18 @@ async def _place_trade_internal(
 # =========================
 AUTO_LOCK = threading.Lock()
 AUTO_RUNNERS: Dict[str, "AutoRunner"] = {}
+
+
+def get_ai_restart_lock(email: str) -> int:
+    """Returns Unix timestamp until which AI restart is locked (0 = not locked)."""
+    try:
+        return int(admin_get_setting(f"ai_restart_lock:{email}", "0"))
+    except Exception:
+        return 0
+
+
+def set_ai_restart_lock(email: str, until_ts: int) -> None:
+    admin_set_setting(f"ai_restart_lock:{email}", str(until_ts))
 
 
 def _ema(series: List[float], period: int) -> List[float]:
@@ -1536,13 +1557,32 @@ class AutoRunner:
             pnl_value = equity_before * (c["size"] / 100.0) * pnl_pct_leveraged
             equity_after = equity_before + pnl_value
 
-            reason_extra = (
-                f"Auto AI Trader: signal={pt.get('signal', '-')}, tf={self.tf}\n"
-                f"Entry: {entry:.4f} | Exit: {exit_price:.4f} | Outcome: {outcome}\n"
-                f"Raw move: {raw_move * 100:.3f}% | PnL (leveraged): {pnl_pct_leveraged * 100:.3f}%\n"
-                f"Adaptive strictness: {self.adaptive_strictness:.2f}"
+            from_start = equity_after - START_EQUITY
+            dir_word = "up" if from_start >= 0 else "down"
+            size_dollar = equity_before * c["size"] / 100.0
+            outcome_label = (
+                "Take profit hit" if outcome == "TP_HIT"
+                else "Stop loss hit" if outcome == "SL_HIT"
+                else "Natural close"
             )
-            reason_text = build_reason(mode, equity_before, c, extra=reason_extra)
+            reason_text = "\n".join([
+                f"{mode}  •  AI Trade  •  {self.tf} timeframe",
+                "",
+                f"Signal       {pt.get('signal', '-')}  →  {side}",
+                f"Entry        ${entry:,.4f}",
+                f"Exit         ${exit_price:,.4f}  ({raw_move * 100:+.3f}% price move)",
+                f"Outcome      {outcome_label}  →  {pnl_pct_leveraged * 100:+.2f}% PnL  (${pnl_value:+.2f})",
+                "",
+                "Position",
+                f"  Size:        {c['size']:.2f}% of equity  →  ${size_dollar:.2f}",
+                f"  Leverage:    {c['leverage']:.0f}×",
+                f"  Stop loss:   {c['sl']:.2f}%   |   Take profit: {c['tp']:.2f}%",
+                "",
+                "Account",
+                f"  Before:      ${equity_before:,.2f}",
+                f"  After:       ${equity_after:,.2f}  ({dir_word} {abs(from_start / START_EQUITY * 100):.2f}% from start)",
+                f"  Strictness:  {self.adaptive_strictness:.2f}×  (Mini-Asym adapts after each trade)",
+            ])
 
             sid = get_session_id(self.email)
             tr = Trade(
@@ -1742,18 +1782,30 @@ def reset_sandbox(user=Depends(require_user)):
     new_sid = sid + 1
     set_session_id(email, new_sid)
     set_equity(email, START_EQUITY)
+    set_ai_restart_lock(email, 0)  # Clear restart lock for demo purposes
     return {"ok": True, "equity": START_EQUITY, "new_session_id": new_sid}
 
 
 @app.get("/auto/status")
 def auto_status(user=Depends(require_user)):
     email = user["email"]
+    now_ts = int(time.time())
+    lock_until = get_ai_restart_lock(email)
+    lock_sec = max(0, lock_until - now_ts)
     with AUTO_LOCK:
         r = AUTO_RUNNERS.get(email)
         if not r:
-            return {"ok": True, "running": False}
+            return {
+                "ok": True, "running": False,
+                "restart_locked": lock_sec > 0,
+                "restart_lock_sec": lock_sec,
+            }
         st = r.status()
-        return {"ok": True, **asdict(st)}
+        return {
+            "ok": True, **asdict(st),
+            "restart_locked": lock_sec > 0,
+            "restart_lock_sec": lock_sec,
+        }
 
 
 @app.get("/auto/history")
@@ -1801,34 +1853,49 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
 
     max_trades = payload.max_trades_per_day if payload.max_trades_per_day is not None else default_max_trades_per_day(payload.mode)
 
-    # Check if today's bad-trade limit is already reached — block restart to enforce risk rules
-    stop_after = int(payload.stop_after_bad_trades)
-    if stop_after > 0:
-        try:
-            dubai_midnight = now_dubai().replace(hour=0, minute=0, second=0, microsecond=0)
-            utc_midnight_str = dubai_midnight.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            sid = get_session_id(email)
-            with DB_LOCK:
-                conn = db()
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT SUM(CASE WHEN unreal_pnl_percent < 0 THEN 1 ELSE 0 END) as bad "
-                    "FROM trades WHERE email = %s AND time >= %s AND session_id = %s",
-                    (email, utc_midnight_str, sid),
-                )
-                row = cur.fetchone()
-                conn.close()
-            bad_today = int((row or {}).get("bad") or 0)
-            if bad_today >= stop_after:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Mini-Asym daily risk limit reached: {bad_today} bad trades today "
-                           f"(limit={stop_after}). AI is locked until Dubai midnight to protect your account.",
-                )
-        except HTTPException:
-            raise
-        except Exception:
-            pass  # DB error — allow start, runner will recount
+    # ── Check 1: Duration-session restart lock ──────────────────────────────
+    now_ts = int(time.time())
+    lock_until = get_ai_restart_lock(email)
+    if lock_until > now_ts:
+        remaining = lock_until - now_ts
+        h, m = remaining // 3600, (remaining % 3600) // 60
+        raise HTTPException(
+            status_code=400,
+            detail=f"AI restart locked for {h}h {m}m — you stopped a duration session early. "
+                   f"This protects your account from impulsive restarts. "
+                   f"Use Reset Sandbox (demo) to clear, or wait until Dubai midnight.",
+        )
+
+    # ── Check 2: Bad-trade daily limit — use mode minimum, not payload value ─
+    # Always enforce the mode's default minimum so the payload can't bypass it.
+    mode_min_stop_after = {"ULTRA_SAFE": 1, "SAFE": 1, "NORMAL": 2, "MINI_ASYM": 2, "AGGRESSIVE": 3}
+    effective_stop_after = max(int(payload.stop_after_bad_trades), mode_min_stop_after.get(payload.mode, 2))
+    try:
+        dubai_midnight = now_dubai().replace(hour=0, minute=0, second=0, microsecond=0)
+        utc_midnight_str = dubai_midnight.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        sid = get_session_id(email)
+        with DB_LOCK:
+            conn = db()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT SUM(CASE WHEN unreal_pnl_percent < 0 THEN 1 ELSE 0 END) as bad "
+                "FROM trades WHERE email = %s AND time >= %s AND session_id = %s",
+                (email, utc_midnight_str, sid),
+            )
+            row = cur.fetchone()
+            conn.close()
+        bad_today = int((row or {}).get("bad") or 0)
+        if bad_today >= effective_stop_after:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Daily risk limit reached — {bad_today} bad trades today "
+                       f"(limit: {effective_stop_after} for {payload.mode}). "
+                       f"AI is locked until Dubai midnight to protect your account.",
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # DB error — allow start, runner will recount
 
     with AUTO_LOCK:
         old = AUTO_RUNNERS.get(email)
@@ -1856,12 +1923,25 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
 @app.post("/auto/stop")
 def auto_stop(user=Depends(require_user)):
     email = user["email"]
+    restart_locked = False
+    lock_sec = 0
     with AUTO_LOCK:
         r = AUTO_RUNNERS.get(email)
         if r:
+            was_duration = r.duration_days > 0
             r.stop("Stopped by user.")
             del AUTO_RUNNERS[email]
-    return {"ok": True, "running": False}
+            # Duration sessions: lock restarts until Dubai midnight to prevent bypass
+            if was_duration:
+                now_dt = now_dubai()
+                next_midnight = (now_dt + timedelta(days=1)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                lock_until = int(next_midnight.timestamp())
+                set_ai_restart_lock(email, lock_until)
+                lock_sec = max(0, lock_until - int(time.time()))
+                restart_locked = True
+    return {"ok": True, "running": False, "restart_locked": restart_locked, "restart_lock_sec": lock_sec}
 
 
 # =========================
