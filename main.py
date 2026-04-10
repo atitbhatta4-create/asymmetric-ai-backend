@@ -1134,6 +1134,208 @@ def _ema(series: List[float], period: int) -> List[float]:
     return out
 
 
+def _rsi(closes: List[float], period: int = 14) -> Optional[float]:
+    if len(closes) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(0.0, d))
+        losses.append(max(0.0, -d))
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        ag = (ag * (period - 1) + gains[i]) / period
+        al = (al * (period - 1) + losses[i]) / period
+    return 100.0 if al == 0 else 100.0 - (100.0 / (1.0 + ag / al))
+
+
+def _atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
+    if len(closes) < period + 1:
+        return None
+    trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+           for i in range(1, len(closes))]
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
+
+
+def _adx(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
+    if len(closes) < period * 2 + 1:
+        return None
+    pdms, ndms, trs = [], [], []
+    for i in range(1, len(closes)):
+        hd = highs[i] - highs[i - 1]
+        ld = lows[i - 1] - lows[i]
+        pdms.append(hd if hd > ld and hd > 0 else 0.0)
+        ndms.append(ld if ld > hd and ld > 0 else 0.0)
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+
+    def _wilder(s: List[float]) -> List[float]:
+        v = sum(s[:period])
+        out = [v]
+        for x in s[period:]:
+            v = v - v / period + x
+            out.append(v)
+        return out
+
+    s_tr, s_p, s_n = _wilder(trs), _wilder(pdms), _wilder(ndms)
+    dxs = []
+    for i in range(len(s_tr)):
+        pdi = 100 * s_p[i] / s_tr[i] if s_tr[i] else 0
+        ndi = 100 * s_n[i] / s_tr[i] if s_tr[i] else 0
+        dxs.append(100 * abs(pdi - ndi) / (pdi + ndi) if (pdi + ndi) else 0)
+    if len(dxs) < period:
+        return None
+    adx = sum(dxs[:period]) / period
+    for dx in dxs[period:]:
+        adx = (adx * (period - 1) + dx) / period
+    return adx
+
+
+# Per-mode signal filter thresholds — all 4 layers
+MODE_SIGNAL_PARAMS: Dict[str, Dict] = {
+    "ULTRA_SAFE": dict(adx_min=30, atr_min=0.003, atr_max=0.020, rsi_min=42, rsi_max=58, pullback_max=0.010, vol_factor=1.50, mom_n=3),
+    "SAFE":       dict(adx_min=25, atr_min=0.002, atr_max=0.025, rsi_min=40, rsi_max=62, pullback_max=0.015, vol_factor=1.30, mom_n=2),
+    "NORMAL":     dict(adx_min=20, atr_min=0.002, atr_max=0.030, rsi_min=38, rsi_max=65, pullback_max=0.020, vol_factor=1.20, mom_n=2),
+    "MINI_ASYM":  dict(adx_min=18, atr_min=0.001, atr_max=0.035, rsi_min=35, rsi_max=68, pullback_max=0.025, vol_factor=1.10, mom_n=1),
+    "AGGRESSIVE": dict(adx_min=15, atr_min=0.001, atr_max=0.040, rsi_min=32, rsi_max=70, pullback_max=0.030, vol_factor=1.00, mom_n=1),
+}
+
+
+def _compute_signal_layers(
+    klines: List[Dict],
+    mode: RiskMode,
+    adaptive_strictness: float = 1.0,
+) -> Dict:
+    """
+    Full 4-layer signal analysis. Returns breakdown dict used by both
+    AutoRunner._signal_and_filters() and the /auto/signal endpoint.
+    """
+    if len(klines) < 220:
+        return {"ok": False, "blocked": "NO_DATA", "signal": "NO_DATA", "breakdown": {}}
+
+    closes  = [k["close"]  for k in klines]
+    highs   = [k["high"]   for k in klines]
+    lows    = [k["low"]    for k in klines]
+    volumes = [k["volume"] for k in klines]
+
+    ema9   = _ema(closes, 9)
+    ema21  = _ema(closes, 21)
+    ema50  = _ema(closes, 50)
+    ema200 = _ema(closes, 200)
+    rsi    = _rsi(closes, 14)
+    atr    = _atr(highs, lows, closes, 14)
+    adx    = _adx(highs, lows, closes, 14)
+
+    price   = closes[-1]
+    atr_pct = (atr / price) if atr else 0.0
+    avg_vol = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0.0
+    vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0.0
+
+    sig          = "EMA9>EMA21" if ema9[-1] > ema21[-1] else "EMA9<EMA21"
+    desired_side: Side = "LONG" if sig == "EMA9>EMA21" else "SHORT"
+
+    # Apply Mini-Asym adaptive strictness
+    p = MODE_SIGNAL_PARAMS.get(mode, MODE_SIGNAL_PARAMS["NORMAL"]).copy()
+    if mode == "MINI_ASYM" and adaptive_strictness != 1.0:
+        s = adaptive_strictness
+        p["adx_min"]      = p["adx_min"] * s
+        p["rsi_min"]      = min(50, p["rsi_min"] + (s - 1) * 8)
+        p["rsi_max"]      = max(50, p["rsi_max"] - (s - 1) * 8)
+        p["pullback_max"] = p["pullback_max"] / max(0.5, s)
+        p["vol_factor"]   = p["vol_factor"] * s
+
+    # ── Layer 1: Market regime (ADX + ATR) ──────────────────────────────
+    adx_ok = adx is not None and adx >= p["adx_min"]
+    atr_ok = p["atr_min"] <= atr_pct <= p["atr_max"]
+    if not adx_ok:
+        reg_reason = f"ADX {adx:.1f} < {p['adx_min']:.0f} — market choppy" if adx else "ADX unavailable"
+    elif not atr_ok:
+        reg_reason = f"ATR {atr_pct*100:.2f}% outside {p['atr_min']*100:.1f}–{p['atr_max']*100:.0f}%"
+    else:
+        reg_reason = ""
+    breakdown_regime = {
+        "adx": round(adx or 0, 1), "adx_min": round(p["adx_min"], 1),
+        "atr_pct": round(atr_pct * 100, 3),
+        "atr_range": f"{p['atr_min']*100:.1f}–{p['atr_max']*100:.0f}%",
+        "ok": adx_ok and atr_ok, "reason": reg_reason,
+    }
+
+    # ── Layer 2: Direction bias (EMA50 vs EMA200 + price position) ──────
+    bull = ema50[-1] > ema200[-1]
+    if desired_side == "LONG":
+        dir_ok     = bull and price > ema50[-1]
+        dir_reason = "" if dir_ok else ("EMA50 < EMA200 — downtrend" if not bull else "Price below EMA50")
+    else:
+        dir_ok     = (not bull) and price < ema50[-1]
+        dir_reason = "" if dir_ok else ("EMA50 > EMA200 — uptrend" if bull else "Price above EMA50")
+    breakdown_direction = {
+        "trend": "BULL" if bull else "BEAR", "signal": sig, "side": desired_side,
+        "ok": dir_ok, "reason": dir_reason,
+    }
+
+    # ── Layer 3: Entry location (pullback to EMA21 + RSI) ───────────────
+    pb_pct  = abs(price - ema21[-1]) / max(1e-9, ema21[-1])
+    pb_ok   = pb_pct <= p["pullback_max"]
+    rsi_ok  = rsi is not None and p["rsi_min"] <= rsi <= p["rsi_max"]
+    if not pb_ok:
+        ent_reason = f"Price {pb_pct*100:.1f}% from EMA21 — want <{p['pullback_max']*100:.0f}%"
+    elif not rsi_ok:
+        ent_reason = f"RSI {rsi:.0f} outside {p['rsi_min']}–{p['rsi_max']}"
+    else:
+        ent_reason = ""
+    breakdown_entry = {
+        "price_vs_ema21_pct": round(pb_pct * 100, 2),
+        "pullback_max_pct": round(p["pullback_max"] * 100, 1),
+        "rsi": round(rsi or 0, 1), "rsi_range": f"{p['rsi_min']}–{p['rsi_max']}",
+        "ok": pb_ok and rsi_ok, "reason": ent_reason,
+    }
+
+    # ── Layer 4: Momentum (candles direction + volume) ───────────────────
+    n = p["mom_n"]
+    if desired_side == "LONG":
+        mom_ok = all(klines[-(i + 1)]["close"] > klines[-(i + 1)]["open"] for i in range(n))
+    else:
+        mom_ok = all(klines[-(i + 1)]["close"] < klines[-(i + 1)]["open"] for i in range(n))
+    vol_ok = vol_ratio >= p["vol_factor"]
+    if not mom_ok:
+        mom_reason = f"Last {n} candle(s) not aligned with {desired_side}"
+    elif not vol_ok:
+        mom_reason = f"Volume {vol_ratio:.1f}x avg — need {p['vol_factor']:.1f}x"
+    else:
+        mom_reason = ""
+    breakdown_momentum = {
+        "candles_n": n, "candles_ok": mom_ok,
+        "volume_ratio": round(vol_ratio, 2), "vol_factor": round(p["vol_factor"], 2),
+        "ok": mom_ok and vol_ok, "reason": mom_reason,
+    }
+
+    breakdown = {
+        "regime":    breakdown_regime,
+        "direction": breakdown_direction,
+        "entry":     breakdown_entry,
+        "momentum":  breakdown_momentum,
+    }
+
+    failed = [k for k, v in breakdown.items() if not v["ok"]]
+    if failed:
+        reasons = " | ".join(breakdown[k]["reason"] for k in failed if breakdown[k]["reason"])
+        return {
+            "ok": False,
+            "blocked": f"BLOCKED ({', '.join(failed)}): {reasons}",
+            "signal": sig, "side": desired_side,
+            "breakdown": breakdown, "atr_pct": atr_pct,
+        }
+
+    return {
+        "ok": True, "blocked": None,
+        "signal": sig, "side": desired_side,
+        "breakdown": breakdown, "atr_pct": atr_pct,
+    }
+
+
 @dataclass
 class AutoState:
     running: bool
@@ -1156,6 +1358,9 @@ class AutoState:
     end_at: Optional[str]
     trend_filter: bool
     chop_min_sep_pct: float
+    signal_breakdown: Dict
+    adaptive_strictness: float
+    pending_trade: Optional[Dict]
 
 
 class AutoStartIn(BaseModel):
@@ -1199,6 +1404,10 @@ class AutoRunner:
             self.end_at_ts = end_dt.timestamp()
         self.history: Deque[Dict[str, str]] = deque(maxlen=120)
         self._prev_sig: str = ""
+        self.pending_trade: Optional[Dict] = None
+        self.adaptive_strictness: float = 1.0
+        self.last_breakdown: Dict = {}
+        self.session_start_equity: float = get_equity(email)
         # Load today's real trade counts from DB — prevents bypass by stop+restart
         self.trades_today, self.bad_trades_today = self._load_today_stats()
 
@@ -1243,6 +1452,9 @@ class AutoRunner:
     def stop(self, reason="Stopped by user."):
         self.log(reason)
         self.stop_event.set()
+        if self.pending_trade:
+            self.log(f"Pending trade abandoned at stop (entry={self.pending_trade.get('entry_price', '?')}).")
+            self.pending_trade = None
 
     def _reset_if_new_day(self):
         k = dubai_day_key()
@@ -1271,33 +1483,127 @@ class AutoRunner:
             bad_trades_today=self.bad_trades_today, reset_in_sec=self._reset_in_sec(),
             duration_days=self.duration_days, end_at=end_at,
             trend_filter=self.trend_filter, chop_min_sep_pct=self.chop_min_sep_pct,
+            signal_breakdown=self.last_breakdown,
+            adaptive_strictness=self.adaptive_strictness,
+            pending_trade=self.pending_trade,
         )
 
+    def _fetch_price_sync(self, symbol: str) -> float:
+        """Sync OKX price fetch for use inside runner thread."""
+        inst = to_okx_inst(symbol)
+        r = httpx.get(
+            f"{OKX_BASE}/api/v5/market/ticker",
+            params={"instId": inst},
+            timeout=8,
+            headers={"accept": "application/json"},
+        )
+        arr = (r.json() or {}).get("data") or []
+        if not arr:
+            raise RuntimeError(f"No price data for {symbol}")
+        return float(arr[0]["last"])
+
+    def _close_pending_trade(self) -> None:
+        """Fetch real exit price, apply SL/TP, record trade to DB, update adaptive strictness."""
+        pt = self.pending_trade
+        if not pt:
+            return
+        try:
+            exit_price = self._fetch_price_sync(self.symbol)
+            entry = float(pt["entry_price"])
+            side: Side = pt["side"]
+            mode: RiskMode = pt["mode"]
+
+            equity_before = get_equity(self.email)
+            risk = mini_asym_risk_engine(mode, equity_before)
+            c = risk["computed"]
+
+            sl_pct = c["sl"] / 100.0
+            tp_pct = c["tp"] / 100.0
+
+            raw_move = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
+
+            if raw_move <= -sl_pct:
+                final_move = -sl_pct
+                outcome = "SL_HIT"
+            elif raw_move >= tp_pct:
+                final_move = tp_pct
+                outcome = "TP_HIT"
+            else:
+                final_move = raw_move
+                outcome = "NATURAL_CLOSE"
+
+            pnl_pct_leveraged = final_move * c["leverage"]
+            pnl_value = equity_before * (c["size"] / 100.0) * pnl_pct_leveraged
+            equity_after = equity_before + pnl_value
+
+            reason_extra = (
+                f"Auto AI Trader: signal={pt.get('signal', '-')}, tf={self.tf}\n"
+                f"Entry: {entry:.4f} | Exit: {exit_price:.4f} | Outcome: {outcome}\n"
+                f"Raw move: {raw_move * 100:.3f}% | PnL (leveraged): {pnl_pct_leveraged * 100:.3f}%\n"
+                f"Adaptive strictness: {self.adaptive_strictness:.2f}"
+            )
+            reason_text = build_reason(mode, equity_before, c, extra=reason_extra)
+
+            sid = get_session_id(self.email)
+            tr = Trade(
+                time=now_utc_str(), side=side, symbol=self.symbol, mode=mode,
+                size=float(c["size"]), sl=float(c["sl"]), tp=float(c["tp"]),
+                leverage=float(c["leverage"]), entry_price=entry,
+                current_price=exit_price,
+                unreal_pnl_percent=float(pnl_pct_leveraged * 100.0),
+                unreal_pnl_value=float(pnl_value),
+                equity_after=float(equity_after), reason=reason_text,
+            )
+
+            with DB_LOCK:
+                conn = db()
+                cur = conn.cursor()
+                cur.execute(
+                    """INSERT INTO trades(
+                        email, time, side, symbol, mode, size, sl, tp, leverage,
+                        entry_price, current_price, unreal_pnl_percent, unreal_pnl_value,
+                        equity_after, reason, session_id
+                    ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    (self.email, tr.time, tr.side, tr.symbol, tr.mode,
+                     float(tr.size), float(tr.sl), float(tr.tp), float(tr.leverage),
+                     float(tr.entry_price), float(tr.current_price),
+                     float(tr.unreal_pnl_percent), float(tr.unreal_pnl_value),
+                     float(tr.equity_after), tr.reason, int(sid)),
+                )
+                conn.commit()
+                conn.close()
+
+            set_equity(self.email, equity_after)
+            self.trades_today += 1
+            if pnl_value < 0:
+                self.bad_trades_today += 1
+
+            # Mini-Asym adaptive strictness: tighten after loss, relax after win
+            if mode == "MINI_ASYM":
+                if pnl_value < 0:
+                    self.adaptive_strictness = min(2.5, self.adaptive_strictness + 0.25)
+                    self.log(f"MINI_ASYM strictness ↑ {self.adaptive_strictness:.2f} (after loss)")
+                else:
+                    self.adaptive_strictness = max(1.0, self.adaptive_strictness - 0.10)
+
+            mt = self.max_trades_per_day if self.max_trades_per_day > 0 else "∞"
+            self.log(
+                f"TRADE CLOSED ({side}) | {outcome} | "
+                f"entry={entry:.2f} exit={exit_price:.2f} | "
+                f"pnl={pnl_pct_leveraged * 100:.2f}% (${pnl_value:.2f}) | "
+                f"trades={self.trades_today}/{mt}"
+            )
+
+        except Exception as e:
+            self.log(f"Error closing trade: {e}")
+        finally:
+            self.pending_trade = None
+
     def _signal_and_filters(self):
-        closes = [k["close"] for k in _fetch_klines_sync(self.symbol, self.tf, limit=260)]
-        if len(closes) < 210:
-            return {"ok": False, "blocked": "NO_DATA", "signal": "NO_DATA"}
-
-        ema9 = _ema(closes, 9)
-        ema21 = _ema(closes, 21)
-        ema50 = _ema(closes, 50)
-        ema200 = _ema(closes, 200)
-
-        sig = "EMA9>EMA21" if ema9[-1] > ema21[-1] else "EMA9<EMA21"
-        desired_side: Side = "LONG" if sig == "EMA9>EMA21" else "SHORT"
-
-        if self.trend_filter:
-            if desired_side == "LONG" and not (ema50[-1] > ema200[-1]):
-                return {"ok": False, "blocked": "TREND_FILTER: LONG requires EMA50>EMA200", "signal": sig}
-            if desired_side == "SHORT" and not (ema50[-1] < ema200[-1]):
-                return {"ok": False, "blocked": "TREND_FILTER: SHORT requires EMA50<EMA200", "signal": sig}
-
-        price = closes[-1]
-        sep_pct = abs(ema50[-1] - ema200[-1]) / max(1e-9, price)
-        if sep_pct < self.chop_min_sep_pct:
-            return {"ok": False, "blocked": f"CHOP_FILTER: sep {sep_pct*100:.3f}% < {self.chop_min_sep_pct*100:.3f}%", "signal": sig}
-
-        return {"ok": True, "blocked": None, "signal": sig, "side": desired_side, "sep_pct": sep_pct}
+        klines = _fetch_klines_sync(self.symbol, self.tf, limit=260)
+        res = _compute_signal_layers(klines, self.mode, self.adaptive_strictness)
+        self.last_breakdown = res.get("breakdown", {})
+        return res
 
     def _secs_until_dubai_midnight(self) -> int:
         """Seconds remaining until next Dubai midnight."""
@@ -1332,6 +1638,8 @@ class AutoRunner:
 
                 if self.end_at_ts and time.time() >= self.end_at_ts:
                     self.blocked_reason = "DURATION_ENDED"
+                    if self.pending_trade:
+                        self._close_pending_trade()
                     self.log("Session complete — duration ended. AI stopped.")
                     self.stop_event.set()
                     break
@@ -1343,14 +1651,19 @@ class AutoRunner:
                     time.sleep(self.interval_sec)
                     continue
 
+                # ── Step 1: Close any pending trade first (real exit after one interval) ──
+                if self.pending_trade:
+                    self._close_pending_trade()
+                    time.sleep(self.interval_sec)
+                    continue
+
+                # ── Step 2: Daily limit checks ──────────────────────────────────────────
                 if self.max_trades_per_day > 0 and self.trades_today >= self.max_trades_per_day:
                     self.blocked_reason = f"MAX_TRADES_DAY: {self.trades_today}/{self.max_trades_per_day}"
                     self.last_signal = "BLOCKED: MAX_TRADES_DAY"
                     if self.duration_days > 0:
-                        # Duration session — pause until midnight, then resume next day
                         self._sleep_until_dubai_midnight()
                     else:
-                        # No duration — stop fully, user restarts tomorrow
                         self.log(f"Max trades/day reached ({self.trades_today}/{self.max_trades_per_day}). Stopping.")
                         self.stop_event.set()
                         break
@@ -1360,20 +1673,19 @@ class AutoRunner:
                     self.blocked_reason = f"MAX_BAD_TRADES: {self.bad_trades_today}/{self.stop_after_bad_trades}"
                     self.last_signal = "BLOCKED: MAX_BAD_TRADES"
                     if self.duration_days > 0:
-                        # Duration session — pause until midnight, then resume next day
                         self._sleep_until_dubai_midnight()
                     else:
-                        # No duration — stop fully, user restarts tomorrow
                         self.log(f"Bad trade limit reached ({self.bad_trades_today}/{self.stop_after_bad_trades}). Stopping.")
                         self.stop_event.set()
                         break
                     continue
 
+                # ── Step 3: 4-layer signal analysis ─────────────────────────────────────
                 res = self._signal_and_filters()
                 self.last_signal = res.get("signal") or "-"
                 if not res.get("ok"):
                     self.blocked_reason = res.get("blocked") or "BLOCKED"
-                    self.log(f"Blocked: {self.blocked_reason} | signal={self.last_signal}")
+                    self.log(f"Blocked: {self.blocked_reason[:100]}")
                     time.sleep(self.interval_sec)
                     continue
 
@@ -1382,34 +1694,28 @@ class AutoRunner:
                 self.last_side = desired_side
 
                 now_ts = time.time()
-                # Trade only on a genuine signal change + cooldown elapsed.
-                # Never trade blindly on the first scan (last_trade_ts is set to now() on init).
+                # Trade only on genuine signal change + cooldown elapsed
                 should_trade = (
                     self.last_signal != self._prev_sig
                     and (now_ts - self.last_trade_ts) >= cooldown_sec
                 )
-
                 self._prev_sig = self.last_signal
 
                 if should_trade:
-                    import asyncio
-                    out = asyncio.run(
-                        _place_trade_internal(
-                            self.email, self.symbol, desired_side, self.mode,
-                            extra_reason=f"Auto AI Trader (V3): tf={self.tf}, interval={self.interval_sec}s, signal={self.last_signal}",
-                        )
-                    )
+                    # ── Step 4: Open trade — fetch real entry price ───────────────────
+                    entry_price = self._fetch_price_sync(self.symbol)
+                    self.pending_trade = {
+                        "entry_price": entry_price,
+                        "side": desired_side,
+                        "mode": self.mode,
+                        "signal": self.last_signal,
+                        "open_ts": time.time(),
+                    }
                     self.last_trade_ts = now_ts
-                    self.trades_today += 1
-                    pnl_pct = float(out.get("pnl_pct", 0.0))
-                    if pnl_pct < 0:
-                        self.bad_trades_today += 1
-                        self.log(f"TRADE PLACED ({desired_side}) | pnl={pnl_pct:.3f}% | BAD {self.bad_trades_today}/{self.stop_after_bad_trades}")
-                    else:
-                        mt = self.max_trades_per_day if self.max_trades_per_day > 0 else 999999
-                        self.log(f"TRADE PLACED ({desired_side}) | pnl={pnl_pct:.3f}% | trades_today={self.trades_today}/{mt}")
+                    self.log(f"TRADE OPENED ({desired_side}) @ {entry_price:.4f} | signal={self.last_signal}")
                 else:
-                    self.log(f"No trade: waiting | signal={self.last_signal}")
+                    layers = [k for k, v in res.get("breakdown", {}).items()]
+                    self.log(f"Waiting | signal={self.last_signal} | layers={layers}")
 
             except Exception as e:
                 self.blocked_reason = "ERROR"
@@ -1458,6 +1764,28 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
         if not r:
             return {"ok": True, "events": []}
         return {"ok": True, "events": list(r.history)[: int(limit)]}
+
+
+@app.get("/auto/signal")
+def auto_signal(user=Depends(require_user)):
+    """Live 4-layer signal breakdown for the running AutoRunner."""
+    email = user["email"]
+    with AUTO_LOCK:
+        r = AUTO_RUNNERS.get(email)
+        if not r:
+            return {"ok": False, "running": False}
+        return {
+            "ok": True,
+            "running": r.is_running(),
+            "symbol": r.symbol,
+            "mode": r.mode,
+            "signal": r.last_signal,
+            "side": r.last_side,
+            "blocked": r.blocked_reason,
+            "adaptive_strictness": r.adaptive_strictness,
+            "pending_trade": r.pending_trade,
+            "breakdown": r.last_breakdown,
+        }
 
 
 @app.post("/auto/start")
