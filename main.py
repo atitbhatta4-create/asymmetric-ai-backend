@@ -857,16 +857,13 @@ binance_price = okx_price
 
 
 async def _route_price(symbol: str, exchange: str) -> float:
-    ex = (exchange or "okx").lower()
-    if ex == "bybit":
-        return await bybit_price(symbol)
-    return await okx_price(symbol)  # okx + binance users both get OKX (Binance geo-blocked on Render)
+    # OKX is the only exchange whose public API is accessible from Render US servers.
+    # Binance and Bybit both geo-block US infrastructure.
+    # We use OKX as the data source for all exchanges — prices are essentially identical.
+    return await okx_price(symbol)
 
 
 def _route_klines(symbol: str, tf: str, exchange: str, limit: int) -> List[Dict[str, Any]]:
-    ex = (exchange or "okx").lower()
-    if ex == "bybit":
-        return _fetch_klines_bybit_sync(symbol, tf, limit=limit)
     return _fetch_klines_sync(symbol, tf, limit=limit)
 
 
