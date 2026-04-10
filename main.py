@@ -1214,14 +1214,16 @@ class AutoRunner:
             # Dubai midnight → UTC equivalent for DB query
             dubai_midnight = now_dubai().replace(hour=0, minute=0, second=0, microsecond=0)
             utc_midnight_str = dubai_midnight.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            # Use current session_id so Reset Sandbox clears the daily lock in demo mode
+            sid = get_session_id(self.email)
             with DB_LOCK:
                 conn = db()
                 cur = conn.cursor()
                 cur.execute(
                     "SELECT COUNT(*) as cnt, "
                     "SUM(CASE WHEN unreal_pnl_percent < 0 THEN 1 ELSE 0 END) as bad "
-                    "FROM trades WHERE email = %s AND time >= %s",
-                    (self.email, utc_midnight_str),
+                    "FROM trades WHERE email = %s AND time >= %s AND session_id = %s",
+                    (self.email, utc_midnight_str, sid),
                 )
                 row = cur.fetchone()
                 conn.close()
@@ -1441,13 +1443,14 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         try:
             dubai_midnight = now_dubai().replace(hour=0, minute=0, second=0, microsecond=0)
             utc_midnight_str = dubai_midnight.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            sid = get_session_id(email)
             with DB_LOCK:
                 conn = db()
                 cur = conn.cursor()
                 cur.execute(
                     "SELECT SUM(CASE WHEN unreal_pnl_percent < 0 THEN 1 ELSE 0 END) as bad "
-                    "FROM trades WHERE email = %s AND time >= %s",
-                    (email, utc_midnight_str),
+                    "FROM trades WHERE email = %s AND time >= %s AND session_id = %s",
+                    (email, utc_midnight_str, sid),
                 )
                 row = cur.fetchone()
                 conn.close()
