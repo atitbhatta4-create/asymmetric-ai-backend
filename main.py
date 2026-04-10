@@ -691,7 +691,7 @@ def exchange_connect(payload: ExchangeConnectIn, user=Depends(require_user)):
         conn.commit()
         conn.close()
 
-    return {"ok": True, "binance_env": BINANCE_ENV}
+    return {"ok": True}
 
 
 @app.post("/exchange/disconnect")
