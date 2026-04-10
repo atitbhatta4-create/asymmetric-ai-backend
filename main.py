@@ -535,6 +535,39 @@ class ResetIn(BaseModel):
     new_password: str
 
 
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@app.post("/auth/change-password")
+def change_password(payload: ChangePasswordIn, user=Depends(require_user)):
+    email = user["email"]
+    if not payload.current_password or not payload.new_password:
+        raise HTTPException(status_code=400, detail="Both current and new password are required.")
+    if len(payload.new_password) < 6:
+        raise HTTPException(status_code=400, detail="New password must be at least 6 characters.")
+
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT password_hash FROM users WHERE email = %s", (email,))
+        row = cur.fetchone()
+        conn.close()
+
+    if not row or row["password_hash"] != hash_pw(payload.current_password):
+        raise HTTPException(status_code=400, detail="Current password is incorrect.")
+
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET password_hash = %s WHERE email = %s", (hash_pw(payload.new_password), email))
+        conn.commit()
+        conn.close()
+
+    return {"ok": True}
+
+
 @app.post("/auth/forgot")
 def auth_forgot(payload: ForgotIn):
     email = payload.email.strip().lower()
