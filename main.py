@@ -1188,21 +1188,48 @@ class AutoRunner:
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.last_signal: str = "-"
         self.last_side: Side = "LONG"
-        self.last_trade_ts: float = 0.0
+        # Set to now so first trade requires a full cooldown — prevents blind trade on start
+        self.last_trade_ts: float = time.time()
         self.last_run_ts: float = 0.0
         self.blocked_reason: Optional[str] = None
         self.day_key = dubai_day_key()
-        self.trades_today = 0
-        self.bad_trades_today = 0
         self.end_at_ts: Optional[float] = None
         if self.duration_days > 0:
             end_dt = now_dubai() + timedelta(days=self.duration_days)
             self.end_at_ts = end_dt.timestamp()
         self.history: Deque[Dict[str, str]] = deque(maxlen=120)
         self._prev_sig: str = ""
+        # Load today's real trade counts from DB — prevents bypass by stop+restart
+        self.trades_today, self.bad_trades_today = self._load_today_stats()
 
     def is_running(self):
         return not self.stop_event.is_set()
+
+    def _load_today_stats(self) -> tuple:
+        """
+        Count today's trades and bad trades from the DB (Dubai timezone).
+        Prevents stop+restart from bypassing daily risk limits.
+        """
+        try:
+            # Dubai midnight → UTC equivalent for DB query
+            dubai_midnight = now_dubai().replace(hour=0, minute=0, second=0, microsecond=0)
+            utc_midnight_str = dubai_midnight.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            with DB_LOCK:
+                conn = db()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT COUNT(*) as cnt, "
+                    "SUM(CASE WHEN unreal_pnl_percent < 0 THEN 1 ELSE 0 END) as bad "
+                    "FROM trades WHERE email = %s AND time >= %s",
+                    (self.email, utc_midnight_str),
+                )
+                row = cur.fetchone()
+                conn.close()
+            trades = int((row or {}).get("cnt") or 0)
+            bad = int((row or {}).get("bad") or 0)
+            return trades, bad
+        except Exception:
+            return 0, 0
 
     def log(self, msg):
         self.history.appendleft({"t": now_utc_str(), "msg": msg})
@@ -1317,11 +1344,12 @@ class AutoRunner:
                 self.last_side = desired_side
 
                 now_ts = time.time()
-                should_trade = False
-                if self.last_trade_ts == 0.0:
-                    should_trade = True
-                elif self.last_signal != self._prev_sig and (now_ts - self.last_trade_ts) >= cooldown_sec:
-                    should_trade = True
+                # Trade only on a genuine signal change + cooldown elapsed.
+                # Never trade blindly on the first scan (last_trade_ts is set to now() on init).
+                should_trade = (
+                    self.last_signal != self._prev_sig
+                    and (now_ts - self.last_trade_ts) >= cooldown_sec
+                )
 
                 self._prev_sig = self.last_signal
 
@@ -1406,6 +1434,34 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         raise HTTPException(status_code=400, detail="interval_sec must be 5..3600")
 
     max_trades = payload.max_trades_per_day if payload.max_trades_per_day is not None else default_max_trades_per_day(payload.mode)
+
+    # Check if today's bad-trade limit is already reached — block restart to enforce risk rules
+    stop_after = int(payload.stop_after_bad_trades)
+    if stop_after > 0:
+        try:
+            dubai_midnight = now_dubai().replace(hour=0, minute=0, second=0, microsecond=0)
+            utc_midnight_str = dubai_midnight.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            with DB_LOCK:
+                conn = db()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT SUM(CASE WHEN unreal_pnl_percent < 0 THEN 1 ELSE 0 END) as bad "
+                    "FROM trades WHERE email = %s AND time >= %s",
+                    (email, utc_midnight_str),
+                )
+                row = cur.fetchone()
+                conn.close()
+            bad_today = int((row or {}).get("bad") or 0)
+            if bad_today >= stop_after:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Mini-Asym daily risk limit reached: {bad_today} bad trades today "
+                           f"(limit={stop_after}). AI is locked until Dubai midnight to protect your account.",
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # DB error — allow start, runner will recount
 
     with AUTO_LOCK:
         old = AUTO_RUNNERS.get(email)
