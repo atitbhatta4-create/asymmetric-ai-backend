@@ -1383,13 +1383,16 @@ def _adx(highs: List[float], lows: List[float], closes: List[float], period: int
     return adx
 
 
-# Per-mode signal filter thresholds — all 4 layers
+# Higher timeframe for trend bias — always one step up
+HIGHER_TF_MAP: Dict[str, str] = {"15m": "4h", "1h": "4h", "4h": "1d", "1d": "1d"}
+
+# Per-mode signal thresholds + minimum quality score to trade
 MODE_SIGNAL_PARAMS: Dict[str, Dict] = {
-    "ULTRA_SAFE": dict(adx_min=30, atr_min=0.003, atr_max=0.020, rsi_min=42, rsi_max=58, pullback_max=0.010, vol_factor=1.50, mom_n=3),
-    "SAFE":       dict(adx_min=25, atr_min=0.002, atr_max=0.025, rsi_min=40, rsi_max=62, pullback_max=0.015, vol_factor=1.30, mom_n=2),
-    "NORMAL":     dict(adx_min=20, atr_min=0.002, atr_max=0.030, rsi_min=38, rsi_max=65, pullback_max=0.020, vol_factor=1.20, mom_n=2),
-    "MINI_ASYM":  dict(adx_min=18, atr_min=0.001, atr_max=0.035, rsi_min=35, rsi_max=68, pullback_max=0.025, vol_factor=1.10, mom_n=1),
-    "AGGRESSIVE": dict(adx_min=15, atr_min=0.001, atr_max=0.040, rsi_min=32, rsi_max=70, pullback_max=0.030, vol_factor=1.00, mom_n=1),
+    "ULTRA_SAFE": dict(adx_min=28, atr_min=0.003, atr_max=0.020, rsi_min=42, rsi_max=58, pullback_max=0.012, vol_factor=1.40, mom_n=3, min_score=0.75),
+    "SAFE":       dict(adx_min=22, atr_min=0.002, atr_max=0.025, rsi_min=40, rsi_max=62, pullback_max=0.015, vol_factor=1.25, mom_n=2, min_score=0.68),
+    "NORMAL":     dict(adx_min=18, atr_min=0.002, atr_max=0.030, rsi_min=38, rsi_max=65, pullback_max=0.020, vol_factor=1.15, mom_n=2, min_score=0.62),
+    "MINI_ASYM":  dict(adx_min=16, atr_min=0.001, atr_max=0.035, rsi_min=35, rsi_max=68, pullback_max=0.025, vol_factor=1.05, mom_n=1, min_score=0.58),
+    "AGGRESSIVE": dict(adx_min=13, atr_min=0.001, atr_max=0.040, rsi_min=32, rsi_max=70, pullback_max=0.030, vol_factor=0.95, mom_n=1, min_score=0.52),
 }
 
 
@@ -1397,13 +1400,15 @@ def _compute_signal_layers(
     klines: List[Dict],
     mode: RiskMode,
     adaptive_strictness: float = 1.0,
+    higher_klines: Optional[List[Dict]] = None,
 ) -> Dict:
     """
-    Full 4-layer signal analysis. Returns breakdown dict used by both
-    AutoRunner._signal_and_filters() and the /auto/signal endpoint.
+    4-layer scored signal analysis.
+    Direction from higher TF trend. Entry on pullback+bounce, not on crossover.
+    Each layer returns a 0-1 score. Total must exceed mode threshold.
     """
     if len(klines) < 220:
-        return {"ok": False, "blocked": "NO_DATA", "signal": "NO_DATA", "breakdown": {}}
+        return {"ok": False, "blocked": "NO_DATA", "signal": "NO_DATA", "score": 0.0, "breakdown": {}}
 
     closes  = [k["close"]  for k in klines]
     highs   = [k["high"]   for k in klines]
@@ -1418,15 +1423,13 @@ def _compute_signal_layers(
     atr    = _atr(highs, lows, closes, 14)
     adx    = _adx(highs, lows, closes, 14)
 
-    price   = closes[-1]
-    atr_pct = (atr / price) if atr else 0.0
-    avg_vol = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0.0
-    vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0.0
+    price      = closes[-1]
+    last_open  = klines[-1]["open"]
+    atr_pct    = (atr / price) if atr else 0.0
+    avg_vol    = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0.0
+    vol_ratio  = volumes[-1] / avg_vol if avg_vol > 0 else 0.0
 
-    sig          = "EMA9>EMA21" if ema9[-1] > ema21[-1] else "EMA9<EMA21"
-    desired_side: Side = "LONG" if sig == "EMA9>EMA21" else "SHORT"
-
-    # Apply Mini-Asym adaptive strictness
+    # Apply adaptive strictness for MINI_ASYM
     p = MODE_SIGNAL_PARAMS.get(mode, MODE_SIGNAL_PARAMS["NORMAL"]).copy()
     if mode == "MINI_ASYM" and adaptive_strictness != 1.0:
         s = adaptive_strictness
@@ -1435,70 +1438,120 @@ def _compute_signal_layers(
         p["rsi_max"]      = max(50, p["rsi_max"] - (s - 1) * 8)
         p["pullback_max"] = p["pullback_max"] / max(0.5, s)
         p["vol_factor"]   = p["vol_factor"] * s
+        p["min_score"]    = min(0.90, p["min_score"] + (s - 1) * 0.12)
 
-    # ── Layer 1: Market regime (ADX + ATR) ──────────────────────────────
-    adx_ok = adx is not None and adx >= p["adx_min"]
-    atr_ok = p["atr_min"] <= atr_pct <= p["atr_max"]
-    if not adx_ok:
-        reg_reason = f"ADX {adx:.1f} < {p['adx_min']:.0f} — market choppy" if adx else "ADX unavailable"
-    elif not atr_ok:
-        reg_reason = f"ATR {atr_pct*100:.2f}% outside {p['atr_min']*100:.1f}–{p['atr_max']*100:.0f}%"
+    # ── Higher TF trend direction ─────────────────────────────────────────
+    # 4h (or 1d) EMA50 vs EMA21 sets the macro bias — trade WITH this trend only
+    if higher_klines and len(higher_klines) >= 55:
+        htf_closes = [k["close"] for k in higher_klines]
+        htf_ema21  = _ema(htf_closes, 21)
+        htf_ema50  = _ema(htf_closes, 50)
+        htf_bull   = htf_ema50[-1] > htf_ema21[-1]
+        htf_ok     = True
     else:
-        reg_reason = ""
+        htf_bull = ema50[-1] > ema200[-1]
+        htf_ok   = False
+
+    desired_side: Side = "LONG" if htf_bull else "SHORT"
+    local_bull = ema50[-1] > ema200[-1]
+    ema9_aligned = (ema9[-1] > ema21[-1]) if desired_side == "LONG" else (ema9[-1] < ema21[-1])
+    sig = f"EMA9{'>' if ema9[-1] > ema21[-1] else '<'}EMA21"
+
+    # ── Layer 1: Regime — ADX strength + ATR volatility ──────────────────
+    adx_ok  = adx is not None and adx >= p["adx_min"]
+    atr_ok  = atr_pct > 0 and p["atr_min"] <= atr_pct <= p["atr_max"]
+    adx_score = min(1.0, (adx - p["adx_min"]) / max(1.0, p["adx_min"])) if adx_ok else 0.0
+    atr_score = 1.0 if atr_ok else 0.0
+    regime_score = round(adx_score * 0.70 + atr_score * 0.30, 3)
+    reg_reason = (
+        f"ADX {adx:.1f} < {p['adx_min']:.0f} — market too choppy" if not adx_ok and adx
+        else f"ATR {atr_pct*100:.2f}% outside safe range {p['atr_min']*100:.1f}–{p['atr_max']*100:.0f}%" if not atr_ok
+        else ""
+    )
     breakdown_regime = {
         "adx": round(adx or 0, 1), "adx_min": round(p["adx_min"], 1),
         "atr_pct": round(atr_pct * 100, 3),
         "atr_range": f"{p['atr_min']*100:.1f}–{p['atr_max']*100:.0f}%",
-        "ok": adx_ok and atr_ok, "reason": reg_reason,
+        "score": regime_score, "ok": regime_score > 0.10, "reason": reg_reason,
     }
 
-    # ── Layer 2: Direction bias (EMA50 vs EMA200 + price position) ──────
-    bull = ema50[-1] > ema200[-1]
-    if desired_side == "LONG":
-        dir_ok     = bull and price > ema50[-1]
-        dir_reason = "" if dir_ok else ("EMA50 < EMA200 — downtrend" if not bull else "Price below EMA50")
-    else:
-        dir_ok     = (not bull) and price < ema50[-1]
-        dir_reason = "" if dir_ok else ("EMA50 > EMA200 — uptrend" if bull else "Price above EMA50")
+    # ── Layer 2: Direction — higher TF trend + local confirmation ─────────
+    htf_aligned   = htf_bull if desired_side == "LONG" else not htf_bull
+    local_aligned = (local_bull and price > ema50[-1]) if desired_side == "LONG" else (not local_bull and price < ema50[-1])
+    htf_score     = 1.0 if htf_aligned else 0.0
+    local_score   = 1.0 if local_aligned else 0.4
+    ema9_bonus    = 0.20 if ema9_aligned else 0.0
+    direction_score = round(min(1.0, htf_score * 0.55 + local_score * 0.30 + ema9_bonus * 0.15), 3)
+    dir_reason = (
+        "" if direction_score >= 0.55
+        else f"{'4h' if htf_ok else 'Higher TF'} trend {'bearish' if desired_side == 'LONG' else 'bullish'} — only trade WITH the trend"
+        if not htf_aligned
+        else f"Price {'below' if desired_side == 'LONG' else 'above'} EMA50 — wait for trend to establish locally"
+    )
     breakdown_direction = {
-        "trend": "BULL" if bull else "BEAR", "signal": sig, "side": desired_side,
-        "ok": dir_ok, "reason": dir_reason,
+        "htf_trend": "BULL" if htf_bull else "BEAR",
+        "htf_confirmed": htf_ok,
+        "local_trend": "BULL" if local_bull else "BEAR",
+        "ema9_momentum": "aligned" if ema9_aligned else "not aligned",
+        "signal": sig, "side": desired_side,
+        "score": direction_score, "ok": direction_score >= 0.55, "reason": dir_reason,
     }
 
-    # ── Layer 3: Entry location (pullback to EMA21 + RSI) ───────────────
-    pb_pct  = abs(price - ema21[-1]) / max(1e-9, ema21[-1])
-    pb_ok   = pb_pct <= p["pullback_max"]
-    rsi_ok  = rsi is not None and p["rsi_min"] <= rsi <= p["rsi_max"]
-    if not pb_ok:
-        ent_reason = f"Price {pb_pct*100:.1f}% from EMA21 — want <{p['pullback_max']*100:.0f}%"
-    elif not rsi_ok:
-        ent_reason = f"RSI {rsi:.0f} outside {p['rsi_min']}–{p['rsi_max']}"
+    # ── Layer 3: Entry — pullback to EMA21 + bounce candle + RSI ─────────
+    # Professional entry: don't chase the crossover — wait for price to pull back
+    # to EMA21 and confirm with a bounce candle in the direction of trade
+    pb_pct = abs(price - ema21[-1]) / max(1e-9, ema21[-1])
+    pullback_score = max(0.0, 1.0 - pb_pct / p["pullback_max"]) if pb_pct <= p["pullback_max"] else 0.0
+
+    # Bounce confirmation: last candle closed in trade direction after touching EMA21
+    if desired_side == "LONG":
+        bounce_ok = last_open < price and price >= ema21[-1] * 0.998
     else:
-        ent_reason = ""
+        bounce_ok = last_open > price and price <= ema21[-1] * 1.002
+    bounce_score = 1.0 if bounce_ok else 0.25
+
+    # RSI: closer to center of the range = better entry quality
+    rsi_in_range = rsi is not None and p["rsi_min"] <= rsi <= p["rsi_max"]
+    if rsi is not None and rsi_in_range:
+        mid = (p["rsi_min"] + p["rsi_max"]) / 2.0
+        half = (p["rsi_max"] - p["rsi_min"]) / 2.0
+        rsi_score = max(0.25, 1.0 - abs(rsi - mid) / half)
+    else:
+        rsi_score = 0.0
+
+    entry_score = round(pullback_score * 0.40 + bounce_score * 0.35 + rsi_score * 0.25, 3)
+    ent_reason = (
+        f"Price {pb_pct*100:.1f}% from EMA21 — need <{p['pullback_max']*100:.0f}% pullback to enter" if pullback_score == 0
+        else f"RSI {rsi:.0f} outside entry zone {p['rsi_min']}–{p['rsi_max']}" if not rsi_in_range
+        else f"Waiting for {'bullish' if desired_side == 'LONG' else 'bearish'} bounce candle off EMA21" if not bounce_ok
+        else ""
+    )
     breakdown_entry = {
         "price_vs_ema21_pct": round(pb_pct * 100, 2),
         "pullback_max_pct": round(p["pullback_max"] * 100, 1),
+        "bounce_confirmed": bounce_ok,
         "rsi": round(rsi or 0, 1), "rsi_range": f"{p['rsi_min']}–{p['rsi_max']}",
-        "ok": pb_ok and rsi_ok, "reason": ent_reason,
+        "score": entry_score, "ok": entry_score > 0.25, "reason": ent_reason,
     }
 
-    # ── Layer 4: Momentum (candles direction + volume) ───────────────────
+    # ── Layer 4: Momentum — candle alignment + volume confirmation ────────
     n = p["mom_n"]
-    if desired_side == "LONG":
-        mom_ok = all(klines[-(i + 1)]["close"] > klines[-(i + 1)]["open"] for i in range(n))
-    else:
-        mom_ok = all(klines[-(i + 1)]["close"] < klines[-(i + 1)]["open"] for i in range(n))
-    vol_ok = vol_ratio >= p["vol_factor"]
-    if not mom_ok:
-        mom_reason = f"Last {n} candle(s) not aligned with {desired_side}"
-    elif not vol_ok:
-        mom_reason = f"Volume {vol_ratio:.1f}x avg — need {p['vol_factor']:.1f}x"
-    else:
-        mom_reason = ""
+    candles_ok = all(
+        (klines[-(i + 1)]["close"] > klines[-(i + 1)]["open"]) == (desired_side == "LONG")
+        for i in range(n)
+    )
+    candle_score = 1.0 if candles_ok else 0.0
+    vol_score    = min(1.0, vol_ratio / (p["vol_factor"] * 1.5)) if vol_ratio >= p["vol_factor"] else vol_ratio / p["vol_factor"] * 0.4
+    momentum_score = round(candle_score * 0.55 + vol_score * 0.45, 3)
+    mom_reason = (
+        f"Last {n} candle(s) not {('bullish' if desired_side == 'LONG' else 'bearish')} — no momentum yet" if not candles_ok
+        else f"Volume {vol_ratio:.1f}x average — need {p['vol_factor']:.1f}x minimum" if vol_ratio < p["vol_factor"]
+        else ""
+    )
     breakdown_momentum = {
-        "candles_n": n, "candles_ok": mom_ok,
+        "candles_n": n, "candles_ok": candles_ok,
         "volume_ratio": round(vol_ratio, 2), "vol_factor": round(p["vol_factor"], 2),
-        "ok": mom_ok and vol_ok, "reason": mom_reason,
+        "score": momentum_score, "ok": momentum_score > 0.20, "reason": mom_reason,
     }
 
     breakdown = {
@@ -1508,19 +1561,33 @@ def _compute_signal_layers(
         "momentum":  breakdown_momentum,
     }
 
+    # ── Final weighted score ──────────────────────────────────────────────
+    total_score = round(
+        regime_score    * 0.25 +
+        direction_score * 0.30 +
+        entry_score     * 0.30 +
+        momentum_score  * 0.15,
+        3,
+    )
+    min_score = p.get("min_score", 0.62)
+
     failed = [k for k, v in breakdown.items() if not v["ok"]]
-    if failed:
-        reasons = " | ".join(breakdown[k]["reason"] for k in failed if breakdown[k]["reason"])
+    if failed or total_score < min_score:
+        reasons = " | ".join(breakdown[k]["reason"] for k in failed if breakdown[k].get("reason"))
+        if total_score < min_score and not failed:
+            reasons = f"Signal quality {total_score:.2f} below threshold {min_score:.2f} — setup not strong enough"
         return {
             "ok": False,
-            "blocked": f"BLOCKED ({', '.join(failed)}): {reasons}",
+            "blocked": f"BLOCKED ({', '.join(failed) or 'score'}): {reasons}",
             "signal": sig, "side": desired_side,
+            "score": total_score, "min_score": min_score,
             "breakdown": breakdown, "atr_pct": atr_pct,
         }
 
     return {
         "ok": True, "blocked": None,
         "signal": sig, "side": desired_side,
+        "score": total_score, "min_score": min_score,
         "breakdown": breakdown, "atr_pct": atr_pct,
     }
 
@@ -1550,6 +1617,7 @@ class AutoState:
     signal_breakdown: Dict
     adaptive_strictness: float
     pending_trade: Optional[Dict]
+    signal_score: float
 
 
 class AutoStartIn(BaseModel):
@@ -1592,10 +1660,11 @@ class AutoRunner:
             end_dt = now_dubai() + timedelta(days=self.duration_days)
             self.end_at_ts = end_dt.timestamp()
         self.history: Deque[Dict[str, str]] = deque(maxlen=120)
-        self._prev_sig: str = ""
         self.pending_trade: Optional[Dict] = None
         self.adaptive_strictness: float = 1.0
         self.last_breakdown: Dict = {}
+        self.last_score: float = 0.0
+        self._last_trade_bad: bool = False
         self.session_start_equity: float = get_equity(email)
         # Load today's real trade counts from DB — prevents bypass by stop+restart
         self.trades_today, self.bad_trades_today = self._load_today_stats()
@@ -1675,6 +1744,7 @@ class AutoRunner:
             signal_breakdown=self.last_breakdown,
             adaptive_strictness=self.adaptive_strictness,
             pending_trade=self.pending_trade,
+            signal_score=self.last_score,
         )
 
     def _fetch_price_sync(self, symbol: str) -> float:
@@ -1783,6 +1853,7 @@ class AutoRunner:
 
             set_equity(self.email, equity_after)
             self.trades_today += 1
+            self._last_trade_bad = pnl_value < 0
             if pnl_value < 0:
                 self.bad_trades_today += 1
 
@@ -1816,8 +1887,16 @@ class AutoRunner:
 
     def _signal_and_filters(self):
         klines = _fetch_klines_sync(self.symbol, self.tf, limit=260)
-        res = _compute_signal_layers(klines, self.mode, self.adaptive_strictness)
+        higher_tf = HIGHER_TF_MAP.get(self.tf, "4h")
+        higher_klines: List[Dict] = []
+        if higher_tf != self.tf:
+            try:
+                higher_klines = _fetch_klines_sync(self.symbol, higher_tf, limit=100)
+            except Exception:
+                higher_klines = []
+        res = _compute_signal_layers(klines, self.mode, self.adaptive_strictness, higher_klines)
         self.last_breakdown = res.get("breakdown", {})
+        self.last_score = res.get("score", 0.0)
         return res
 
     def _secs_until_dubai_midnight(self) -> int:
@@ -1840,7 +1919,7 @@ class AutoRunner:
             # New day — reload counters from DB and resume
             self.trades_today, self.bad_trades_today = self._load_today_stats()
             self.day_key = dubai_day_key()
-            self._prev_sig = ""  # reset signal memory so first trade waits for a real change
+            self._last_trade_bad = False
             self.last_trade_ts = time.time()
             self.log("New Dubai day — daily limits reset. Resuming AI.")
 
@@ -1909,16 +1988,14 @@ class AutoRunner:
                 self.last_side = desired_side
 
                 now_ts = time.time()
-                # Trade only on genuine signal change + cooldown elapsed
-                should_trade = (
-                    self.last_signal != self._prev_sig
-                    and (now_ts - self.last_trade_ts) >= cooldown_sec
-                )
-                self._prev_sig = self.last_signal
+                # After a bad trade wait 2× the normal cooldown before entering again
+                effective_cooldown = cooldown_sec * 2 if self._last_trade_bad else cooldown_sec
+                should_trade = (now_ts - self.last_trade_ts) >= effective_cooldown
 
                 if should_trade:
                     # ── Step 4: Open trade — fetch real entry price ───────────────────
                     entry_price = self._fetch_price_sync(self.symbol)
+                    self._last_trade_bad = False  # reset until this trade closes
                     self.pending_trade = {
                         "entry_price": entry_price,
                         "side": desired_side,
@@ -1927,10 +2004,11 @@ class AutoRunner:
                         "open_ts": time.time(),
                     }
                     self.last_trade_ts = now_ts
-                    self.log(f"TRADE OPENED ({desired_side}) @ {entry_price:.4f} | signal={self.last_signal}")
+                    self.log(f"TRADE OPENED ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}")
                 else:
-                    layers = [k for k, v in res.get("breakdown", {}).items()]
-                    self.log(f"Waiting | signal={self.last_signal} | layers={layers}")
+                    wait_sec = int(effective_cooldown - (now_ts - self.last_trade_ts))
+                    cd_label = "2× cooldown (after loss)" if self._last_trade_bad else "cooldown"
+                    self.log(f"Signal OK (score={self.last_score:.2f}) | {cd_label} — {wait_sec}s remaining")
 
             except Exception as e:
                 self.blocked_reason = "ERROR"
