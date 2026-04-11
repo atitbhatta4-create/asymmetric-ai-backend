@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import secrets
 import time
@@ -1067,6 +1068,101 @@ async def get_price(symbol: str, exchange: Optional[str] = Query(default=None)):
     sym = symbol.upper().strip()
     price = await _route_price(sym, exchange or "okx")
     return {"symbol": sym, "price": price, "exchange": (exchange or "okx").lower()}
+
+
+@app.get("/market/ticker/{symbol}")
+async def market_ticker(symbol: str):
+    """24h stats for a symbol: price, change%, high, low, volume in USDT."""
+    inst = to_okx_inst(symbol.upper().strip())
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(
+            f"{OKX_BASE}/api/v5/market/ticker",
+            params={"instId": inst},
+            headers={"accept": "application/json"},
+        )
+    d = ((r.json() or {}).get("data") or [{}])[0]
+    last   = float(d.get("last") or 0)
+    open24 = float(d.get("open24h") or last or 1)
+    high   = float(d.get("high24h") or 0)
+    low    = float(d.get("low24h") or 0)
+    vol    = float(d.get("volCcy24h") or 0)   # volume in USDT
+    chg    = ((last - open24) / open24 * 100) if open24 else 0.0
+    return {
+        "symbol": symbol.upper().strip(),
+        "price": last, "open24h": open24,
+        "high24h": high, "low24h": low,
+        "change24h": round(chg, 3),
+        "volume24h": round(vol, 2),
+    }
+
+
+@app.get("/market/tickers")
+async def market_tickers(symbols: str = Query(...)):
+    """Batch 24h stats. Pass ?symbols=BTCUSDT,ETHUSDT,..."""
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    async with httpx.AsyncClient(timeout=12) as client:
+        results = await asyncio.gather(*[
+            client.get(
+                f"{OKX_BASE}/api/v5/market/ticker",
+                params={"instId": to_okx_inst(s)},
+                headers={"accept": "application/json"},
+            )
+            for s in syms
+        ], return_exceptions=True)
+    out = []
+    for sym, res in zip(syms, results):
+        try:
+            d = ((res.json() or {}).get("data") or [{}])[0]  # type: ignore
+            last   = float(d.get("last") or 0)
+            open24 = float(d.get("open24h") or last or 1)
+            high   = float(d.get("high24h") or 0)
+            low    = float(d.get("low24h") or 0)
+            vol    = float(d.get("volCcy24h") or 0)
+            chg    = ((last - open24) / open24 * 100) if open24 else 0.0
+            out.append({"symbol": sym, "price": last, "change24h": round(chg, 3),
+                        "high24h": high, "low24h": low, "volume24h": round(vol, 2)})
+        except Exception:
+            out.append({"symbol": sym, "price": 0, "change24h": 0, "high24h": 0, "low24h": 0, "volume24h": 0})
+    return {"tickers": out}
+
+
+@app.get("/market/orderbook/{symbol}")
+async def market_orderbook(symbol: str, depth: int = Query(default=15, ge=5, le=50)):
+    """Live order book bids/asks."""
+    inst = to_okx_inst(symbol.upper().strip())
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(
+            f"{OKX_BASE}/api/v5/market/books",
+            params={"instId": inst, "sz": depth},
+            headers={"accept": "application/json"},
+        )
+    d = ((r.json() or {}).get("data") or [{}])[0]
+    def parse_side(rows):
+        return [{"price": float(row[0]), "size": float(row[1])} for row in (rows or [])]
+    return {
+        "symbol": symbol.upper().strip(),
+        "asks": parse_side(d.get("asks", [])),   # ascending (lowest ask first)
+        "bids": parse_side(d.get("bids", [])),   # descending (highest bid first)
+    }
+
+
+@app.get("/market/trades/{symbol}")
+async def market_trades(symbol: str, limit: int = Query(default=20, ge=5, le=50)):
+    """Recent trades."""
+    inst = to_okx_inst(symbol.upper().strip())
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(
+            f"{OKX_BASE}/api/v5/market/trades",
+            params={"instId": inst, "limit": limit},
+            headers={"accept": "application/json"},
+        )
+    rows = (r.json() or {}).get("data") or []
+    trades = [
+        {"price": float(t.get("px", 0)), "size": float(t.get("sz", 0)),
+         "side": t.get("side", "").upper(), "ts": int(t.get("ts", 0))}
+        for t in rows
+    ]
+    return {"symbol": symbol.upper().strip(), "trades": trades}
 
 
 @app.get("/klines/{symbol}")
