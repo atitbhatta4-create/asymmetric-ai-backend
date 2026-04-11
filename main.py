@@ -5,6 +5,9 @@ import secrets
 import time
 import hashlib
 import threading
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Literal, Any, Deque
@@ -44,6 +47,137 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# =========================
+# EMAIL (Gmail SMTP)
+# =========================
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
+
+
+def _email_base(content: str) -> str:
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#050814;font-family:system-ui,-apple-system,sans-serif;color:#e5e7eb;">
+  <div style="max-width:520px;margin:32px auto;padding:0 16px;">
+    <div style="background:#0a0f1e;border:1px solid rgba(255,255,255,0.08);border-radius:18px;overflow:hidden;">
+      <div style="padding:18px 24px;border-bottom:1px solid rgba(255,255,255,0.06);">
+        <span style="font-size:17px;font-weight:900;color:#00ffe0;">Asymmetric AI</span>
+      </div>
+      <div style="padding:24px;">{content}</div>
+      <div style="padding:14px 24px;border-top:1px solid rgba(255,255,255,0.06);font-size:12px;color:#4b5563;">
+        Demo mode &nbsp;·&nbsp; No real funds &nbsp;·&nbsp; Educational only
+      </div>
+    </div>
+  </div>
+</body></html>"""
+
+
+def _send_email_sync(to: str, subject: str, html: str) -> None:
+    if not SMTP_USER or not SMTP_PASS:
+        return
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = f"Asymmetric AI <{SMTP_USER}>"
+        msg["To"] = to
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as srv:
+            srv.ehlo()
+            srv.starttls()
+            srv.login(SMTP_USER, SMTP_PASS)
+            srv.sendmail(SMTP_USER, to, msg.as_string())
+    except Exception as e:
+        print(f"[EMAIL ERROR] {e}")
+
+
+def send_email(to: str, subject: str, html: str) -> None:
+    """Fire-and-forget — never blocks the main thread."""
+    threading.Thread(target=_send_email_sync, args=(to, subject, html), daemon=True).start()
+
+
+def email_password_changed(to: str) -> None:
+    content = f"""
+    <h2 style="margin:0 0 14px;font-size:20px;font-weight:900;color:#f1f5f9;">Password Changed</h2>
+    <p style="margin:0 0 14px;opacity:0.85;line-height:1.6;">
+      Your password for <b>{to}</b> was changed successfully.
+    </p>
+    <div style="background:rgba(220,38,38,0.12);border:1px solid rgba(248,113,113,0.3);
+                border-radius:12px;padding:12px 16px;font-size:13px;color:#fecaca;">
+      If this wasn't you, change your password immediately and secure your account.
+    </div>"""
+    send_email(to, "Your Asymmetric AI password was changed", _email_base(content))
+
+
+def email_ai_started(to: str, symbol: str, mode: str, tf: str,
+                     interval_sec: int, duration_days: int,
+                     max_trades: int, stop_after_bad: int) -> None:
+    duration_str = f"{duration_days} day{'s' if duration_days != 1 else ''}" if duration_days > 0 else "Unlimited"
+    interval_str = f"{interval_sec // 60}m" if interval_sec >= 60 else f"{interval_sec}s"
+    content = f"""
+    <h2 style="margin:0 0 6px;font-size:20px;font-weight:900;color:#f1f5f9;">AI Trading Started</h2>
+    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">
+      Your AI trader is live and monitoring the market.
+    </p>
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);
+                border-radius:14px;padding:16px;margin-bottom:16px;">
+      <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        {''.join(f'<tr><td style="padding:7px 0;color:#6b7280;width:140px;">{k}</td><td style="padding:7px 0;font-weight:900;color:#f1f5f9;">{v}</td></tr>' for k,v in [
+            ("Coin", symbol), ("Mode", mode), ("Timeframe", tf),
+            ("Check every", interval_str), ("Duration", duration_str),
+            ("Max trades / day", str(max_trades)), ("Bad trade limit", f"{stop_after_bad} per day"),
+        ])}
+      </table>
+    </div>
+    <p style="margin:0;font-size:12px;color:#4b5563;">
+      The AI only trades when all 4 signal layers pass.
+      You will receive an email for each completed trade.
+    </p>"""
+    send_email(to, f"AI started — {symbol} {mode}", _email_base(content))
+
+
+def email_trade_closed(to: str, symbol: str, side: str, mode: str,
+                       entry: float, exit_price: float, outcome: str,
+                       pnl_pct: float, pnl_value: float, equity_after: float) -> None:
+    outcome_label = (
+        "Take profit hit" if outcome == "TP_HIT"
+        else "Stop loss hit" if outcome == "SL_HIT"
+        else "Natural close"
+    )
+    win = pnl_value >= 0
+    pnl_color = "#00ff9d" if win else "#ff5078"
+    side_color = "#00ff9d" if side == "LONG" else "#ff5078"
+    sign = "+" if win else ""
+    outcome_icon = "✓" if win else "✗"
+    content = f"""
+    <h2 style="margin:0 0 4px;font-size:20px;font-weight:900;color:#f1f5f9;">Trade Completed</h2>
+    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">{symbol} &nbsp;·&nbsp; {mode}</p>
+
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);
+                border-radius:14px;padding:20px;margin-bottom:14px;text-align:center;">
+      <div style="font-size:13px;color:#6b7280;margin-bottom:8px;">
+        {outcome_label} {outcome_icon}
+      </div>
+      <div style="font-size:38px;font-weight:900;color:{pnl_color};">{sign}{pnl_pct:.2f}%</div>
+      <div style="font-size:16px;font-weight:900;color:{pnl_color};margin-top:4px;">{sign}${pnl_value:.2f}</div>
+    </div>
+
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);
+                border-radius:14px;padding:16px;">
+      <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        {''.join(f'<tr><td style="padding:6px 0;color:#6b7280;width:130px;">{k}</td><td style="padding:6px 0;font-weight:900;color:{c};">{v}</td></tr>' for k,v,c in [
+            ("Direction", side, side_color),
+            ("Entry price", f"${entry:,.4f}", "#f1f5f9"),
+            ("Exit price", f"${exit_price:,.4f}", "#f1f5f9"),
+            ("Equity after", f"${equity_after:,.2f}", "#f1f5f9"),
+        ])}
+      </table>
+    </div>"""
+    subject = f"{'Win' if win else 'Loss'} {sign}{pnl_pct:.2f}% — {symbol} {side} closed"
+    send_email(to, subject, _email_base(content))
+
 
 # Strip /api prefix forwarded by Vercel
 @app.middleware("http")
@@ -565,6 +699,7 @@ def change_password(payload: ChangePasswordIn, user=Depends(require_user)):
         conn.commit()
         conn.close()
 
+    email_password_changed(email)
     return {"ok": True}
 
 
@@ -1651,6 +1786,13 @@ class AutoRunner:
             if pnl_value < 0:
                 self.bad_trades_today += 1
 
+            email_trade_closed(
+                to=self.email, symbol=self.symbol, side=side, mode=mode,
+                entry=entry, exit_price=exit_price, outcome=outcome,
+                pnl_pct=pnl_pct_leveraged * 100.0,
+                pnl_value=pnl_value, equity_after=equity_after,
+            )
+
             # Mini-Asym adaptive strictness: tighten after loss, relax after win
             if mode == "MINI_ASYM":
                 if pnl_value < 0:
@@ -1947,6 +2089,12 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         )
         AUTO_RUNNERS[email] = runner
         runner.start()
+
+    email_ai_started(
+        to=email, symbol=symbol, mode=payload.mode, tf=payload.tf,
+        interval_sec=payload.interval_sec, duration_days=int(payload.duration_days),
+        max_trades=int(max_trades), stop_after_bad=int(payload.stop_after_bad_trades),
+    )
 
     return {"ok": True, "running": True, "symbol": symbol, "tf": payload.tf,
             "interval_sec": payload.interval_sec, "mode": payload.mode,
