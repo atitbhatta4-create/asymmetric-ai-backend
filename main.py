@@ -311,6 +311,8 @@ init_db()
 # =========================
 OKX_BASE = "https://www.okx.com"
 OKX_TF_MAP = {"15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}
+# Minimum interval (seconds) per timeframe — trade must be open at least this long
+TF_MIN_INTERVAL: Dict[str, int] = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 
 # =========================
 # HELPERS
@@ -1470,7 +1472,10 @@ def _compute_signal_layers(
     desired_side: Side = "LONG" if htf_bull else "SHORT"
     local_bull = ema50[-1] > ema200[-1]
     ema9_aligned = (ema9[-1] > ema21[-1]) if desired_side == "LONG" else (ema9[-1] < ema21[-1])
-    sig = f"EMA9{'>' if ema9[-1] > ema21[-1] else '<'}EMA21"
+    # Signal label: HTF trend direction + local EMA9 momentum alignment
+    htf_label = "4h-BULL" if htf_bull else "4h-BEAR"
+    ema9_label = "EMA9↑" if ema9[-1] > ema21[-1] else "EMA9↓"
+    sig = f"{htf_label} {ema9_label}"
 
     # ── Layer 1: Regime — ADX strength + ATR volatility ──────────────────
     adx_ok  = adx is not None and adx >= p["adx_min"]
@@ -2117,8 +2122,9 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         raise HTTPException(status_code=400, detail="Use symbol like BTCUSDT / ETHUSDT / SOLUSDT")
     if payload.tf not in TF_MAP:
         raise HTTPException(status_code=400, detail="Bad timeframe")
-    if payload.interval_sec < 5 or payload.interval_sec > 3600:
-        raise HTTPException(status_code=400, detail="interval_sec must be 5..3600")
+    # Force interval_sec to be at least the TF duration so SL/TP have time to hit
+    tf_min = TF_MIN_INTERVAL.get(payload.tf, 900)
+    interval_sec = max(tf_min, min(int(payload.interval_sec), 86400))
 
     max_trades = payload.max_trades_per_day if payload.max_trades_per_day is not None else default_max_trades_per_day(payload.mode)
 
@@ -2174,7 +2180,7 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
 
         runner = AutoRunner(
             email=email, symbol=symbol, tf=payload.tf,
-            interval_sec=payload.interval_sec, mode=payload.mode,
+            interval_sec=interval_sec, mode=payload.mode,
             max_trades_per_day=int(max_trades),
             stop_after_bad_trades=int(payload.stop_after_bad_trades),
             duration_days=int(payload.duration_days),
@@ -2186,12 +2192,12 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
 
     email_ai_started(
         to=email, symbol=symbol, mode=payload.mode, tf=payload.tf,
-        interval_sec=payload.interval_sec, duration_days=int(payload.duration_days),
+        interval_sec=interval_sec, duration_days=int(payload.duration_days),
         max_trades=int(max_trades), stop_after_bad=int(payload.stop_after_bad_trades),
     )
 
     return {"ok": True, "running": True, "symbol": symbol, "tf": payload.tf,
-            "interval_sec": payload.interval_sec, "mode": payload.mode,
+            "interval_sec": interval_sec, "mode": payload.mode,
             "max_trades_per_day": int(max_trades)}
 
 
