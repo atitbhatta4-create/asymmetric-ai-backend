@@ -714,10 +714,20 @@ def debug_email(to: str = Query(default="")):
     content = "<h2 style='color:#f1f5f9;'>Test Email</h2><p style='opacity:0.85;'>SMTP is working on Asymmetric AI.</p>"
     err = None
     try:
-        _send_email_sync(target, "Asymmetric AI — SMTP Test", _email_base(content))
+        # Call raw SMTP directly (bypass the internal try/except) so errors surface here
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = "Asymmetric AI — SMTP Test"
+        msg["From"] = f"Asymmetric AI <{SMTP_USER}>"
+        msg["To"] = target
+        msg.attach(MIMEText(_email_base(content), "html"))
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as srv:
+            srv.ehlo()
+            srv.starttls()
+            srv.login(SMTP_USER, SMTP_PASS)
+            srv.sendmail(SMTP_USER, target, msg.as_string())
     except Exception as e:
         err = str(e)
-    return {"ok": err is None, "sent_to": target, "error": err}
+    return {"ok": err is None, "sent_to": target, "smtp_user": SMTP_USER, "error": err}
 
 
 @app.post("/auth/forgot")
