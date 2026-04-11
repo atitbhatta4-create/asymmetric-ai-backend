@@ -704,13 +704,13 @@ def change_password(payload: ChangePasswordIn, user=Depends(require_user)):
 
 
 @app.get("/debug/email")
-def debug_email(user=Depends(require_user)):
-    """Send a test email to the logged-in user. Use this to verify SMTP config."""
+def debug_email():
+    """Send a test email to SMTP_USER itself. No auth needed — for diagnosing SMTP config."""
     if not SMTP_USER or not SMTP_PASS:
-        return {"ok": False, "error": "SMTP_USER or SMTP_PASS env var not set on server"}
+        return {"ok": False, "error": "SMTP_USER or SMTP_PASS env var not set on server", "smtp_user": repr(SMTP_USER), "smtp_pass_set": bool(SMTP_PASS)}
     content = "<h2 style='color:#f1f5f9;'>Test Email</h2><p style='opacity:0.85;'>If you see this, SMTP is working correctly on Asymmetric AI.</p>"
-    _send_email_sync(user["email"], "Asymmetric AI — SMTP Test", _email_base(content))
-    return {"ok": True, "sent_to": user["email"], "smtp_user": SMTP_USER}
+    _send_email_sync(SMTP_USER, "Asymmetric AI — SMTP Test", _email_base(content))
+    return {"ok": True, "sent_to": SMTP_USER, "smtp_user": SMTP_USER}
 
 
 @app.post("/auth/forgot")
