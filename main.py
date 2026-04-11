@@ -704,13 +704,18 @@ def change_password(payload: ChangePasswordIn, user=Depends(require_user)):
 
 
 @app.get("/debug/email")
-def debug_email():
-    """Send a test email to SMTP_USER itself. No auth needed — for diagnosing SMTP config."""
+def debug_email(to: str = Query(default="")):
+    """Send a test email. Pass ?to=your@email.com to test delivery. No auth needed."""
     if not SMTP_USER or not SMTP_PASS:
-        return {"ok": False, "error": "SMTP_USER or SMTP_PASS env var not set on server", "smtp_user": repr(SMTP_USER), "smtp_pass_set": bool(SMTP_PASS)}
-    content = "<h2 style='color:#f1f5f9;'>Test Email</h2><p style='opacity:0.85;'>If you see this, SMTP is working correctly on Asymmetric AI.</p>"
-    _send_email_sync(SMTP_USER, "Asymmetric AI — SMTP Test", _email_base(content))
-    return {"ok": True, "sent_to": SMTP_USER, "smtp_user": SMTP_USER}
+        return {"ok": False, "error": "SMTP_USER or SMTP_PASS not set", "smtp_user": repr(SMTP_USER)}
+    target = to.strip() if to.strip() else SMTP_USER
+    content = "<h2 style='color:#f1f5f9;'>Test Email</h2><p style='opacity:0.85;'>SMTP is working on Asymmetric AI.</p>"
+    err = None
+    try:
+        _send_email_sync(target, "Asymmetric AI — SMTP Test", _email_base(content))
+    except Exception as e:
+        err = str(e)
+    return {"ok": err is None, "sent_to": target, "error": err}
 
 
 @app.post("/auth/forgot")
