@@ -2088,6 +2088,7 @@ def auto_signal(user=Depends(require_user)):
             "side": r.last_side,
             "blocked": r.blocked_reason,
             "adaptive_strictness": r.adaptive_strictness,
+            "signal_score": r.last_score,
             "pending_trade": r.pending_trade,
             "breakdown": r.last_breakdown,
         }
