@@ -112,11 +112,11 @@ def email_password_changed(to: str) -> None:
     send_email(to, "Your Asymmetric AI password was changed", _email_base(content))
 
 
-def email_ai_started(to: str, symbol: str, mode: str, tf: str,
-                     interval_sec: int, duration_days: int,
-                     max_trades: int, stop_after_bad: int) -> None:
+def email_ai_started(to: str, symbol: str, mode: str, trade_style: str,
+                     duration_days: int, max_trades: int, stop_after_bad: int) -> None:
     duration_str = f"{duration_days} day{'s' if duration_days != 1 else ''}" if duration_days > 0 else "Unlimited"
-    interval_str = f"{interval_sec // 60}m" if interval_sec >= 60 else f"{interval_sec}s"
+    sp = TRADE_STYLE_PARAMS.get(trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
+    interval_str = f"{sp['interval'] // 60}m"
     content = f"""
     <h2 style="margin:0 0 6px;font-size:20px;font-weight:900;color:#f1f5f9;">AI Trading Started</h2>
     <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">
@@ -126,8 +126,8 @@ def email_ai_started(to: str, symbol: str, mode: str, tf: str,
                 border-radius:14px;padding:16px;margin-bottom:16px;">
       <table style="width:100%;border-collapse:collapse;font-size:14px;">
         {''.join(f'<tr><td style="padding:7px 0;color:#6b7280;width:140px;">{k}</td><td style="padding:7px 0;font-weight:900;color:#f1f5f9;">{v}</td></tr>' for k,v in [
-            ("Coin", symbol), ("Mode", mode), ("Timeframe", tf),
-            ("Check every", interval_str), ("Duration", duration_str),
+            ("Coin", symbol), ("Mode", mode), ("Style", trade_style),
+            ("Timeframe", sp["tf"]), ("Check every", interval_str), ("Duration", duration_str),
             ("Max trades / day", str(max_trades)), ("Bad trade limit", f"{stop_after_bad} per day"),
         ])}
       </table>
@@ -323,6 +323,14 @@ RiskMode = Literal["ULTRA_SAFE", "SAFE", "NORMAL", "MINI_ASYM", "AGGRESSIVE"]
 Side = Literal["LONG", "SHORT"]
 TF = Literal["15m", "1h", "4h", "1d"]
 TF_MAP: Dict[str, str] = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
+TradeStyle = Literal["SCALP", "DAY_TRADE", "SWING"]
+
+# Trading style: auto-sets TF + interval + ATR multipliers for SL/TP (1:2 RR always)
+TRADE_STYLE_PARAMS: Dict[str, Dict] = {
+    "SCALP":     {"tf": "15m", "interval": 900,   "sl_atr": 0.8, "tp_atr": 1.6, "sl_max": 1.5, "tp_max": 3.0},
+    "DAY_TRADE": {"tf": "1h",  "interval": 3600,  "sl_atr": 1.0, "tp_atr": 2.0, "sl_max": 2.5, "tp_max": 5.0},
+    "SWING":     {"tf": "4h",  "interval": 14400, "sl_atr": 1.5, "tp_atr": 3.0, "sl_max": 4.0, "tp_max": 8.0},
+}
 
 DUBAI_TZ = timezone(timedelta(hours=4))
 
@@ -1697,6 +1705,9 @@ def _compute_signal_layers(
     )
     min_score = p.get("min_score", 0.62)
 
+    # Market grade: A = high conviction, B = good setup, C = weak (blocked)
+    grade = "A" if total_score >= 0.78 else "B"
+
     failed = [k for k, v in breakdown.items() if not v["ok"]]
     if failed or total_score < min_score:
         reasons = " | ".join(breakdown[k]["reason"] for k in failed if breakdown[k].get("reason"))
@@ -1706,14 +1717,14 @@ def _compute_signal_layers(
             "ok": False,
             "blocked": f"BLOCKED ({', '.join(failed) or 'score'}): {reasons}",
             "signal": sig, "side": desired_side,
-            "score": total_score, "min_score": min_score,
+            "score": total_score, "min_score": min_score, "grade": "C",
             "breakdown": breakdown, "atr_pct": atr_pct,
         }
 
     return {
         "ok": True, "blocked": None,
         "signal": sig, "side": desired_side,
-        "score": total_score, "min_score": min_score,
+        "score": total_score, "min_score": min_score, "grade": grade,
         "breakdown": breakdown, "atr_pct": atr_pct,
     }
 
@@ -1742,14 +1753,15 @@ class AutoState:
     chop_min_sep_pct: float
     signal_breakdown: Dict
     adaptive_strictness: float
-    pending_trade: Optional[Dict]
+    pending_trades: List[Dict]
     signal_score: float
+    trade_style: str
+    market_grade: str
 
 
 class AutoStartIn(BaseModel):
     symbol: str
-    tf: TF = "15m"
-    interval_sec: int = 60
+    trade_style: TradeStyle = "DAY_TRADE"
     mode: RiskMode = "MINI_ASYM"
     max_trades_per_day: Optional[int] = None
     stop_after_bad_trades: int = 2
@@ -1759,13 +1771,15 @@ class AutoStartIn(BaseModel):
 
 
 class AutoRunner:
-    def __init__(self, email, symbol, tf, interval_sec, mode,
+    def __init__(self, email, symbol, trade_style, mode,
                  max_trades_per_day, stop_after_bad_trades, duration_days,
                  trend_filter, chop_min_sep_pct):
         self.email = email
         self.symbol = symbol.upper().strip()
-        self.tf = tf
-        self.interval_sec = int(max(5, min(3600, interval_sec)))
+        self.trade_style: TradeStyle = trade_style
+        sp = TRADE_STYLE_PARAMS.get(trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
+        self.tf = sp["tf"]
+        self.interval_sec = sp["interval"]
         self.mode = mode
         self.max_trades_per_day = int(max(0, max_trades_per_day))
         self.stop_after_bad_trades = int(max(0, stop_after_bad_trades))
@@ -1786,10 +1800,12 @@ class AutoRunner:
             end_dt = now_dubai() + timedelta(days=self.duration_days)
             self.end_at_ts = end_dt.timestamp()
         self.history: Deque[Dict[str, str]] = deque(maxlen=120)
-        self.pending_trade: Optional[Dict] = None
+        self.pending_trades: List[Dict] = []
         self.adaptive_strictness: float = 1.0
         self.last_breakdown: Dict = {}
         self.last_score: float = 0.0
+        self.last_atr_pct: float = 0.01   # fallback 1% ATR until first signal
+        self.market_grade: str = "-"
         self._last_trade_bad: bool = False
         self.session_start_equity: float = get_equity(email)
         # Load today's real trade counts from DB — prevents bypass by stop+restart
@@ -1836,9 +1852,9 @@ class AutoRunner:
     def stop(self, reason="Stopped by user."):
         self.log(reason)
         self.stop_event.set()
-        if self.pending_trade:
-            self.log(f"Pending trade abandoned at stop (entry={self.pending_trade.get('entry_price', '?')}).")
-            self.pending_trade = None
+        if self.pending_trades:
+            self.log(f"Pending trade(s) abandoned at stop (entry={self.pending_trades[0].get('entry_price', '?')}).")
+            self.pending_trades = []
 
     def _reset_if_new_day(self):
         k = dubai_day_key()
@@ -1869,8 +1885,10 @@ class AutoRunner:
             trend_filter=self.trend_filter, chop_min_sep_pct=self.chop_min_sep_pct,
             signal_breakdown=self.last_breakdown,
             adaptive_strictness=self.adaptive_strictness,
-            pending_trade=self.pending_trade,
+            pending_trades=list(self.pending_trades),
             signal_score=self.last_score,
+            trade_style=self.trade_style,
+            market_grade=self.market_grade,
         )
 
     def _fetch_price_sync(self, symbol: str) -> float:
@@ -1887,129 +1905,157 @@ class AutoRunner:
             raise RuntimeError(f"No price data for {symbol}")
         return float(arr[0]["last"])
 
-    def _close_pending_trade(self) -> None:
-        """Fetch real exit price, apply SL/TP, record trade to DB, update adaptive strictness."""
-        pt = self.pending_trade
-        if not pt:
-            return
-        try:
-            exit_price = self._fetch_price_sync(self.symbol)
-            entry = float(pt["entry_price"])
-            side: Side = pt["side"]
-            mode: RiskMode = pt["mode"]
+    def _close_one_trade(self, pt: Dict, exit_price: float, equity_before: float) -> float:
+        """
+        Close a single pending trade dict. Returns equity_after.
+        Uses ATR-based SL/TP from trade style. size_mult/tp_mult support Grade B splits.
+        """
+        entry = float(pt["entry_price"])
+        side: Side = pt["side"]
+        mode: RiskMode = pt["mode"]
+        size_mult = float(pt.get("size_mult", 1.0))
+        tp_mult   = float(pt.get("tp_mult", 1.0))
+        is_primary = pt.get("is_primary", True)  # only primary trade counts toward bad-trade limit
+        label = pt.get("label", "")
 
-            equity_before = get_equity(self.email)
-            risk = mini_asym_risk_engine(mode, equity_before)
-            c = risk["computed"]
+        # Base risk preset (size% and leverage from mode)
+        risk = mini_asym_risk_engine(mode, equity_before)
+        c = risk["computed"]
 
-            sl_pct = c["sl"] / 100.0
-            tp_pct = c["tp"] / 100.0
+        # ATR-based SL/TP — adapts to real market volatility
+        sp = TRADE_STYLE_PARAMS.get(self.trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
+        atr = self.last_atr_pct
+        sl_pct = min(atr * sp["sl_atr"], sp["sl_max"] / 100.0)
+        tp_pct = min(atr * sp["tp_atr"], sp["tp_max"] / 100.0) * tp_mult
+        # Enforce minimum viable SL/TP
+        sl_pct = max(sl_pct, 0.002)
+        tp_pct = max(tp_pct, 0.004)
 
-            raw_move = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
+        effective_size = c["size"] * size_mult
 
-            if raw_move <= -sl_pct:
-                final_move = -sl_pct
-                outcome = "SL_HIT"
-            elif raw_move >= tp_pct:
-                final_move = tp_pct
-                outcome = "TP_HIT"
-            else:
-                final_move = raw_move
-                outcome = "NATURAL_CLOSE"
+        raw_move = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
 
-            pnl_pct_leveraged = final_move * c["leverage"]
-            pnl_value = equity_before * (c["size"] / 100.0) * pnl_pct_leveraged
-            equity_after = equity_before + pnl_value
+        if raw_move <= -sl_pct:
+            final_move = -sl_pct
+            outcome = "SL_HIT"
+        elif raw_move >= tp_pct:
+            final_move = tp_pct
+            outcome = "TP_HIT"
+        else:
+            final_move = raw_move
+            outcome = "NATURAL_CLOSE"
 
-            from_start = equity_after - START_EQUITY
-            dir_word = "up" if from_start >= 0 else "down"
-            size_dollar = equity_before * c["size"] / 100.0
-            outcome_label = (
-                "Take profit hit" if outcome == "TP_HIT"
-                else "Stop loss hit" if outcome == "SL_HIT"
-                else "Natural close"
+        pnl_pct_leveraged = final_move * c["leverage"]
+        pnl_value = equity_before * (effective_size / 100.0) * pnl_pct_leveraged
+        equity_after = equity_before + pnl_value
+
+        from_start = equity_after - START_EQUITY
+        dir_word = "up" if from_start >= 0 else "down"
+        size_dollar = equity_before * effective_size / 100.0
+        outcome_label = (
+            "Take profit hit" if outcome == "TP_HIT"
+            else "Stop loss hit" if outcome == "SL_HIT"
+            else "Natural close"
+        )
+        grade_label = pt.get("grade", "A")
+        style_label = self.trade_style.replace("_", " ").title()
+        tp_display = tp_pct * 100 / tp_mult   # show full ATR TP in display
+        reason_text = "\n".join([
+            f"{mode}  •  AI Trade  •  {style_label} ({self.tf})",
+            f"Grade {grade_label}{' — ' + label if label else ''}",
+            "",
+            f"Signal       {pt.get('signal', '-')}  →  {side}",
+            f"Entry        ${entry:,.4f}",
+            f"Exit         ${exit_price:,.4f}  ({raw_move * 100:+.3f}% price move)",
+            f"Outcome      {outcome_label}  →  {pnl_pct_leveraged * 100:+.2f}% PnL  (${pnl_value:+.2f})",
+            "",
+            "Position (ATR-based)",
+            f"  Size:        {effective_size:.2f}% of equity  →  ${size_dollar:.2f}",
+            f"  Leverage:    {c['leverage']:.0f}×",
+            f"  SL (1×ATR):  {sl_pct * 100:.3f}%   |   TP ({tp_mult:.1f}×ATR): {tp_pct * 100:.3f}%",
+            f"  ATR:         {atr * 100:.3f}%",
+            "",
+            "Account",
+            f"  Before:      ${equity_before:,.2f}",
+            f"  After:       ${equity_after:,.2f}  ({dir_word} {abs(from_start / START_EQUITY * 100):.2f}% from start)",
+        ])
+
+        sid = get_session_id(self.email)
+        tr = Trade(
+            time=now_utc_str(), side=side, symbol=self.symbol, mode=mode,
+            size=float(effective_size),
+            sl=round(sl_pct * 100, 4), tp=round(tp_pct * 100, 4),
+            leverage=float(c["leverage"]), entry_price=entry,
+            current_price=exit_price,
+            unreal_pnl_percent=float(pnl_pct_leveraged * 100.0),
+            unreal_pnl_value=float(pnl_value),
+            equity_after=float(equity_after), reason=reason_text,
+        )
+
+        with DB_LOCK:
+            conn = db()
+            cur = conn.cursor()
+            cur.execute(
+                """INSERT INTO trades(
+                    email, time, side, symbol, mode, size, sl, tp, leverage,
+                    entry_price, current_price, unreal_pnl_percent, unreal_pnl_value,
+                    equity_after, reason, session_id
+                ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (self.email, tr.time, tr.side, tr.symbol, tr.mode,
+                 float(tr.size), float(tr.sl), float(tr.tp), float(tr.leverage),
+                 float(tr.entry_price), float(tr.current_price),
+                 float(tr.unreal_pnl_percent), float(tr.unreal_pnl_value),
+                 float(tr.equity_after), tr.reason, int(sid)),
             )
-            reason_text = "\n".join([
-                f"{mode}  •  AI Trade  •  {self.tf} timeframe",
-                "",
-                f"Signal       {pt.get('signal', '-')}  →  {side}",
-                f"Entry        ${entry:,.4f}",
-                f"Exit         ${exit_price:,.4f}  ({raw_move * 100:+.3f}% price move)",
-                f"Outcome      {outcome_label}  →  {pnl_pct_leveraged * 100:+.2f}% PnL  (${pnl_value:+.2f})",
-                "",
-                "Position",
-                f"  Size:        {c['size']:.2f}% of equity  →  ${size_dollar:.2f}",
-                f"  Leverage:    {c['leverage']:.0f}×",
-                f"  Stop loss:   {c['sl']:.2f}%   |   Take profit: {c['tp']:.2f}%",
-                "",
-                "Account",
-                f"  Before:      ${equity_before:,.2f}",
-                f"  After:       ${equity_after:,.2f}  ({dir_word} {abs(from_start / START_EQUITY * 100):.2f}% from start)",
-                f"  Strictness:  {self.adaptive_strictness:.2f}×  (Mini-Asym adapts after each trade)",
-            ])
+            conn.commit()
+            conn.close()
 
-            sid = get_session_id(self.email)
-            tr = Trade(
-                time=now_utc_str(), side=side, symbol=self.symbol, mode=mode,
-                size=float(c["size"]), sl=float(c["sl"]), tp=float(c["tp"]),
-                leverage=float(c["leverage"]), entry_price=entry,
-                current_price=exit_price,
-                unreal_pnl_percent=float(pnl_pct_leveraged * 100.0),
-                unreal_pnl_value=float(pnl_value),
-                equity_after=float(equity_after), reason=reason_text,
-            )
-
-            with DB_LOCK:
-                conn = db()
-                cur = conn.cursor()
-                cur.execute(
-                    """INSERT INTO trades(
-                        email, time, side, symbol, mode, size, sl, tp, leverage,
-                        entry_price, current_price, unreal_pnl_percent, unreal_pnl_value,
-                        equity_after, reason, session_id
-                    ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                    (self.email, tr.time, tr.side, tr.symbol, tr.mode,
-                     float(tr.size), float(tr.sl), float(tr.tp), float(tr.leverage),
-                     float(tr.entry_price), float(tr.current_price),
-                     float(tr.unreal_pnl_percent), float(tr.unreal_pnl_value),
-                     float(tr.equity_after), tr.reason, int(sid)),
-                )
-                conn.commit()
-                conn.close()
-
-            set_equity(self.email, equity_after)
-            self.trades_today += 1
+        set_equity(self.email, equity_after)
+        self.trades_today += 1
+        if is_primary:
             self._last_trade_bad = pnl_value < 0
             if pnl_value < 0:
                 self.bad_trades_today += 1
 
-            email_trade_closed(
-                to=self.email, symbol=self.symbol, side=side, mode=mode,
-                entry=entry, exit_price=exit_price, outcome=outcome,
-                pnl_pct=pnl_pct_leveraged * 100.0,
-                pnl_value=pnl_value, equity_after=equity_after,
-            )
+        # Mini-Asym adaptive strictness — only update on primary trade
+        if is_primary and mode == "MINI_ASYM":
+            if pnl_value < 0:
+                self.adaptive_strictness = min(2.5, self.adaptive_strictness + 0.25)
+                self.log(f"MINI_ASYM strictness ↑ {self.adaptive_strictness:.2f} (after loss)")
+            else:
+                self.adaptive_strictness = max(1.0, self.adaptive_strictness - 0.10)
 
-            # Mini-Asym adaptive strictness: tighten after loss, relax after win
-            if mode == "MINI_ASYM":
-                if pnl_value < 0:
-                    self.adaptive_strictness = min(2.5, self.adaptive_strictness + 0.25)
-                    self.log(f"MINI_ASYM strictness ↑ {self.adaptive_strictness:.2f} (after loss)")
-                else:
-                    self.adaptive_strictness = max(1.0, self.adaptive_strictness - 0.10)
+        mt = self.max_trades_per_day if self.max_trades_per_day > 0 else "∞"
+        self.log(
+            f"TRADE CLOSED ({side}){' [' + label + ']' if label else ''} | {outcome} | "
+            f"entry={entry:.2f} exit={exit_price:.2f} | "
+            f"pnl={pnl_pct_leveraged * 100:.2f}% (${pnl_value:.2f}) | "
+            f"trades={self.trades_today}/{mt}"
+        )
 
-            mt = self.max_trades_per_day if self.max_trades_per_day > 0 else "∞"
-            self.log(
-                f"TRADE CLOSED ({side}) | {outcome} | "
-                f"entry={entry:.2f} exit={exit_price:.2f} | "
-                f"pnl={pnl_pct_leveraged * 100:.2f}% (${pnl_value:.2f}) | "
-                f"trades={self.trades_today}/{mt}"
-            )
+        email_trade_closed(
+            to=self.email, symbol=self.symbol, side=side, mode=mode,
+            entry=entry, exit_price=exit_price, outcome=outcome,
+            pnl_pct=pnl_pct_leveraged * 100.0,
+            pnl_value=pnl_value, equity_after=equity_after,
+        )
 
+        return equity_after
+
+    def _close_pending_trades(self) -> None:
+        """Close all pending trades (1 for Grade A, 2 for Grade B), using same exit price."""
+        if not self.pending_trades:
+            return
+        try:
+            exit_price = self._fetch_price_sync(self.symbol)
+            for pt in list(self.pending_trades):
+                # Each T2 uses updated equity from T1 close
+                eq = get_equity(self.email)
+                self._close_one_trade(pt, exit_price, eq)
         except Exception as e:
-            self.log(f"Error closing trade: {e}")
+            self.log(f"Error closing trade(s): {e}")
         finally:
-            self.pending_trade = None
+            self.pending_trades = []
 
     def _signal_and_filters(self):
         klines = _fetch_klines_sync(self.symbol, self.tf, limit=260)
@@ -2023,6 +2069,9 @@ class AutoRunner:
         res = _compute_signal_layers(klines, self.mode, self.adaptive_strictness, higher_klines)
         self.last_breakdown = res.get("breakdown", {})
         self.last_score = res.get("score", 0.0)
+        self.market_grade = res.get("grade", "-")
+        if res.get("atr_pct"):
+            self.last_atr_pct = res["atr_pct"]
         return res
 
     def _secs_until_dubai_midnight(self) -> int:
@@ -2058,8 +2107,8 @@ class AutoRunner:
 
                 if self.end_at_ts and time.time() >= self.end_at_ts:
                     self.blocked_reason = "DURATION_ENDED"
-                    if self.pending_trade:
-                        self._close_pending_trade()
+                    if self.pending_trades:
+                        self._close_pending_trades()
                     self.log("Session complete — duration ended. AI stopped.")
                     self.stop_event.set()
                     break
@@ -2071,9 +2120,9 @@ class AutoRunner:
                     time.sleep(self.interval_sec)
                     continue
 
-                # ── Step 1: Close any pending trade first (real exit after one interval) ──
-                if self.pending_trade:
-                    self._close_pending_trade()
+                # ── Step 1: Close any pending trades first (real exit after one interval) ──
+                if self.pending_trades:
+                    self._close_pending_trades()
                     time.sleep(self.interval_sec)
                     continue
 
@@ -2119,18 +2168,29 @@ class AutoRunner:
                 should_trade = (now_ts - self.last_trade_ts) >= effective_cooldown
 
                 if should_trade:
-                    # ── Step 4: Open trade — fetch real entry price ───────────────────
+                    # ── Step 4: Open trade(s) — Grade A = 1 trade, Grade B = T1+T2 ──
                     entry_price = self._fetch_price_sync(self.symbol)
-                    self._last_trade_bad = False  # reset until this trade closes
-                    self.pending_trade = {
+                    self._last_trade_bad = False
+                    grade = self.market_grade
+                    base_trade = {
                         "entry_price": entry_price,
                         "side": desired_side,
                         "mode": self.mode,
                         "signal": self.last_signal,
                         "open_ts": time.time(),
                     }
+                    if grade == "B":
+                        self.pending_trades = [
+                            {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.50, "is_primary": True,  "label": "T1"},
+                            {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00, "is_primary": False, "label": "T2"},
+                        ]
+                        self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+50%TP, T2 40%+100%TP | score={self.last_score:.2f}")
+                    else:
+                        self.pending_trades = [
+                            {**base_trade, "grade": "A", "size_mult": 1.00, "tp_mult": 1.00, "is_primary": True},
+                        ]
+                        self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}")
                     self.last_trade_ts = now_ts
-                    self.log(f"TRADE OPENED ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}")
                 else:
                     wait_sec = int(effective_cooldown - (now_ts - self.last_trade_ts))
                     cd_label = "2× cooldown (after loss)" if self._last_trade_bad else "cooldown"
@@ -2215,7 +2275,9 @@ def auto_signal(user=Depends(require_user)):
             "blocked": r.blocked_reason,
             "adaptive_strictness": r.adaptive_strictness,
             "signal_score": r.last_score,
-            "pending_trade": r.pending_trade,
+            "trade_style": r.trade_style,
+            "market_grade": r.market_grade,
+            "pending_trades": r.pending_trades,
             "breakdown": r.last_breakdown,
         }
 
@@ -2226,12 +2288,6 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
     symbol = payload.symbol.upper().strip()
     if not (symbol.endswith("USDT") or symbol.endswith("-USDT")):
         raise HTTPException(status_code=400, detail="Use symbol like BTCUSDT / ETHUSDT / SOLUSDT")
-    if payload.tf not in TF_MAP:
-        raise HTTPException(status_code=400, detail="Bad timeframe")
-    # Force interval_sec to be at least the TF duration so SL/TP have time to hit
-    tf_min = TF_MIN_INTERVAL.get(payload.tf, 900)
-    interval_sec = max(tf_min, min(int(payload.interval_sec), 86400))
-
     max_trades = payload.max_trades_per_day if payload.max_trades_per_day is not None else default_max_trades_per_day(payload.mode)
 
     # ── Check 1: Duration-session restart lock ──────────────────────────────
@@ -2285,8 +2341,8 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
             del AUTO_RUNNERS[email]
 
         runner = AutoRunner(
-            email=email, symbol=symbol, tf=payload.tf,
-            interval_sec=interval_sec, mode=payload.mode,
+            email=email, symbol=symbol, trade_style=payload.trade_style,
+            mode=payload.mode,
             max_trades_per_day=int(max_trades),
             stop_after_bad_trades=int(payload.stop_after_bad_trades),
             duration_days=int(payload.duration_days),
@@ -2297,13 +2353,15 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         runner.start()
 
     email_ai_started(
-        to=email, symbol=symbol, mode=payload.mode, tf=payload.tf,
-        interval_sec=interval_sec, duration_days=int(payload.duration_days),
+        to=email, symbol=symbol, mode=payload.mode, trade_style=payload.trade_style,
+        duration_days=int(payload.duration_days),
         max_trades=int(max_trades), stop_after_bad=int(payload.stop_after_bad_trades),
     )
 
-    return {"ok": True, "running": True, "symbol": symbol, "tf": payload.tf,
-            "interval_sec": interval_sec, "mode": payload.mode,
+    sp = TRADE_STYLE_PARAMS.get(payload.trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
+    return {"ok": True, "running": True, "symbol": symbol,
+            "trade_style": payload.trade_style, "tf": sp["tf"],
+            "interval_sec": sp["interval"], "mode": payload.mode,
             "max_trades_per_day": int(max_trades)}
 
 
