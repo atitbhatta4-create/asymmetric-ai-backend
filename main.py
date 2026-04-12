@@ -2016,6 +2016,7 @@ class AutoRunner:
         self.market_grade: str = "-"
         self._last_trade_bad: bool = False
         self.session_start_equity: float = get_equity(email)
+        self.peak_equity: float = get_equity(email)   # tracks highest equity for drawdown protection
         # Load today's real trade counts from DB — prevents bypass by stop+restart
         self.trades_today, self.bad_trades_today = self._load_today_stats()
 
@@ -2150,14 +2151,39 @@ class AutoRunner:
         if pt.get("breakeven"):
             sl_pct = 0.0001  # near-zero SL at entry price — can only lose a tiny bit
 
+        # ── Volatility-adjusted sizing ────────────────────────────────────
+        # When ATR is elevated (news / high volatility), reduce position size
+        # to keep the dollar-risk-per-trade roughly constant.
+        # Normal ATR for BTC 15m ≈ 0.3–0.5%. Above 1.0% = high volatility.
+        atr_normal = sp.get("sl_max", 1.5) / 100.0 / sp["sl_atr"]  # implied normal ATR
+        vol_ratio_atr = atr / atr_normal if atr_normal > 0 else 1.0
+        vol_size_mult = 1.0
+        if vol_ratio_atr > 1.5:
+            vol_size_mult = max(0.4, 1.0 / vol_ratio_atr)  # scale down, floor at 40%
+            self.log(f"High volatility (ATR {atr*100:.2f}% = {vol_ratio_atr:.1f}× normal) → size reduced to {vol_size_mult*100:.0f}%")
+
+        # ── Drawdown protection ───────────────────────────────────────────
+        # Track peak equity; if current drawdown > 5%, halve position size
+        if equity_before > self.peak_equity:
+            self.peak_equity = equity_before
+        drawdown_pct = (self.peak_equity - equity_before) / self.peak_equity if self.peak_equity > 0 else 0.0
+        dd_size_mult = 1.0
+        if drawdown_pct >= 0.10:
+            dd_size_mult = 0.25   # -10%+ drawdown: quarter size (recovery mode)
+            self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at 25%")
+        elif drawdown_pct >= 0.05:
+            dd_size_mult = 0.50   # -5%+ drawdown: half size
+            self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at 50%")
+
+        # Apply all size multipliers
+        effective_size = c["size"] * size_mult * vol_size_mult * dd_size_mult
+
         # Hard per-trade max loss cap: never risk more than 2% of equity on one trade
-        # Guards against ATR spikes (news events, flash crashes)
-        effective_size = c["size"] * size_mult
-        max_loss_pct = 0.02  # 2% of equity hard cap
+        max_loss_pct = 0.02
         max_sl_for_cap = max_loss_pct / (effective_size * c["leverage"]) if (effective_size * c["leverage"]) > 0 else sl_pct
         if sl_pct > max_sl_for_cap:
             sl_pct = max_sl_for_cap
-            tp_pct = sl_pct * (sp["tp_atr"] / sp["sl_atr"]) * tp_mult  # maintain RR ratio
+            tp_pct = sl_pct * (sp["tp_atr"] / sp["sl_atr"]) * tp_mult
 
         # ── Intrabar SL/TP detection ──────────────────────────────────────
         # Use candle high/low to check if SL or TP was touched DURING the
@@ -2174,21 +2200,35 @@ class AutoRunner:
             (side == "SHORT" and candle_low  <= tp_price)
         )
 
-        # ── Trailing stop simulation (paper trading) ─────────────────────
-        # If price moved ≥60% toward TP during the candle, SL trails to
-        # break-even. This simulates real trailing stop behaviour: once in
-        # good profit the trade can only close at ≥0 (minus tiny spread).
-        trail_trigger_pct = tp_pct * 0.60   # 60% of TP distance triggers trail
-        trail_price_long  = entry * (1 + trail_trigger_pct)
-        trail_price_short = entry * (1 - trail_trigger_pct)
-        trailing_activated = candle_high > 0 and (
-            (side == "LONG"  and candle_high >= trail_price_long  and not intrabar_tp) or
-            (side == "SHORT" and candle_low  <= trail_price_short and not intrabar_tp)
-        )
+        # ── Progressive trailing stop ─────────────────────────────────────
+        # Simulates a real trailing stop using intrabar high/low:
+        #   Price reaches 40% of TP  → SL trails to break-even (entry)
+        #   Price reaches 70% of TP  → SL trails to +50% of SL locked in
+        #   Price reaches 100% of TP → TP_HIT (handled above)
+        # The trail SL is 1×ATR behind the best price reached in the candle.
+        best_price = candle_high if (side == "LONG" and candle_high > 0) else candle_low if candle_high > 0 else exit_price
+        best_move  = (best_price - entry) / entry if side == "LONG" else (entry - best_price) / entry
+
+        trailing_activated = False
+        trail_locked_pct   = 0.0   # how much profit is locked in
+
+        if candle_high > 0 and not intrabar_tp:
+            if best_move >= tp_pct * 0.70:
+                # Deep in profit — trail SL to lock in half the SL distance as profit
+                trail_locked_pct  = sl_pct * 0.50
+                trailing_activated = True
+            elif best_move >= tp_pct * 0.40:
+                # At break-even trigger — SL moves to entry
+                trail_locked_pct  = 0.0
+                trailing_activated = True
+
         if trailing_activated:
-            # SL moves to break-even — worst case now is +0 (entry close)
-            sl_price = entry
-            sl_pct   = 0.0001   # near-zero — effectively flat exit on reversal
+            # New SL is at (entry + locked profit) — anything above this is safe
+            if side == "LONG":
+                sl_price = entry * (1 + trail_locked_pct)
+            else:
+                sl_price = entry * (1 - trail_locked_pct)
+            sl_pct = trail_locked_pct  # effective SL distance from entry
 
         # SL and TP both touched in same candle → TP wins if trailing activated
         # (trade moved to profit first), otherwise SL wins (worst case)
@@ -2205,9 +2245,9 @@ class AutoRunner:
         else:
             # No intrabar trigger — use actual close price
             raw_move = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
-            if trailing_activated and raw_move < 0:
-                # Trailing was active but reversed and closed below entry — exit at entry
-                final_move = 0.0
+            if trailing_activated and raw_move < trail_locked_pct:
+                # Trail SL was hit — exit at the locked-in level
+                final_move = trail_locked_pct
                 outcome = "TRAIL_STOP"
             elif raw_move <= -sl_pct:
                 final_move = -sl_pct
@@ -2251,7 +2291,8 @@ class AutoRunner:
             f"  Leverage:    {c['leverage']:.0f}×",
             f"  SL (1×ATR):  {sl_pct * 100:.3f}%   |   TP ({tp_mult:.1f}×ATR): {tp_pct * 100:.3f}%",
             f"  ATR:         {atr * 100:.3f}%",
-            f"  Trailing:    {'activated at 60% of TP (' + f'{trail_trigger_pct*100:.3f}%)' if trailing_activated else 'not triggered'}",
+            f"  Trailing:    {'activated — locked ' + f'{trail_locked_pct*100:.2f}%' if trailing_activated else 'not triggered'}",
+            f"  Vol adj:     {vol_size_mult*100:.0f}%  |  DD adj: {dd_size_mult*100:.0f}%",
             "",
             "Account",
             f"  Before:      ${equity_before:,.2f}",
