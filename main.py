@@ -1229,7 +1229,7 @@ def build_reason(mode: RiskMode, equity: float, computed: Dict[str, float], extr
     from_start = equity - START_EQUITY
     dir_word = "up" if from_start >= 0 else "down"
     pct = abs(from_start / START_EQUITY * 100)
-    size_dollar = equity * computed["size"] / 100.0
+    size_dollar = equity * computed["size"]
     effective = size_dollar * computed["leverage"]
     reduced = pct >= 10.0
 
@@ -1240,7 +1240,7 @@ def build_reason(mode: RiskMode, equity: float, computed: Dict[str, float], extr
         f"  Equity:      ${equity:,.2f}  ({dir_word} {pct:.1f}% from ${START_EQUITY:.0f} start)",
         "",
         "Position",
-        f"  Size:        {computed['size']:.2f}% of equity  →  ${size_dollar:.2f} at risk",
+        f"  Size:        {computed['size'] * 100:.1f}% of equity  →  ${size_dollar:.2f} at risk",
         f"  Leverage:    {computed['leverage']:.0f}×  →  ${effective:.2f} total exposure",
         f"  Stop loss:   {computed['sl']:.2f}% from entry",
         f"  Take profit: {computed['tp']:.2f}% from entry",
@@ -1379,7 +1379,7 @@ async def _place_trade_internal(
 
     move = ((int(time.time()) % 140) - 70) / 1000.0
     pnl_pct = move * (c["leverage"] / 5.0)
-    pnl_value = equity_before * (c["size"] / 100.0) * pnl_pct
+    pnl_value = equity_before * c["size"] * pnl_pct
     equity_after = equity_before + pnl_value
 
     tr = Trade(
@@ -1946,12 +1946,12 @@ class AutoRunner:
             outcome = "NATURAL_CLOSE"
 
         pnl_pct_leveraged = final_move * c["leverage"]
-        pnl_value = equity_before * (effective_size / 100.0) * pnl_pct_leveraged
+        pnl_value = equity_before * effective_size * pnl_pct_leveraged
         equity_after = equity_before + pnl_value
 
         from_start = equity_after - START_EQUITY
         dir_word = "up" if from_start >= 0 else "down"
-        size_dollar = equity_before * effective_size / 100.0
+        size_dollar = equity_before * effective_size
         outcome_label = (
             "Take profit hit" if outcome == "TP_HIT"
             else "Stop loss hit" if outcome == "SL_HIT"
@@ -1970,7 +1970,7 @@ class AutoRunner:
             f"Outcome      {outcome_label}  →  {pnl_pct_leveraged * 100:+.2f}% PnL  (${pnl_value:+.2f})",
             "",
             "Position (ATR-based)",
-            f"  Size:        {effective_size:.2f}% of equity  →  ${size_dollar:.2f}",
+            f"  Size:        {effective_size * 100:.1f}% of equity  →  ${size_dollar:.2f}",
             f"  Leverage:    {c['leverage']:.0f}×",
             f"  SL (1×ATR):  {sl_pct * 100:.3f}%   |   TP ({tp_mult:.1f}×ATR): {tp_pct * 100:.3f}%",
             f"  ATR:         {atr * 100:.3f}%",
@@ -2011,8 +2011,8 @@ class AutoRunner:
             conn.close()
 
         set_equity(self.email, equity_after)
-        self.trades_today += 1
         if is_primary:
+            self.trades_today += 1
             self._last_trade_bad = pnl_value < 0
             if pnl_value < 0:
                 self.bad_trades_today += 1
