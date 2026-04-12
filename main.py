@@ -1522,8 +1522,8 @@ MODE_SIGNAL_PARAMS: Dict[str, Dict] = {
     "ULTRA_SAFE": dict(adx_min=28, atr_min=0.003, atr_max=0.020, rsi_min=42, rsi_max=58, pullback_max=0.012, vol_factor=1.40, mom_n=3, min_score=0.75),
     "SAFE":       dict(adx_min=22, atr_min=0.002, atr_max=0.025, rsi_min=40, rsi_max=62, pullback_max=0.015, vol_factor=1.25, mom_n=2, min_score=0.68),
     "NORMAL":     dict(adx_min=18, atr_min=0.002, atr_max=0.030, rsi_min=38, rsi_max=65, pullback_max=0.020, vol_factor=1.15, mom_n=2, min_score=0.62),
-    "MINI_ASYM":  dict(adx_min=16, atr_min=0.001, atr_max=0.035, rsi_min=35, rsi_max=68, pullback_max=0.025, vol_factor=1.05, mom_n=1, min_score=0.58),
-    "AGGRESSIVE": dict(adx_min=13, atr_min=0.001, atr_max=0.040, rsi_min=32, rsi_max=70, pullback_max=0.030, vol_factor=0.95, mom_n=1, min_score=0.52),
+    "MINI_ASYM":  dict(adx_min=16, atr_min=0.001, atr_max=0.035, rsi_min=35, rsi_max=68, pullback_max=0.025, vol_factor=1.05, mom_n=1, min_score=0.65),
+    "AGGRESSIVE": dict(adx_min=13, atr_min=0.001, atr_max=0.040, rsi_min=32, rsi_max=70, pullback_max=0.030, vol_factor=0.95, mom_n=1, min_score=0.58),
 }
 
 
@@ -1677,11 +1677,16 @@ def _compute_signal_layers(
     candle_score = 1.0 if candles_ok else 0.0
     vol_score    = min(1.0, vol_ratio / (p["vol_factor"] * 1.5)) if vol_ratio >= p["vol_factor"] else vol_ratio / p["vol_factor"] * 0.4
     momentum_score = round(candle_score * 0.55 + vol_score * 0.45, 3)
+    # Hard block: volume below 0.3x average = illiquid, fake move — never trade
+    vol_too_low = vol_ratio < 0.30
     mom_reason = (
-        f"Last {n} candle(s) not {('bullish' if desired_side == 'LONG' else 'bearish')} — no momentum yet" if not candles_ok
+        f"Volume {vol_ratio:.2f}x average — too low (min 0.30x), likely fake move" if vol_too_low
+        else f"Last {n} candle(s) not {('bullish' if desired_side == 'LONG' else 'bearish')} — no momentum yet" if not candles_ok
         else f"Volume {vol_ratio:.1f}x average — need {p['vol_factor']:.1f}x minimum" if vol_ratio < p["vol_factor"]
         else ""
     )
+    if vol_too_low:
+        momentum_score = 0.0
     breakdown_momentum = {
         "candles_n": n, "candles_ok": candles_ok,
         "volume_ratio": round(vol_ratio, 2), "vol_factor": round(p["vol_factor"], 2),
@@ -1705,8 +1710,8 @@ def _compute_signal_layers(
     )
     min_score = p.get("min_score", 0.62)
 
-    # Market grade: A = high conviction, B = good setup, C = weak (blocked)
-    grade = "A" if total_score >= 0.78 else "B"
+    # Market grade: A = high conviction (≥0.78), B = good setup (≥0.65), C = weak (blocked)
+    grade = "A" if total_score >= 0.78 else "B" if total_score >= 0.65 else "C"
 
     failed = [k for k, v in breakdown.items() if not v["ok"]]
     if failed or total_score < min_score:
@@ -1828,11 +1833,17 @@ class AutoRunner:
             with DB_LOCK:
                 conn = db()
                 cur = conn.cursor()
+                # Only count primary trades (T1 / Grade A) — T2 has size_mult=0.40
+                # so its stored size is always < 50% of base. Threshold: base_size * 0.45
+                sp = TRADE_STYLE_PARAMS.get(self.trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
+                base_size = presets_for_mode(self.mode)["size"]
+                primary_threshold = round(base_size * 0.45, 4)
                 cur.execute(
                     "SELECT COUNT(*) as cnt, "
                     "SUM(CASE WHEN unreal_pnl_percent < 0 THEN 1 ELSE 0 END) as bad "
-                    "FROM trades WHERE email = %s AND time >= %s AND session_id = %s",
-                    (self.email, utc_midnight_str, sid),
+                    "FROM trades WHERE email = %s AND time >= %s AND session_id = %s "
+                    "AND size >= %s",
+                    (self.email, utc_midnight_str, sid, primary_threshold),
                 )
                 row = cur.fetchone()
                 conn.close()
