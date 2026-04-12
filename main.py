@@ -1544,6 +1544,138 @@ def _adx(highs: List[float], lows: List[float], closes: List[float], period: int
 # Higher timeframe for trend bias — always one step up
 HIGHER_TF_MAP: Dict[str, str] = {"15m": "4h", "1h": "4h", "4h": "1d", "1d": "1d"}
 
+
+def _rsi_series(closes: List[float], period: int = 14) -> List[float]:
+    """RSI value for every candle after warmup — needed for divergence check."""
+    if len(closes) < period + 2:
+        return []
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(0.0, d))
+        losses.append(max(0.0, -d))
+    ag = sum(gains[:period]) / period
+    al = sum(losses[:period]) / period
+    out = []
+    for i in range(period, len(gains)):
+        ag = (ag * (period - 1) + gains[i]) / period
+        al = (al * (period - 1) + losses[i]) / period
+        out.append(100.0 if al == 0 else 100.0 - (100.0 / (1.0 + ag / al)))
+    return out
+
+
+def _session_active(trade_style: str) -> tuple:
+    """
+    Returns (is_active, reason).
+    Crypto is 24/7 but liquidity varies — avoid dead zones for short TFs.
+    Dubai timezone (UTC+4):
+      Dead zone: 02:00-09:00 — Asia late night, thin before London opens
+      Active:    09:00-02:00 — Asia open, London, NY overlap
+    """
+    if trade_style == "SWING":
+        return True, ""   # 4h candles — session irrelevant
+    hour = now_dubai().hour
+    if trade_style == "SCALP" and 2 <= hour < 9:
+        return False, f"Dead zone {hour:02d}:xx Dubai — SCALP paused 02:00–09:00 (thin liquidity, wide spreads)"
+    if trade_style == "DAY_TRADE" and 3 <= hour < 7:
+        return False, f"Dead zone {hour:02d}:xx Dubai — paused 03:00–07:00 (lowest liquidity window)"
+    return True, ""
+
+
+def _ema_spread_trend(ema_fast: List[float], ema_slow: List[float], n: int = 4) -> tuple:
+    """
+    Checks if EMA gap is WIDENING (trend accelerating) or NARROWING (stalling).
+    Returns (widening: bool, score: float 0-1)
+    A widening spread = conviction in trend direction → better entry.
+    Narrowing = trend losing steam → lower quality entry.
+    """
+    if len(ema_fast) < n + 1 or len(ema_slow) < n + 1:
+        return False, 0.5
+    spread_now  = abs(ema_fast[-1] - ema_slow[-1])
+    spread_prev = abs(ema_fast[-n] - ema_slow[-n])
+    if spread_prev < 1e-10:
+        return False, 0.5
+    ratio = spread_now / spread_prev
+    widening = ratio >= 1.03   # at least 3% wider than 4 candles ago
+    score = min(1.0, 0.5 + (ratio - 1.0) * 2.0) if widening else max(0.1, ratio * 0.5)
+    return widening, round(score, 3)
+
+
+def _candle_pattern(klines: List[Dict], side: str) -> tuple:
+    """
+    Score the last candle's pattern quality for the given trade direction.
+    Returns (pattern_name: str, score: float 0-1)
+    pin_bar=1.0, engulfing=0.90, momentum=0.75, basic=0.50, against=0.10
+    """
+    if len(klines) < 2:
+        return "none", 0.3
+    curr = klines[-1]
+    prev = klines[-2]
+    body  = abs(curr["close"] - curr["open"])
+    rng   = curr["high"] - curr["low"]
+    if rng < 1e-10:
+        return "doji", 0.25
+    body_ratio = body / rng
+
+    if side == "LONG":
+        lower_wick = min(curr["open"], curr["close"]) - curr["low"]
+        # Pin bar: hammer shape — long lower wick, small body, closes bullish
+        if body_ratio < 0.35 and lower_wick > rng * 0.55 and curr["close"] > curr["open"]:
+            return "pin_bar", 1.0
+        # Bullish engulfing: current body covers previous body completely
+        if (curr["close"] > curr["open"] and
+                curr["open"] <= prev["close"] and curr["close"] >= prev["open"]):
+            return "engulfing", 0.90
+        # Strong momentum candle: large bullish body
+        if curr["close"] > curr["open"] and body_ratio > 0.65:
+            return "momentum", 0.75
+        # Basic bullish
+        if curr["close"] > curr["open"]:
+            return "bullish", 0.50
+    else:
+        upper_wick = curr["high"] - max(curr["open"], curr["close"])
+        # Shooting star / pin bar bearish
+        if body_ratio < 0.35 and upper_wick > rng * 0.55 and curr["close"] < curr["open"]:
+            return "pin_bar", 1.0
+        # Bearish engulfing
+        if (curr["close"] < curr["open"] and
+                curr["open"] >= prev["close"] and curr["close"] <= prev["open"]):
+            return "engulfing", 0.90
+        # Strong bearish momentum candle
+        if curr["close"] < curr["open"] and body_ratio > 0.65:
+            return "momentum", 0.75
+        # Basic bearish
+        if curr["close"] < curr["open"]:
+            return "bearish", 0.50
+
+    return "against_trend", 0.10
+
+
+def _rsi_divergence(closes: List[float], rsi_vals: List[float], side: str, n: int = 12) -> tuple:
+    """
+    Detect RSI divergence — price makes new extreme but RSI disagrees.
+    Bearish divergence (during LONG): price higher high, RSI lower high → weakening bull.
+    Bullish divergence (during SHORT): price lower low, RSI higher low → weakening bear.
+    Returns (divergence: bool, score_penalty: float 0.0-0.30)
+    """
+    if len(closes) < n + 1 or len(rsi_vals) < n:
+        return False, 0.0
+    price_window = closes[-n:]
+    rsi_window   = rsi_vals[-n:]
+    p_latest     = closes[-1]
+    r_latest     = rsi_vals[-1]
+
+    if side == "LONG":
+        p_prev_high = max(price_window[:-3])
+        r_prev_high = max(rsi_window[:-3])
+        divergence  = p_latest > p_prev_high * 1.001 and r_latest < r_prev_high * 0.96
+    else:
+        p_prev_low  = min(price_window[:-3])
+        r_prev_low  = min(rsi_window[:-3])
+        divergence  = p_latest < p_prev_low * 0.999 and r_latest > r_prev_low * 1.04
+
+    return divergence, (0.28 if divergence else 0.0)
+
 # Per-mode signal thresholds + minimum quality score to trade
 MODE_SIGNAL_PARAMS: Dict[str, Dict] = {
     "ULTRA_SAFE": dict(adx_min=28, atr_min=0.003, atr_max=0.020, rsi_min=42, rsi_max=58, pullback_max=0.012, vol_factor=1.40, mom_n=3, min_score=0.75),
@@ -1566,6 +1698,13 @@ def _compute_signal_layers(
     Direction from higher TF trend. Entry on pullback+bounce, not on crossover.
     Each layer returns a 0-1 score. Total must exceed mode threshold.
     """
+    # ── Pre-check: session filter ─────────────────────────────────────────
+    sess_ok, sess_reason = _session_active(trade_style)
+    if not sess_ok:
+        return {"ok": False, "blocked": f"SESSION: {sess_reason}",
+                "signal": "SESSION_FILTER", "score": 0.0, "breakdown": {},
+                "atr_pct": 0.0}
+
     if len(klines) < 220:
         return {"ok": False, "blocked": "NO_DATA", "signal": "NO_DATA", "score": 0.0, "breakdown": {}}
 
@@ -1574,13 +1713,14 @@ def _compute_signal_layers(
     lows    = [k["low"]    for k in klines]
     volumes = [k["volume"] for k in klines]
 
-    ema9   = _ema(closes, 9)
-    ema21  = _ema(closes, 21)
-    ema50  = _ema(closes, 50)
-    ema200 = _ema(closes, 200)
-    rsi    = _rsi(closes, 14)
-    atr    = _atr(highs, lows, closes, 14)
-    adx    = _adx(highs, lows, closes, 14)
+    ema9      = _ema(closes, 9)
+    ema21     = _ema(closes, 21)
+    ema50     = _ema(closes, 50)
+    ema200    = _ema(closes, 200)
+    rsi       = _rsi(closes, 14)
+    rsi_vals  = _rsi_series(closes, 14)   # full series for divergence
+    atr       = _atr(highs, lows, closes, 14)
+    adx       = _adx(highs, lows, closes, 14)
 
     price      = closes[-1]
     last_open  = klines[-1]["open"]
@@ -1652,15 +1792,22 @@ def _compute_signal_layers(
         "score": regime_score, "ok": regime_score > 0.10, "reason": reg_reason,
     }
 
-    # ── Layer 2: Direction — higher TF trend + local confirmation ─────────
+    # ── Layer 2: Direction — higher TF trend + local confirmation + spread ──
     htf_aligned   = htf_bull if desired_side == "LONG" else not htf_bull
     local_aligned = (local_bull and price > ema50[-1]) if desired_side == "LONG" else (not local_bull and price < ema50[-1])
     htf_score     = 1.0 if htf_aligned else 0.0
     local_score   = 1.0 if local_aligned else 0.4
     ema9_bonus    = 0.20 if ema9_aligned else 0.0
-    direction_score = round(min(1.0, htf_score * 0.55 + local_score * 0.30 + ema9_bonus * 0.15), 3)
+
+    # EMA spread widening = trend accelerating = better entry quality
+    spread_widening, spread_score = _ema_spread_trend(ema9, ema21, n=4)
+
+    direction_score = round(min(1.0,
+        htf_score * 0.45 + local_score * 0.25 + ema9_bonus * 0.15 + spread_score * 0.15
+    ), 3)
     dir_reason = (
         "" if direction_score >= 0.55
+        else "EMA spread narrowing — trend losing momentum, wait for re-acceleration" if not spread_widening and htf_aligned and local_aligned
         else f"{'4h' if htf_ok else 'Higher TF'} trend {'bearish' if desired_side == 'LONG' else 'bullish'} — only trade WITH the trend"
         if not htf_aligned
         else f"Price {'below' if desired_side == 'LONG' else 'above'} EMA50 — wait for trend to establish locally"
@@ -1670,44 +1817,49 @@ def _compute_signal_layers(
         "htf_confirmed": htf_ok,
         "local_trend": "BULL" if local_bull else "BEAR",
         "ema9_momentum": "aligned" if ema9_aligned else "not aligned",
+        "ema_spread": "widening" if spread_widening else "narrowing",
         "signal": sig, "side": desired_side,
         "score": direction_score, "ok": direction_score >= 0.55, "reason": dir_reason,
     }
 
-    # ── Layer 3: Entry — pullback to EMA21 + bounce candle + RSI ─────────
-    # Professional entry: don't chase the crossover — wait for price to pull back
-    # to EMA21 and confirm with a bounce candle in the direction of trade
+    # ── Layer 3: Entry — pullback + candle pattern + RSI + divergence check ──
     pb_pct = abs(price - ema21[-1]) / max(1e-9, ema21[-1])
     pullback_score = max(0.0, 1.0 - pb_pct / p["pullback_max"]) if pb_pct <= p["pullback_max"] else 0.0
 
-    # Bounce confirmation: last candle closed in trade direction after touching EMA21
-    if desired_side == "LONG":
-        bounce_ok = last_open < price and price >= ema21[-1] * 0.998
-    else:
-        bounce_ok = last_open > price and price <= ema21[-1] * 1.002
-    bounce_score = 1.0 if bounce_ok else 0.25
+    # Candle pattern at pullback zone (replaces simple bounce check)
+    pattern_name, pattern_score = _candle_pattern(klines, desired_side)
 
     # RSI: closer to center of the range = better entry quality
     rsi_in_range = rsi is not None and p["rsi_min"] <= rsi <= p["rsi_max"]
     if rsi is not None and rsi_in_range:
-        mid = (p["rsi_min"] + p["rsi_max"]) / 2.0
+        mid  = (p["rsi_min"] + p["rsi_max"]) / 2.0
         half = (p["rsi_max"] - p["rsi_min"]) / 2.0
         rsi_score = max(0.25, 1.0 - abs(rsi - mid) / half)
     else:
         rsi_score = 0.0
 
-    entry_score = round(pullback_score * 0.40 + bounce_score * 0.35 + rsi_score * 0.25, 3)
+    # RSI divergence — price extreme not confirmed by RSI = weakening setup
+    div_detected, div_penalty = _rsi_divergence(closes, rsi_vals, desired_side, n=12)
+
+    entry_score = round(
+        max(0.0, pullback_score * 0.35 + pattern_score * 0.35 + rsi_score * 0.30 - div_penalty),
+        3,
+    )
     ent_reason = (
-        f"Price {pb_pct*100:.1f}% from EMA21 — need <{p['pullback_max']*100:.0f}% pullback to enter" if pullback_score == 0
+        f"RSI divergence — price at new extreme but RSI disagrees, trend may be weakening" if div_detected
+        else f"Price {pb_pct*100:.1f}% from EMA21 — need <{p['pullback_max']*100:.1f}% to enter" if pullback_score == 0
         else f"RSI {rsi:.0f} outside entry zone {p['rsi_min']}–{p['rsi_max']}" if not rsi_in_range
-        else f"Waiting for {'bullish' if desired_side == 'LONG' else 'bearish'} bounce candle off EMA21" if not bounce_ok
+        else f"Candle pattern weak ({pattern_name}) — wait for pin bar or engulfing at EMA21" if pattern_score < 0.40
         else ""
     )
     breakdown_entry = {
         "price_vs_ema21_pct": round(pb_pct * 100, 2),
-        "pullback_max_pct": round(p["pullback_max"] * 100, 1),
-        "bounce_confirmed": bounce_ok,
-        "rsi": round(rsi or 0, 1), "rsi_range": f"{p['rsi_min']}–{p['rsi_max']}",
+        "pullback_max_pct":   round(p["pullback_max"] * 100, 1),
+        "candle_pattern":     pattern_name,
+        "pattern_score":      round(pattern_score, 2),
+        "rsi":                round(rsi or 0, 1),
+        "rsi_range":          f"{p['rsi_min']}–{p['rsi_max']}",
+        "rsi_divergence":     div_detected,
         "score": entry_score, "ok": entry_score > 0.25, "reason": ent_reason,
     }
 
