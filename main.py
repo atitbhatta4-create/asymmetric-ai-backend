@@ -143,8 +143,9 @@ def email_trade_closed(to: str, symbol: str, side: str, mode: str,
                        entry: float, exit_price: float, outcome: str,
                        pnl_pct: float, pnl_value: float, equity_after: float) -> None:
     outcome_label = (
-        "Take profit hit" if outcome == "TP_HIT"
+        "Take profit hit"    if outcome == "TP_HIT"
         else "Stop loss hit" if outcome == "SL_HIT"
+        else "Trailing stop" if outcome == "TRAIL_STOP"
         else "Natural close"
     )
     win = pnl_value >= 0
@@ -2013,10 +2014,27 @@ class AutoRunner:
             (side == "SHORT" and candle_low  <= tp_price)
         )
 
-        # SL and TP both touched in same candle → whichever triggered first
-        # Conservatively assume SL hit first (worst case for paper trading)
+        # ── Trailing stop simulation (paper trading) ─────────────────────
+        # If price moved ≥60% toward TP during the candle, SL trails to
+        # break-even. This simulates real trailing stop behaviour: once in
+        # good profit the trade can only close at ≥0 (minus tiny spread).
+        trail_trigger_pct = tp_pct * 0.60   # 60% of TP distance triggers trail
+        trail_price_long  = entry * (1 + trail_trigger_pct)
+        trail_price_short = entry * (1 - trail_trigger_pct)
+        trailing_activated = candle_high > 0 and (
+            (side == "LONG"  and candle_high >= trail_price_long  and not intrabar_tp) or
+            (side == "SHORT" and candle_low  <= trail_price_short and not intrabar_tp)
+        )
+        if trailing_activated:
+            # SL moves to break-even — worst case now is +0 (entry close)
+            sl_price = entry
+            sl_pct   = 0.0001   # near-zero — effectively flat exit on reversal
+
+        # SL and TP both touched in same candle → TP wins if trailing activated
+        # (trade moved to profit first), otherwise SL wins (worst case)
         if intrabar_sl and intrabar_tp:
-            intrabar_tp = False
+            intrabar_tp = trailing_activated  # trailing means TP is more likely
+            intrabar_sl = not trailing_activated
 
         if intrabar_sl:
             final_move = -sl_pct
@@ -2027,7 +2045,11 @@ class AutoRunner:
         else:
             # No intrabar trigger — use actual close price
             raw_move = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
-            if raw_move <= -sl_pct:
+            if trailing_activated and raw_move < 0:
+                # Trailing was active but reversed and closed below entry — exit at entry
+                final_move = 0.0
+                outcome = "TRAIL_STOP"
+            elif raw_move <= -sl_pct:
                 final_move = -sl_pct
                 outcome = "SL_HIT"
             elif raw_move >= tp_pct:
@@ -2047,8 +2069,9 @@ class AutoRunner:
         dir_word = "up" if from_start >= 0 else "down"
         size_dollar = equity_before * effective_size
         outcome_label = (
-            "Take profit hit" if outcome == "TP_HIT"
-            else "Stop loss hit" if outcome == "SL_HIT"
+            "Take profit hit"      if outcome == "TP_HIT"
+            else "Stop loss hit"   if outcome == "SL_HIT"
+            else "Trailing stop"   if outcome == "TRAIL_STOP"
             else "Natural close"
         )
         grade_label = pt.get("grade", "A")
@@ -2068,6 +2091,7 @@ class AutoRunner:
             f"  Leverage:    {c['leverage']:.0f}×",
             f"  SL (1×ATR):  {sl_pct * 100:.3f}%   |   TP ({tp_mult:.1f}×ATR): {tp_pct * 100:.3f}%",
             f"  ATR:         {atr * 100:.3f}%",
+            f"  Trailing:    {'activated at 60% of TP (' + f'{trail_trigger_pct*100:.3f}%)' if trailing_activated else 'not triggered'}",
             "",
             "Account",
             f"  Before:      ${equity_before:,.2f}",
