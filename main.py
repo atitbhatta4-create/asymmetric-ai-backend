@@ -960,7 +960,16 @@ async def okx_price(symbol: str) -> float:
     return float(last)
 
 
-def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
+# ── Market data cache ─────────────────────────────────────────────────────
+# All users on the same symbol+tf share ONE OKX fetch per TTL period.
+# 1000 BTCUSDT/15m users → 1 API call per minute instead of 1000.
+_KLINES_CACHE: Dict[tuple, tuple] = {}   # (symbol, tf) → (fetched_at, klines)
+_KLINES_CACHE_LOCK = threading.Lock()
+_KLINES_CACHE_TTL = 55  # seconds — refresh just under 1 minute
+
+
+def _fetch_klines_raw(symbol: str, tf: str, limit: int) -> List[Dict[str, Any]]:
+    """Direct OKX fetch — no cache."""
     inst = to_okx_inst(symbol)
     bar = OKX_TF_MAP.get(str(tf))
     if not bar:
@@ -985,6 +994,23 @@ def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str,
         return out
     except Exception:
         return []
+
+
+def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
+    """Cached OKX fetch — all users sharing same symbol+tf get the same data."""
+    key = (symbol.upper(), tf)
+    now = time.time()
+    with _KLINES_CACHE_LOCK:
+        if key in _KLINES_CACHE:
+            fetched_at, cached = _KLINES_CACHE[key]
+            if now - fetched_at < _KLINES_CACHE_TTL:
+                return cached
+    # Cache miss or expired — fetch fresh
+    fresh = _fetch_klines_raw(symbol, tf, limit)
+    if fresh:
+        with _KLINES_CACHE_LOCK:
+            _KLINES_CACHE[key] = (now, fresh)
+    return fresh
 
 
 # =========================
@@ -1532,6 +1558,7 @@ def _compute_signal_layers(
     mode: RiskMode,
     adaptive_strictness: float = 1.0,
     higher_klines: Optional[List[Dict]] = None,
+    trade_style: str = "DAY_TRADE",
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -1562,6 +1589,21 @@ def _compute_signal_layers(
 
     # Apply adaptive strictness for MINI_ASYM
     p = MODE_SIGNAL_PARAMS.get(mode, MODE_SIGNAL_PARAMS["NORMAL"]).copy()
+
+    # Trade-style tightens/relaxes entry thresholds — SCALP must be strict
+    # because 15m candles are noisy; SWING can tolerate wider pullbacks
+    _style_adj = {
+        "SCALP":     dict(pullback_mult=0.40, mom_n_add=1, rsi_tighten=6,  score_add=0.06),
+        "DAY_TRADE": dict(pullback_mult=0.70, mom_n_add=0, rsi_tighten=2,  score_add=0.02),
+        "SWING":     dict(pullback_mult=1.20, mom_n_add=0, rsi_tighten=-3, score_add=0.0),
+    }
+    adj = _style_adj.get(trade_style, _style_adj["DAY_TRADE"])
+    p["pullback_max"] = p["pullback_max"] * adj["pullback_mult"]
+    p["mom_n"]        = max(1, p["mom_n"] + adj["mom_n_add"])
+    p["rsi_min"]      = min(50, p["rsi_min"] + adj["rsi_tighten"])
+    p["rsi_max"]      = max(50, p["rsi_max"] - adj["rsi_tighten"])
+    p["min_score"]    = min(0.92, p["min_score"] + adj["score_add"])
+
     if mode == "MINI_ASYM" and adaptive_strictness != 1.0:
         s = adaptive_strictness
         p["adx_min"]      = p["adx_min"] * s
@@ -1916,17 +1958,19 @@ class AutoRunner:
             raise RuntimeError(f"No price data for {symbol}")
         return float(arr[0]["last"])
 
-    def _close_one_trade(self, pt: Dict, exit_price: float, equity_before: float) -> float:
+    def _close_one_trade(self, pt: Dict, exit_price: float, equity_before: float,
+                         candle_high: float = 0.0, candle_low: float = 0.0) -> float:
         """
         Close a single pending trade dict. Returns equity_after.
-        Uses ATR-based SL/TP from trade style. size_mult/tp_mult support Grade B splits.
+        candle_high/candle_low: intrabar extremes — used to detect SL/TP hits
+        that occurred DURING the interval, not just at close price.
         """
         entry = float(pt["entry_price"])
         side: Side = pt["side"]
         mode: RiskMode = pt["mode"]
         size_mult = float(pt.get("size_mult", 1.0))
         tp_mult   = float(pt.get("tp_mult", 1.0))
-        is_primary = pt.get("is_primary", True)  # only primary trade counts toward bad-trade limit
+        is_primary = pt.get("is_primary", True)
         label = pt.get("label", "")
 
         # Base risk preset (size% and leverage from mode)
@@ -1938,23 +1982,51 @@ class AutoRunner:
         atr = self.last_atr_pct
         sl_pct = min(atr * sp["sl_atr"], sp["sl_max"] / 100.0)
         tp_pct = min(atr * sp["tp_atr"], sp["tp_max"] / 100.0) * tp_mult
-        # Enforce minimum viable SL/TP
         sl_pct = max(sl_pct, 0.002)
         tp_pct = max(tp_pct, 0.004)
 
         effective_size = c["size"] * size_mult
 
-        raw_move = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
+        # ── Intrabar SL/TP detection ──────────────────────────────────────
+        # Use candle high/low to check if SL or TP was touched DURING the
+        # interval, not just at close. This is more realistic for paper trading.
+        sl_price = entry * (1 - sl_pct) if side == "LONG" else entry * (1 + sl_pct)
+        tp_price = entry * (1 + tp_pct) if side == "LONG" else entry * (1 - tp_pct)
 
-        if raw_move <= -sl_pct:
+        intrabar_sl = candle_high > 0 and (
+            (side == "LONG"  and candle_low  <= sl_price) or
+            (side == "SHORT" and candle_high >= sl_price)
+        )
+        intrabar_tp = candle_high > 0 and (
+            (side == "LONG"  and candle_high >= tp_price) or
+            (side == "SHORT" and candle_low  <= tp_price)
+        )
+
+        # SL and TP both touched in same candle → whichever triggered first
+        # Conservatively assume SL hit first (worst case for paper trading)
+        if intrabar_sl and intrabar_tp:
+            intrabar_tp = False
+
+        if intrabar_sl:
             final_move = -sl_pct
             outcome = "SL_HIT"
-        elif raw_move >= tp_pct:
+        elif intrabar_tp:
             final_move = tp_pct
             outcome = "TP_HIT"
         else:
-            final_move = raw_move
-            outcome = "NATURAL_CLOSE"
+            # No intrabar trigger — use actual close price
+            raw_move = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
+            if raw_move <= -sl_pct:
+                final_move = -sl_pct
+                outcome = "SL_HIT"
+            elif raw_move >= tp_pct:
+                final_move = tp_pct
+                outcome = "TP_HIT"
+            else:
+                final_move = raw_move
+                outcome = "NATURAL_CLOSE"
+
+        raw_move = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
 
         pnl_pct_leveraged = final_move * c["leverage"]
         pnl_value = equity_before * effective_size * pnl_pct_leveraged
@@ -2054,15 +2126,27 @@ class AutoRunner:
         return equity_after
 
     def _close_pending_trades(self) -> None:
-        """Close all pending trades (1 for Grade A, 2 for Grade B), using same exit price."""
+        """Close all pending trades (1 for Grade A, 2 for Grade B).
+        Uses intrabar high/low to realistically check SL/TP during the interval."""
         if not self.pending_trades:
             return
         try:
-            exit_price = self._fetch_price_sync(self.symbol)
+            # Get the latest candle to check intrabar SL/TP
+            klines = _fetch_klines_sync(self.symbol, self.tf, limit=10)
+            if klines:
+                last_candle = klines[-1]
+                candle_high = last_candle["high"]
+                candle_low  = last_candle["low"]
+                exit_price  = last_candle["close"]
+            else:
+                exit_price = self._fetch_price_sync(self.symbol)
+                candle_high = exit_price
+                candle_low  = exit_price
+
             for pt in list(self.pending_trades):
-                # Each T2 uses updated equity from T1 close
                 eq = get_equity(self.email)
-                self._close_one_trade(pt, exit_price, eq)
+                self._close_one_trade(pt, exit_price, eq,
+                                      candle_high=candle_high, candle_low=candle_low)
         except Exception as e:
             self.log(f"Error closing trade(s): {e}")
         finally:
@@ -2077,7 +2161,7 @@ class AutoRunner:
                 higher_klines = _fetch_klines_sync(self.symbol, higher_tf, limit=100)
             except Exception:
                 higher_klines = []
-        res = _compute_signal_layers(klines, self.mode, self.adaptive_strictness, higher_klines)
+        res = _compute_signal_layers(klines, self.mode, self.adaptive_strictness, higher_klines, self.trade_style)
         self.last_breakdown = res.get("breakdown", {})
         self.last_score = res.get("score", 0.0)
         self.market_grade = res.get("grade", "-")
