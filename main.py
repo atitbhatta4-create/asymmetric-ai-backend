@@ -1564,22 +1564,28 @@ def _rsi_series(closes: List[float], period: int = 14) -> List[float]:
     return out
 
 
-def _session_active(trade_style: str) -> tuple:
+def _session_quality(trade_style: str) -> tuple:
     """
-    Returns (is_active, reason).
-    Crypto is 24/7 but liquidity varies — avoid dead zones for short TFs.
+    Returns (quality_score 0.5-1.0, label).
+    NOT a hard block — low liquidity hours reduce the score so the signal
+    needs to be STRONGER to trade. A real news spike (high ATR/ADX/volume)
+    will still overcome the session penalty and trigger a trade.
     Dubai timezone (UTC+4):
-      Dead zone: 02:00-09:00 — Asia late night, thin before London opens
-      Active:    09:00-02:00 — Asia open, London, NY overlap
+      02:00-09:00 → score 0.60 (thin, but news events can still qualify)
+      09:00-13:00 → score 0.85 (Asia open, decent liquidity)
+      13:00-01:00 → score 1.00 (London + NY, best liquidity)
+      01:00-02:00 → score 0.75 (NY close wind-down)
     """
     if trade_style == "SWING":
-        return True, ""   # 4h candles — session irrelevant
+        return 1.0, "swing"
     hour = now_dubai().hour
-    if trade_style == "SCALP" and 2 <= hour < 9:
-        return False, f"Dead zone {hour:02d}:xx Dubai — SCALP paused 02:00–09:00 (thin liquidity, wide spreads)"
-    if trade_style == "DAY_TRADE" and 3 <= hour < 7:
-        return False, f"Dead zone {hour:02d}:xx Dubai — paused 03:00–07:00 (lowest liquidity window)"
-    return True, ""
+    if 2 <= hour < 9:
+        return 0.60, f"low-liq {hour:02d}:xx"
+    if 9 <= hour < 13:
+        return 0.85, f"Asia {hour:02d}:xx"
+    if 1 <= hour < 2:
+        return 0.75, f"NY-close {hour:02d}:xx"
+    return 1.00, f"active {hour:02d}:xx"
 
 
 def _ema_spread_trend(ema_fast: List[float], ema_slow: List[float], n: int = 4) -> tuple:
@@ -1698,12 +1704,10 @@ def _compute_signal_layers(
     Direction from higher TF trend. Entry on pullback+bounce, not on crossover.
     Each layer returns a 0-1 score. Total must exceed mode threshold.
     """
-    # ── Pre-check: session filter ─────────────────────────────────────────
-    sess_ok, sess_reason = _session_active(trade_style)
-    if not sess_ok:
-        return {"ok": False, "blocked": f"SESSION: {sess_reason}",
-                "signal": "SESSION_FILTER", "score": 0.0, "breakdown": {},
-                "atr_pct": 0.0}
+    # ── Session quality multiplier (not a hard block) ────────────────────
+    # Low-liquidity hours reduce the final score — a news spike with high
+    # ATR/ADX/volume can still overcome this and trigger a trade.
+    sess_score, sess_label = _session_quality(trade_style)
 
     if len(klines) < 220:
         return {"ok": False, "blocked": "NO_DATA", "signal": "NO_DATA", "score": 0.0, "breakdown": {}}
@@ -1896,14 +1900,18 @@ def _compute_signal_layers(
     }
 
     # ── Final weighted score ──────────────────────────────────────────────
-    total_score = round(
+    # sess_score scales the total: 1.0 = full, 0.60 = needs 67% stronger signal
+    # This means a news spike (high ATR, high ADX, high volume) can still
+    # fire at 3am — but a mediocre setup in thin hours gets filtered out.
+    raw_score = (
         regime_score    * 0.25 +
         direction_score * 0.30 +
         entry_score     * 0.30 +
-        momentum_score  * 0.15,
-        3,
+        momentum_score  * 0.15
     )
+    total_score = round(raw_score * sess_score, 3)
     min_score = p.get("min_score", 0.62)
+    breakdown["session"] = {"label": sess_label, "quality": round(sess_score, 2), "raw_score": round(raw_score, 3)}
 
     # Market grade: A = high conviction (≥0.78), B = good setup (≥0.65), C = weak (blocked)
     grade = "A" if total_score >= 0.78 else "B" if total_score >= 0.65 else "C"
