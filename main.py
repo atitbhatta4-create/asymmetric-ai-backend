@@ -1985,7 +1985,18 @@ class AutoRunner:
         sl_pct = max(sl_pct, 0.002)
         tp_pct = max(tp_pct, 0.004)
 
+        # Break-even SL: T2 after T1 wins → SL moves to entry (risk-free trade)
+        if pt.get("breakeven"):
+            sl_pct = 0.0001  # near-zero SL at entry price — can only lose a tiny bit
+
+        # Hard per-trade max loss cap: never risk more than 2% of equity on one trade
+        # Guards against ATR spikes (news events, flash crashes)
         effective_size = c["size"] * size_mult
+        max_loss_pct = 0.02  # 2% of equity hard cap
+        max_sl_for_cap = max_loss_pct / (effective_size * c["leverage"]) if (effective_size * c["leverage"]) > 0 else sl_pct
+        if sl_pct > max_sl_for_cap:
+            sl_pct = max_sl_for_cap
+            tp_pct = sl_pct * (sp["tp_atr"] / sp["sl_atr"]) * tp_mult  # maintain RR ratio
 
         # ── Intrabar SL/TP detection ──────────────────────────────────────
         # Use candle high/low to check if SL or TP was touched DURING the
@@ -2143,10 +2154,17 @@ class AutoRunner:
                 candle_high = exit_price
                 candle_low  = exit_price
 
+            t1_won = False
             for pt in list(self.pending_trades):
+                # Break-even: if T2 has breakeven_after_t1 flag and T1 won, SL moves to entry
+                if pt.get("breakeven_after_t1") and t1_won:
+                    pt = {**pt, "breakeven": True}
                 eq = get_equity(self.email)
-                self._close_one_trade(pt, exit_price, eq,
-                                      candle_high=candle_high, candle_low=candle_low)
+                outcome_eq = self._close_one_trade(pt, exit_price, eq,
+                                                   candle_high=candle_high, candle_low=candle_low)
+                # Track if T1 (primary) won so T2 can use break-even
+                if pt.get("is_primary") and outcome_eq > eq:
+                    t1_won = True
         except Exception as e:
             self.log(f"Error closing trade(s): {e}")
         finally:
@@ -2276,10 +2294,10 @@ class AutoRunner:
                     }
                     if grade == "B":
                         self.pending_trades = [
-                            {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.50, "is_primary": True,  "label": "T1"},
-                            {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00, "is_primary": False, "label": "T2"},
+                            {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80, "is_primary": True,  "label": "T1"},
+                            {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00, "is_primary": False, "label": "T2", "breakeven_after_t1": True},
                         ]
-                        self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+50%TP, T2 40%+100%TP | score={self.last_score:.2f}")
+                        self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}")
                     else:
                         self.pending_trades = [
                             {**base_trade, "grade": "A", "size_mult": 1.00, "tp_mult": 1.00, "is_primary": True},
