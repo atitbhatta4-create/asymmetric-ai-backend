@@ -1911,12 +1911,12 @@ def _compute_signal_layers(
     )
     total_score = round(raw_score * sess_score, 3)
     min_score = p.get("min_score", 0.62)
-    breakdown["session"] = {"label": sess_label, "quality": round(sess_score, 2), "raw_score": round(raw_score, 3)}
+    breakdown["session"] = {"label": sess_label, "quality": round(sess_score, 2), "raw_score": round(raw_score, 3), "ok": True, "reason": ""}
 
     # Market grade: A = high conviction (≥0.78), B = good setup (≥0.65), C = weak (blocked)
     grade = "A" if total_score >= 0.78 else "B" if total_score >= 0.65 else "C"
 
-    failed = [k for k, v in breakdown.items() if not v["ok"]]
+    failed = [k for k, v in breakdown.items() if not v.get("ok")]
     if failed or total_score < min_score:
         reasons = " | ".join(breakdown[k]["reason"] for k in failed if breakdown[k].get("reason"))
         if total_score < min_score and not failed:
@@ -2259,7 +2259,18 @@ class AutoRunner:
                 final_move = raw_move
                 outcome = "NATURAL_CLOSE"
 
-        raw_move = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
+        # Use the actual SL/TP price for display and DB when those levels were hit,
+        # not the raw candle close — otherwise exit price and PnL are inconsistent.
+        if outcome == "SL_HIT":
+            actual_exit = entry * (1 - sl_pct) if side == "LONG" else entry * (1 + sl_pct)
+        elif outcome == "TP_HIT":
+            actual_exit = entry * (1 + tp_pct) if side == "LONG" else entry * (1 - tp_pct)
+        elif outcome == "TRAIL_STOP":
+            actual_exit = entry * (1 + trail_locked_pct) if side == "LONG" else entry * (1 - trail_locked_pct)
+        else:
+            actual_exit = exit_price
+
+        raw_move = final_move  # always consistent with PnL
 
         pnl_pct_leveraged = final_move * c["leverage"]
         pnl_value = equity_before * effective_size * pnl_pct_leveraged
@@ -2283,7 +2294,7 @@ class AutoRunner:
             "",
             f"Signal       {pt.get('signal', '-')}  →  {side}",
             f"Entry        ${entry:,.4f}",
-            f"Exit         ${exit_price:,.4f}  ({raw_move * 100:+.3f}% price move)",
+            f"Exit         ${actual_exit:,.4f}  ({raw_move * 100:+.3f}% price move)",
             f"Outcome      {outcome_label}  →  {pnl_pct_leveraged * 100:+.2f}% PnL  (${pnl_value:+.2f})",
             "",
             "Position (ATR-based)",
@@ -2305,7 +2316,7 @@ class AutoRunner:
             size=float(effective_size),
             sl=round(sl_pct * 100, 4), tp=round(tp_pct * 100, 4),
             leverage=float(c["leverage"]), entry_price=entry,
-            current_price=exit_price,
+            current_price=actual_exit,
             unreal_pnl_percent=float(pnl_pct_leveraged * 100.0),
             unreal_pnl_value=float(pnl_value),
             equity_after=float(equity_after), reason=reason_text,
@@ -2347,7 +2358,7 @@ class AutoRunner:
         mt = self.max_trades_per_day if self.max_trades_per_day > 0 else "∞"
         self.log(
             f"TRADE CLOSED ({side}){' [' + label + ']' if label else ''} | {outcome} | "
-            f"entry={entry:.2f} exit={exit_price:.2f} | "
+            f"entry={entry:.2f} exit={actual_exit:.2f} | "
             f"pnl={pnl_pct_leveraged * 100:.2f}% (${pnl_value:.2f}) | "
             f"trades={self.trades_today}/{mt}"
         )
