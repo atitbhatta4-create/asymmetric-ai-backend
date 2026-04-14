@@ -2017,6 +2017,8 @@ class AutoRunner:
         self._last_trade_bad: bool = False
         self.session_start_equity: float = get_equity(email)
         self.peak_equity: float = get_equity(email)   # tracks highest equity for drawdown protection
+        self.consecutive_wins: int = 0    # reset strictness after 3 wins in a row
+        self.floor_equity: float = START_EQUITY * 0.60  # hard floor: never go below 60% of start
         # Load today's real trade counts from DB — prevents bypass by stop+restart
         self.trades_today, self.bad_trades_today = self._load_today_stats()
 
@@ -2162,28 +2164,57 @@ class AutoRunner:
             vol_size_mult = max(0.4, 1.0 / vol_ratio_atr)  # scale down, floor at 40%
             self.log(f"High volatility (ATR {atr*100:.2f}% = {vol_ratio_atr:.1f}× normal) → size reduced to {vol_size_mult*100:.0f}%")
 
-        # ── Drawdown protection ───────────────────────────────────────────
-        # Track peak equity; if current drawdown > 5%, halve position size
+        # ── Hard equity floor — never trade if account below 60% of start ──
+        if equity_before < self.floor_equity:
+            self.log(
+                f"HARD FLOOR HIT — equity ${equity_before:.2f} below 60% floor "
+                f"(${self.floor_equity:.2f}). AI paused to protect capital."
+            )
+            self.blocked_reason = "HARD_FLOOR"
+            self.stop_event.set()
+            return equity_before
+
+        # ── Drawdown protection (4-tier, from peak equity) ────────────────
         if equity_before > self.peak_equity:
             self.peak_equity = equity_before
         drawdown_pct = (self.peak_equity - equity_before) / self.peak_equity if self.peak_equity > 0 else 0.0
         dd_size_mult = 1.0
-        if drawdown_pct >= 0.10:
-            dd_size_mult = 0.25   # -10%+ drawdown: quarter size (recovery mode)
+        if drawdown_pct >= 0.20:
+            # -20%+ from peak: stop trading, protect what's left
+            self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak — STOPPING to protect capital.")
+            self.blocked_reason = "MAX_DRAWDOWN"
+            self.stop_event.set()
+            return equity_before
+        elif drawdown_pct >= 0.15:
+            dd_size_mult = 0.25   # -15%: quarter size (recovery mode)
             self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at 25%")
+        elif drawdown_pct >= 0.10:
+            dd_size_mult = 0.40   # -10%: 40% size
+            self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at 40%")
         elif drawdown_pct >= 0.05:
-            dd_size_mult = 0.50   # -5%+ drawdown: half size
-            self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at 50%")
+            dd_size_mult = 0.65   # -5%: 65% size
+            self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at 65%")
 
         # Apply all size multipliers
         effective_size = c["size"] * size_mult * vol_size_mult * dd_size_mult
 
-        # Hard per-trade max loss cap: never risk more than 2% of equity on one trade
-        max_loss_pct = 0.02
+        # Hard per-trade max loss cap — scales by trade style (wider SL allowed on longer TF)
+        max_loss_pct = {"SCALP": 0.015, "DAY_TRADE": 0.020, "SWING": 0.030}.get(self.trade_style, 0.020)
         max_sl_for_cap = max_loss_pct / (effective_size * c["leverage"]) if (effective_size * c["leverage"]) > 0 else sl_pct
         if sl_pct > max_sl_for_cap:
             sl_pct = max_sl_for_cap
             tp_pct = sl_pct * (sp["tp_atr"] / sp["sl_atr"]) * tp_mult
+
+        # ── Breakeven stop — no fees, no loss ────────────────────────────
+        # If trade has been open ≥ 2 intervals and price hasn't moved 30% toward TP,
+        # move SL to entry. Worst case = 0% PnL, avoids paying fees on a losing exit.
+        candles_held = int((time.time() - pt.get("open_ts", time.time())) / self.interval_sec)
+        if candles_held >= 2 and not pt.get("breakeven"):
+            raw_progress = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
+            if raw_progress < tp_pct * 0.30:
+                sl_pct = 0.0001   # SL at entry — exits at breakeven
+                pt["breakeven"] = True
+                self.log(f"Breakeven stop activated ({candles_held} candles, no progress) — SL moved to entry")
 
         # ── Intrabar SL/TP detection ──────────────────────────────────────
         # Use candle high/low to check if SL or TP was touched DURING the
@@ -2350,10 +2381,18 @@ class AutoRunner:
         # Mini-Asym adaptive strictness — only update on primary trade
         if is_primary and mode == "MINI_ASYM":
             if pnl_value < 0:
+                self.consecutive_wins = 0
                 self.adaptive_strictness = min(2.5, self.adaptive_strictness + 0.25)
                 self.log(f"MINI_ASYM strictness ↑ {self.adaptive_strictness:.2f} (after loss)")
             else:
-                self.adaptive_strictness = max(1.0, self.adaptive_strictness - 0.10)
+                self.consecutive_wins += 1
+                if self.consecutive_wins >= 3:
+                    # 3 wins in a row → reset strictness fully, AI is in good form
+                    self.adaptive_strictness = 1.0
+                    self.consecutive_wins = 0
+                    self.log("MINI_ASYM strictness reset to 1.0 (3 consecutive wins)")
+                else:
+                    self.adaptive_strictness = max(1.0, self.adaptive_strictness - 0.10)
 
         mt = self.max_trades_per_day if self.max_trades_per_day > 0 else "∞"
         self.log(
@@ -2475,7 +2514,29 @@ class AutoRunner:
                     time.sleep(self.interval_sec)
                     continue
 
-                # ── Step 2: Daily limit checks ──────────────────────────────────────────
+                # ── Step 2a: Hard floor + max drawdown guard ─────────────────────────────
+                current_equity = get_equity(self.email)
+                if current_equity < self.floor_equity:
+                    self.log(
+                        f"HARD FLOOR — equity ${current_equity:.2f} is below 60% of start "
+                        f"(${self.floor_equity:.2f}). AI stopped to protect remaining capital."
+                    )
+                    self.blocked_reason = "HARD_FLOOR"
+                    self.stop_event.set()
+                    break
+
+                if self.peak_equity > 0:
+                    dd = (self.peak_equity - current_equity) / self.peak_equity
+                    if dd >= 0.20:
+                        self.log(
+                            f"MAX DRAWDOWN — equity down {dd*100:.1f}% from peak "
+                            f"(${self.peak_equity:.2f} → ${current_equity:.2f}). AI stopped."
+                        )
+                        self.blocked_reason = "MAX_DRAWDOWN"
+                        self.stop_event.set()
+                        break
+
+                # ── Step 2b: Daily limit checks ─────────────────────────────────────────
                 if self.max_trades_per_day > 0 and self.trades_today >= self.max_trades_per_day:
                     self.blocked_reason = f"MAX_TRADES_DAY: {self.trades_today}/{self.max_trades_per_day}"
                     self.last_signal = "BLOCKED: MAX_TRADES_DAY"
