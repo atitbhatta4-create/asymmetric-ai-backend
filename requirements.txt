@@ -46,3 +46,6 @@ watchfiles==1.1.1
 websockets==15.0.1
 yarl==1.22.0
 psycopg[binary]==3.2.9
+bcrypt==4.2.1
+pyotp==2.9.0
+qrcode==8.2

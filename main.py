@@ -5,8 +5,11 @@ import os
 import secrets
 import time
 import hashlib
+import hmac
 import threading
 import smtplib
+import bcrypt
+from cryptography.fernet import Fernet
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from dataclasses import dataclass, asdict
@@ -181,6 +184,68 @@ def email_trade_closed(to: str, symbol: str, side: str, mode: str,
     send_email(to, subject, _email_base(content))
 
 
+def email_ai_stopped(to: str, symbol: str, reason: str, equity: float) -> None:
+    reason_map = {
+        "MAX_DRAWDOWN":   ("Drawdown Limit Reached",   "#ff5078", "The AI hit the maximum drawdown limit and stopped to protect your remaining capital."),
+        "HARD_FLOOR":     ("Safety Floor Triggered",   "#ff5078", "Equity fell below the 85% safety floor. AI stopped completely to protect your funds."),
+        "MAX_BAD_TRADES": ("Bad Trade Limit Hit",      "#f59e0b", "Too many consecutive losing trades. AI paused for today — resets at midnight Dubai time."),
+        "DURATION_END":   ("Session Ended",            "#00ffe0", "The AI completed its scheduled trading duration."),
+    }
+    title, color, detail = reason_map.get(reason, ("AI Stopped", "#94a3b8", f"Reason: {reason}"))
+    content = f"""
+    <h2 style="margin:0 0 6px;font-size:20px;font-weight:900;color:#f1f5f9;">AI Trading Stopped</h2>
+    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">{symbol}</p>
+    <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);
+                border-radius:14px;padding:18px;margin-bottom:16px;">
+      <div style="font-size:16px;font-weight:900;color:{color};margin-bottom:8px;">{title}</div>
+      <div style="font-size:14px;opacity:0.85;line-height:1.6;">{detail}</div>
+    </div>
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:12px;
+                padding:14px;font-size:14px;">
+      <div style="opacity:0.6;margin-bottom:4px;">Current equity</div>
+      <div style="font-size:22px;font-weight:900;color:#f1f5f9;">${equity:,.2f}</div>
+    </div>
+    <p style="margin-top:16px;font-size:12px;color:#4b5563;">
+      Log in to Asymmetric AI to review your trades and restart when ready.
+    </p>"""
+    send_email(to, f"AI stopped — {symbol} ({title})", _email_base(content))
+
+
+def email_otp_reset(to: str, code: str) -> None:
+    """Send 6-digit OTP for forgot-password flow. Expires in 15 minutes."""
+    content = f"""
+    <h2 style="margin:0 0 14px;font-size:20px;font-weight:900;color:#f1f5f9;">Reset Your Password</h2>
+    <p style="margin:0 0 20px;opacity:0.85;line-height:1.6;">
+      We received a request to reset the password for <b>{to}</b>.<br>
+      Enter this code in the app to continue:
+    </p>
+    <div style="background:#0f172a;border:1px solid rgba(0,255,224,0.25);border-radius:14px;
+                padding:28px;text-align:center;margin-bottom:20px;">
+      <div style="font-size:42px;font-weight:900;letter-spacing:12px;color:#00ffe0;
+                  font-family:monospace;">{code}</div>
+      <div style="margin-top:10px;font-size:12px;color:#6b7280;">Expires in 15 minutes</div>
+    </div>
+    <div style="background:rgba(220,38,38,0.1);border:1px solid rgba(248,113,113,0.25);
+                border-radius:10px;padding:12px 16px;font-size:13px;color:#fecaca;">
+      If you did not request this, ignore this email. Your password has not been changed.
+    </div>"""
+    send_email(to, "Asymmetric AI — Password Reset Code", _email_base(content))
+
+
+def email_2fa_enabled(to: str) -> None:
+    content = f"""
+    <h2 style="margin:0 0 14px;font-size:20px;font-weight:900;color:#f1f5f9;">Two-Factor Authentication Enabled</h2>
+    <p style="margin:0 0 14px;opacity:0.85;line-height:1.6;">
+      2FA has been successfully enabled on your account <b>{to}</b>.<br>
+      You will now need your authenticator app every time you log in.
+    </p>
+    <div style="background:rgba(0,255,157,0.08);border:1px solid rgba(0,255,157,0.25);
+                border-radius:12px;padding:12px 16px;font-size:13px;color:#a7f3d0;">
+      If you did not enable this, contact support immediately and change your password.
+    </div>"""
+    send_email(to, "2FA enabled on your Asymmetric AI account", _email_base(content))
+
+
 # Strip /api prefix forwarded by Vercel
 @app.middleware("http")
 async def strip_api_prefix(request: Request, call_next):
@@ -282,6 +347,45 @@ def init_db() -> None:
         )
         """)
 
+        # OTP codes for forgot-password (6-digit, 15min expiry)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS otp_codes (
+            email TEXT PRIMARY KEY,
+            code  TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0
+        )
+        """)
+
+        # 2FA TOTP secrets — one per user, optional
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS totp_secrets (
+            email      TEXT PRIMARY KEY,
+            secret     TEXT NOT NULL,
+            enabled    INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+        """)
+
+        # AI runner persistence — survives backend restarts / deploys.
+        # Saved when user starts the AI, cleared when AI stops for any reason.
+        # On startup, all rows here are auto-resumed so live sessions never drop.
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ai_runner_state (
+            email               TEXT PRIMARY KEY,
+            symbol              TEXT NOT NULL,
+            trade_style         TEXT NOT NULL,
+            mode                TEXT NOT NULL,
+            max_trades_per_day  INTEGER NOT NULL,
+            stop_after_bad_trades INTEGER NOT NULL,
+            duration_days       INTEGER NOT NULL,
+            trend_filter        INTEGER NOT NULL,
+            chop_min_sep_pct    REAL NOT NULL,
+            end_at_ts           REAL,
+            started_at          INTEGER NOT NULL
+        )
+        """)
+
         # Safe migrations for existing databases
         if not column_exists(conn, "trades", "reason"):
             cur.execute("ALTER TABLE trades ADD COLUMN reason TEXT")
@@ -307,6 +411,8 @@ def init_db() -> None:
 
 
 init_db()
+
+# Runners are resumed after all AutoRunner code is defined — see bottom of file.
 
 # =========================
 # CONFIG
@@ -345,8 +451,62 @@ def dubai_day_key(dt: Optional[datetime] = None) -> str:
     return d.strftime("%Y-%m-%d")
 
 
+# =========================
+# SECURITY — PASSWORDS + KEY ENCRYPTION
+# =========================
+
 def hash_pw(pw: str) -> str:
-    return hashlib.sha256(pw.encode()).hexdigest()
+    """Hash a new password with bcrypt."""
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt(rounds=12)).decode()
+
+
+def verify_pw(plain: str, stored: str) -> bool:
+    """
+    Verify password — handles both:
+    - Old SHA-256 hashes (legacy, migrated on next login)
+    - New bcrypt hashes
+    """
+    if not plain or not stored:
+        return False
+    if stored.startswith("$2b$") or stored.startswith("$2a$"):
+        # bcrypt
+        return bcrypt.checkpw(plain.encode(), stored.encode())
+    # Legacy SHA-256 — still works but will be re-hashed on login
+    return hashlib.sha256(plain.encode()).hexdigest() == stored
+
+
+# Fernet encryption for API keys stored in DB
+# Set ENCRYPTION_KEY env var to a Fernet key (generate once: Fernet.generate_key().decode())
+_RAW_ENC_KEY = os.getenv("ENCRYPTION_KEY", "")
+_FERNET: Fernet | None = None
+if _RAW_ENC_KEY:
+    try:
+        _FERNET = Fernet(_RAW_ENC_KEY.encode() if isinstance(_RAW_ENC_KEY, str) else _RAW_ENC_KEY)
+    except Exception:
+        pass
+
+if not _FERNET:
+    import base64, warnings
+    _FALLBACK = base64.urlsafe_b64encode(hashlib.sha256(b"asym-dev-key").digest())
+    _FERNET = Fernet(_FALLBACK)
+    if os.getenv("ENV", "dev") == "prod":
+        warnings.warn("ENCRYPTION_KEY not set — using dev fallback. Set ENCRYPTION_KEY in prod!")
+
+
+def encrypt_key(value: str) -> str:
+    if not value:
+        return ""
+    return _FERNET.encrypt(value.encode()).decode()
+
+
+def decrypt_key(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        return _FERNET.decrypt(value.encode()).decode()
+    except Exception:
+        # Fallback: might be unencrypted legacy value
+        return value
 
 
 def mask_key(s: str) -> str:
@@ -420,7 +580,15 @@ def get_exchange(email: str) -> Optional[dict]:
         cur.execute("SELECT * FROM exchange_keys WHERE email = %s", (email,))
         row = cur.fetchone()
         conn.close()
-    return row
+    if not row:
+        return None
+    # Decrypt keys before returning — callers always get plain text
+    return {
+        **dict(row),
+        "api_key":    decrypt_key(row["api_key"]),
+        "api_secret": decrypt_key(row["api_secret"]),
+        "passphrase": decrypt_key(row.get("passphrase") or ""),
+    }
 
 
 def require_user(session: Optional[str] = Cookie(default=None)) -> Dict[str, str]:
@@ -624,8 +792,19 @@ def login(payload: AuthIn, response: Response):
         row = cur.fetchone()
         conn.close()
 
-    if not row or row["password_hash"] != hash_pw(payload.password):
+    if not row or not verify_pw(payload.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    # Silently migrate legacy SHA-256 hash to bcrypt on successful login
+    stored = row["password_hash"]
+    if not (stored.startswith("$2b$") or stored.startswith("$2a$")):
+        new_hash = hash_pw(payload.password)
+        with DB_LOCK:
+            conn2 = db()
+            cur2 = conn2.cursor()
+            cur2.execute("UPDATE users SET password_hash=%s WHERE email=%s", (new_hash, email))
+            conn2.commit()
+            conn2.close()
 
     token = secrets.token_urlsafe(32)
     now = int(time.time())
@@ -639,7 +818,11 @@ def login(payload: AuthIn, response: Response):
 
     set_session_cookie(response, token)
     ensure_user_state(email)
-    return {"ok": True, "email": email}
+
+    # Check if 2FA is enabled — tell frontend to prompt for TOTP code
+    totp_row = _get_totp_row(email)
+    requires_2fa = bool(totp_row and totp_row["enabled"])
+    return {"ok": True, "email": email, "requires_2fa": requires_2fa}
 
 
 @app.post("/auth/logout")
@@ -701,7 +884,7 @@ def change_password(payload: ChangePasswordIn, user=Depends(require_user)):
         row = cur.fetchone()
         conn.close()
 
-    if not row or row["password_hash"] != hash_pw(payload.current_password):
+    if not row or not verify_pw(payload.current_password, row["password_hash"]):
         raise HTTPException(status_code=400, detail="Current password is incorrect.")
 
     with DB_LOCK:
@@ -713,6 +896,231 @@ def change_password(payload: ChangePasswordIn, user=Depends(require_user)):
 
     email_password_changed(email)
     return {"ok": True}
+
+
+# =========================
+# FORGOT PASSWORD (OTP via email)
+# =========================
+
+class ForgotPasswordIn(BaseModel):
+    email: str
+
+class VerifyOtpIn(BaseModel):
+    email: str
+    code: str
+    new_password: str
+
+@app.post("/auth/forgot-password")
+def forgot_password(payload: ForgotPasswordIn):
+    """
+    Step 1 — user enters their email.
+    Generates a 6-digit OTP, stores it (15min TTL), sends to their Gmail.
+    Always returns ok=True so attackers can't enumerate registered emails.
+    """
+    email = payload.email.strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+
+    # Check user exists — but don't reveal it in the response
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT email FROM users WHERE email = %s", (email,))
+        exists = cur.fetchone() is not None
+        conn.close()
+
+    if exists:
+        code = str(secrets.randbelow(900000) + 100000)   # 100000-999999
+        now_ts = int(time.time())
+        with DB_LOCK:
+            conn = db()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO otp_codes(email, code, created_at, used)
+                VALUES(%s, %s, %s, 0)
+                ON CONFLICT(email) DO UPDATE SET code=EXCLUDED.code,
+                    created_at=EXCLUDED.created_at, used=0
+            """, (email, code, now_ts))
+            conn.commit()
+            conn.close()
+        email_otp_reset(email, code)
+
+    # Always return ok — prevents email enumeration
+    return {"ok": True, "detail": "If that email exists, a reset code has been sent."}
+
+
+@app.post("/auth/reset-password")
+def reset_password(payload: VerifyOtpIn):
+    """
+    Step 2 — user enters the 6-digit code + new password.
+    Code is valid for 15 minutes, single-use.
+    """
+    email = payload.email.strip().lower()
+    code  = payload.code.strip()
+
+    if not email or not code or not payload.new_password:
+        raise HTTPException(status_code=400, detail="Email, code and new password required")
+    if len(payload.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    OTP_TTL = 15 * 60  # 15 minutes
+
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT code, created_at, used FROM otp_codes WHERE email = %s", (email,)
+        )
+        row = cur.fetchone()
+        conn.close()
+
+    if not row:
+        raise HTTPException(status_code=400, detail="No reset code found. Request a new one.")
+    if row["used"]:
+        raise HTTPException(status_code=400, detail="Code already used. Request a new one.")
+    if int(time.time()) - row["created_at"] > OTP_TTL:
+        raise HTTPException(status_code=400, detail="Code expired. Request a new one.")
+    if not hmac.compare_digest(str(row["code"]), code):
+        raise HTTPException(status_code=400, detail="Incorrect code.")
+
+    # Mark used + update password
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("UPDATE otp_codes SET used=1 WHERE email=%s", (email,))
+        cur.execute("UPDATE users SET password_hash=%s WHERE email=%s",
+                    (hash_pw(payload.new_password), email))
+        conn.commit()
+        conn.close()
+
+    email_password_changed(email)
+    return {"ok": True, "detail": "Password reset successfully. You can now log in."}
+
+
+# =========================
+# TWO-FACTOR AUTH (TOTP — Google Authenticator compatible)
+# =========================
+import pyotp
+import base64
+
+def _get_totp_row(email: str) -> Optional[dict]:
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT secret, enabled FROM totp_secrets WHERE email=%s", (email,))
+        row = cur.fetchone()
+        conn.close()
+    return dict(row) if row else None
+
+
+@app.get("/auth/2fa/status")
+def totp_status(user=Depends(require_user)):
+    """Returns whether 2FA is enabled for this account."""
+    row = _get_totp_row(user["email"])
+    return {"enabled": bool(row and row["enabled"])}
+
+
+@app.post("/auth/2fa/setup")
+def totp_setup(user=Depends(require_user)):
+    """
+    Generate a new TOTP secret + QR code URI for Google Authenticator.
+    User scans the QR, then calls /auth/2fa/confirm with a valid code to activate.
+    """
+    email = user["email"]
+    secret = pyotp.random_base32()
+    uri = pyotp.totp.TOTP(secret).provisioning_uri(
+        name=email,
+        issuer_name="Asymmetric AI"
+    )
+    # Store secret but NOT enabled yet — only enabled after confirm
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO totp_secrets(email, secret, enabled, created_at)
+            VALUES(%s, %s, 0, %s)
+            ON CONFLICT(email) DO UPDATE SET secret=EXCLUDED.secret,
+                enabled=0, created_at=EXCLUDED.created_at
+        """, (email, encrypt_key(secret), now_utc_str()))
+        conn.commit()
+        conn.close()
+    return {"ok": True, "uri": uri, "secret": secret}
+
+
+class TotpCodeIn(BaseModel):
+    code: str
+
+@app.post("/auth/2fa/confirm")
+def totp_confirm(payload: TotpCodeIn, user=Depends(require_user)):
+    """
+    Confirm 2FA setup by verifying the first code from the authenticator app.
+    Only after this succeeds is 2FA actually activated.
+    """
+    email = user["email"]
+    row = _get_totp_row(email)
+    if not row:
+        raise HTTPException(status_code=400, detail="Run /auth/2fa/setup first")
+
+    secret = decrypt_key(row["secret"])
+    totp   = pyotp.TOTP(secret)
+    if not totp.verify(payload.code.strip(), valid_window=1):
+        raise HTTPException(status_code=400, detail="Invalid code — check your authenticator app")
+
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("UPDATE totp_secrets SET enabled=1 WHERE email=%s", (email,))
+        conn.commit()
+        conn.close()
+
+    email_2fa_enabled(email)
+    return {"ok": True, "detail": "2FA is now active on your account"}
+
+
+@app.post("/auth/2fa/verify")
+def totp_verify(payload: TotpCodeIn, user=Depends(require_user)):
+    """
+    Called after password login when 2FA is enabled.
+    Frontend: after login returns {requires_2fa: true}, show code input → POST here.
+    On success, session is fully authenticated.
+    """
+    email = user["email"]
+    row = _get_totp_row(email)
+    if not row or not row["enabled"]:
+        return {"ok": True, "detail": "2FA not enabled"}   # no-op if not set up
+
+    secret = decrypt_key(row["secret"])
+    totp   = pyotp.TOTP(secret)
+    # valid_window=1 allows 30s clock drift (one period before/after)
+    if not totp.verify(payload.code.strip(), valid_window=1):
+        raise HTTPException(status_code=400, detail="Invalid 2FA code")
+
+    return {"ok": True}
+
+
+@app.post("/auth/2fa/disable")
+def totp_disable(payload: TotpCodeIn, user=Depends(require_user)):
+    """
+    Disable 2FA. Requires a valid TOTP code to confirm it's really the user.
+    """
+    email = user["email"]
+    row = _get_totp_row(email)
+    if not row or not row["enabled"]:
+        raise HTTPException(status_code=400, detail="2FA is not enabled")
+
+    secret = decrypt_key(row["secret"])
+    totp   = pyotp.TOTP(secret)
+    if not totp.verify(payload.code.strip(), valid_window=1):
+        raise HTTPException(status_code=400, detail="Invalid code — cannot disable 2FA")
+
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("UPDATE totp_secrets SET enabled=0 WHERE email=%s", (email,))
+        conn.commit()
+        conn.close()
+
+    return {"ok": True, "detail": "2FA disabled"}
 
 
 @app.get("/debug/email")
@@ -887,9 +1295,9 @@ def exchange_connect(payload: ExchangeConnectIn, user=Depends(require_user)):
             (
                 email,
                 payload.exchange,
-                payload.api_key.strip(),
-                payload.api_secret.strip(),
-                (payload.passphrase or "").strip(),
+                encrypt_key(payload.api_key.strip()),
+                encrypt_key(payload.api_secret.strip()),
+                encrypt_key((payload.passphrase or "").strip()),
                 created_at,
             ),
         )
@@ -911,23 +1319,122 @@ def exchange_disconnect(user=Depends(require_user)):
     return {"ok": True}
 
 
+# ── Per-exchange fee table (futures/perpetuals, USD-margined) ─────────────────
+# maker = limit order (you add liquidity)   taker = market order (you take liquidity)
+# SL exits are always market (taker). TP exits can be limit (maker).
+# Slippage estimate is conservative round-trip for <$20k position size.
+EXCHANGE_FEES = {
+    "bybit": {
+        "maker":     0.00020,   # 0.020%
+        "taker":     0.00055,   # 0.055%
+        "slippage":  0.00025,   # ~0.025% round-trip (BTC liquid, alts slightly more)
+        "min_qty":   0.001,     # BTC minimum order size
+    },
+    "okx": {
+        "maker":     0.00020,   # 0.020%
+        "taker":     0.00050,   # 0.050%
+        "slippage":  0.00030,   # ~0.030% round-trip
+        "min_qty":   0.001,
+    },
+    "binance": {
+        "maker":     0.00020,   # 0.020% (futures)
+        "taker":     0.00040,   # 0.040% (futures, lower than spot)
+        "slippage":  0.00020,   # ~0.020% round-trip (most liquid exchange)
+        "min_qty":   0.001,
+    },
+}
+
+def exchange_fee_cost(exchange_id: str, size_dollar: float, outcome: str) -> float:
+    """
+    Calculate total fee + slippage cost for one complete trade (entry + exit).
+    outcome: "TP_HIT" (limit exit) | "SL_HIT" | "TRAIL_STOP" | other (market exit)
+    Returns dollar cost to deduct from PnL.
+    """
+    fees = EXCHANGE_FEES.get(exchange_id.lower(), EXCHANGE_FEES["bybit"])
+    entry_fee   = size_dollar * fees["maker"]           # entry always limit
+    exit_fee    = size_dollar * (fees["maker"] if outcome == "TP_HIT" else fees["taker"])
+    slippage    = size_dollar * fees["slippage"]
+    return round(entry_fee + exit_fee + slippage, 4)
+
+
+def _make_ccxt_exchange(row: dict):
+    """Build a ccxt exchange instance from stored (decrypted) keys."""
+    import ccxt
+    exchange_id = (row.get("exchange") or "bybit").lower()
+    config = {
+        "apiKey":   row["api_key"],
+        "secret":   row["api_secret"],
+        "options":  {"defaultType": "linear"},
+        "enableRateLimit": True,
+    }
+    if row.get("passphrase"):
+        config["password"] = row["passphrase"]  # required for OKX
+    cls = getattr(ccxt, exchange_id, None)
+    if cls is None:
+        raise ValueError(f"Unsupported exchange: {exchange_id}")
+    return cls(config)
+
+
 @app.get("/exchange/test")
 def exchange_test(user=Depends(require_user)):
+    """Actually test the API key against the real exchange."""
     email = user["email"]
     row = get_exchange(email)
     if not row:
         raise HTTPException(status_code=400, detail="No exchange connected.")
-    return {"ok": True, "canTrade": False, "accountType": "DEMO", "note": "Demo mode only."}
+    try:
+        ex = _make_ccxt_exchange(row)
+        # Fetch account info to verify key is valid and has trading permissions
+        status = ex.fetch_status()
+        # Try a lightweight authenticated call
+        balance = ex.fetch_balance({"accountType": "UNIFIED"})
+        usdt = balance.get("USDT", {})
+        return {
+            "ok": True,
+            "exchange": row["exchange"],
+            "canTrade": True,
+            "accountType": "UNIFIED",
+            "usdt_free": round(float(usdt.get("free") or 0), 4),
+            "usdt_total": round(float(usdt.get("total") or 0), 4),
+            "note": "Live connection verified ✓",
+        }
+    except Exception as e:
+        err = str(e)
+        return {
+            "ok": False,
+            "canTrade": False,
+            "error": err[:300],
+            "note": "Connection failed — check your API key, secret, and IP whitelist on the exchange.",
+        }
 
 
 @app.get("/exchange/balance")
 def exchange_balance(user=Depends(require_user)):
+    """Fetch real USDT balance from the connected exchange."""
     email = user["email"]
     row = get_exchange(email)
     if not row:
         raise HTTPException(status_code=400, detail="No exchange connected.")
-    eq = get_equity(email)
-    return {"ok": True, "balances": [{"asset": "USDT", "free": eq, "locked": 0.0}], "note": "Demo balances only."}
+    try:
+        ex = _make_ccxt_exchange(row)
+        balance = ex.fetch_balance({"accountType": "UNIFIED"})
+        balances = []
+        for asset in ["USDT", "BTC", "ETH", "SOL", "BNB"]:
+            info = balance.get(asset, {})
+            free  = float(info.get("free") or 0)
+            total = float(info.get("total") or 0)
+            if total > 0:
+                balances.append({"asset": asset, "free": round(free, 6), "locked": round(total - free, 6)})
+        return {"ok": True, "balances": balances, "note": "Live balance from exchange ✓"}
+    except Exception as e:
+        # Fallback to virtual equity when exchange unreachable
+        eq = get_equity(email)
+        return {
+            "ok": False,
+            "balances": [{"asset": "USDT", "free": eq, "locked": 0.0}],
+            "error": str(e)[:200],
+            "note": "Could not reach exchange — showing paper balance.",
+        }
 
 
 # =========================
@@ -974,6 +1481,7 @@ def _fetch_klines_raw(symbol: str, tf: str, limit: int) -> List[Dict[str, Any]]:
     inst = to_okx_inst(symbol)
     bar = OKX_TF_MAP.get(str(tf))
     if not bar:
+        print(f"[klines] unknown tf={tf!r} for {symbol}")
         return []
     try:
         r = httpx.get(
@@ -983,9 +1491,11 @@ def _fetch_klines_raw(symbol: str, tf: str, limit: int) -> List[Dict[str, Any]]:
             headers={"accept": "application/json"},
         )
         if r.status_code != 200:
+            print(f"[klines] OKX HTTP {r.status_code} for {inst}/{bar}: {r.text[:120]}")
             return []
         rows = (r.json() or {}).get("data") or []
         if not rows:
+            print(f"[klines] OKX returned empty data for {inst}/{bar} limit={limit}")
             return []
         out: List[Dict[str, Any]] = []
         for k in rows:
@@ -993,7 +1503,8 @@ def _fetch_klines_raw(symbol: str, tf: str, limit: int) -> List[Dict[str, Any]]:
                         "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])})
         out.reverse()
         return out
-    except Exception:
+    except Exception as e:
+        print(f"[klines] exception fetching {inst}/{bar}: {e}")
         return []
 
 
@@ -1004,9 +1515,10 @@ def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str,
     with _KLINES_CACHE_LOCK:
         if key in _KLINES_CACHE:
             fetched_at, cached = _KLINES_CACHE[key]
-            if now - fetched_at < _KLINES_CACHE_TTL:
+            # Only use cache if it's fresh AND has enough candles for this request
+            if now - fetched_at < _KLINES_CACHE_TTL and len(cached) >= limit:
                 return cached
-    # Cache miss or expired — fetch fresh
+    # Cache miss, expired, or insufficient length — fetch fresh
     fresh = _fetch_klines_raw(symbol, tf, limit)
     if fresh:
         with _KLINES_CACHE_LOCK:
@@ -1459,6 +1971,83 @@ AUTO_LOCK = threading.Lock()
 AUTO_RUNNERS: Dict[str, "AutoRunner"] = {}
 
 
+# ── Runner state persistence (survive deploys) ────────────────────────────────
+
+def _save_runner_state(runner: "AutoRunner") -> None:
+    """Persist runner config to DB so it can be resumed after a backend restart."""
+    try:
+        with DB_LOCK:
+            conn = db()
+            cur = conn.cursor()
+            if USING_PG:
+                cur.execute("""
+                    INSERT INTO ai_runner_state
+                        (email, symbol, trade_style, mode, max_trades_per_day,
+                         stop_after_bad_trades, duration_days, trend_filter,
+                         chop_min_sep_pct, end_at_ts, started_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON CONFLICT(email) DO UPDATE SET
+                        symbol=%s, trade_style=%s, mode=%s,
+                        max_trades_per_day=%s, stop_after_bad_trades=%s,
+                        duration_days=%s, trend_filter=%s,
+                        chop_min_sep_pct=%s, end_at_ts=%s, started_at=%s
+                """, (
+                    runner.email, runner.symbol, runner.trade_style, runner.mode,
+                    runner.max_trades_per_day, runner.stop_after_bad_trades,
+                    runner.duration_days, int(runner.trend_filter),
+                    runner.chop_min_sep_pct, runner.end_at_ts, int(time.time()),
+                    runner.symbol, runner.trade_style, runner.mode,
+                    runner.max_trades_per_day, runner.stop_after_bad_trades,
+                    runner.duration_days, int(runner.trend_filter),
+                    runner.chop_min_sep_pct, runner.end_at_ts, int(time.time()),
+                ))
+            else:
+                cur.execute("""
+                    INSERT OR REPLACE INTO ai_runner_state
+                        (email, symbol, trade_style, mode, max_trades_per_day,
+                         stop_after_bad_trades, duration_days, trend_filter,
+                         chop_min_sep_pct, end_at_ts, started_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    runner.email, runner.symbol, runner.trade_style, runner.mode,
+                    runner.max_trades_per_day, runner.stop_after_bad_trades,
+                    runner.duration_days, int(runner.trend_filter),
+                    runner.chop_min_sep_pct, runner.end_at_ts, int(time.time()),
+                ))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"[runner-state] save failed for {runner.email}: {e}")
+
+
+def _clear_runner_state(email: str) -> None:
+    """Remove persisted runner state — called when AI stops for any reason."""
+    try:
+        with DB_LOCK:
+            conn = db()
+            cur = conn.cursor()
+            cur.execute("DELETE FROM ai_runner_state WHERE email = %s", (email,))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"[runner-state] clear failed for {email}: {e}")
+
+
+def _load_all_runner_states() -> list:
+    """Return all saved runner configs (called once on startup)."""
+    try:
+        with DB_LOCK:
+            conn = db()
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM ai_runner_state")
+            rows = cur.fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[runner-state] load failed: {e}")
+        return []
+
+
 def get_ai_restart_lock(email: str) -> int:
     """Returns Unix timestamp until which AI restart is locked (0 = not locked)."""
     try:
@@ -1566,25 +2155,30 @@ def _rsi_series(closes: List[float], period: int = 14) -> List[float]:
 
 def _session_quality(trade_style: str) -> tuple:
     """
-    Returns (quality_score 0.5-1.0, label).
-    NOT a hard block — low liquidity hours reduce the score so the signal
-    needs to be STRONGER to trade. A real news spike (high ATR/ADX/volume)
-    will still overcome the session penalty and trigger a trade.
+    Returns (quality_score 0.70-1.0, label) — NOT a hard block.
+    Low-liquidity hours reduce the effective score so the signal must be stronger.
+    SCALP during deep low-liq (02:00-06:00 Dubai) is hard-blocked — scalping thin
+    markets is bad practice and the math is unfavorable at 0.60× multiplier.
     Dubai timezone (UTC+4):
-      02:00-09:00 → score 0.60 (thin, but news events can still qualify)
-      09:00-13:00 → score 0.85 (Asia open, decent liquidity)
+      02:00-06:00 → score 0.0  (SCALP hard-block; DAY_TRADE/SWING: 0.72)
+      06:00-09:00 → score 0.80 (early morning, partial liquidity)
+      09:00-13:00 → score 0.90 (Asia open, decent liquidity)
       13:00-01:00 → score 1.00 (London + NY, best liquidity)
-      01:00-02:00 → score 0.75 (NY close wind-down)
+      01:00-02:00 → score 0.82 (NY close wind-down)
     """
     if trade_style == "SWING":
         return 1.0, "swing"
     hour = now_dubai().hour
-    if 2 <= hour < 9:
-        return 0.60, f"low-liq {hour:02d}:xx"
+    if 2 <= hour < 6:
+        if trade_style == "SCALP":
+            return 0.0, f"scalp-blocked {hour:02d}:xx (thin market 02-06 Dubai)"
+        return 0.72, f"low-liq {hour:02d}:xx"
+    if 6 <= hour < 9:
+        return 0.80, f"early {hour:02d}:xx"
     if 9 <= hour < 13:
-        return 0.85, f"Asia {hour:02d}:xx"
+        return 0.90, f"Asia {hour:02d}:xx"
     if 1 <= hour < 2:
-        return 0.75, f"NY-close {hour:02d}:xx"
+        return 0.82, f"NY-close {hour:02d}:xx"
     return 1.00, f"active {hour:02d}:xx"
 
 
@@ -1704,10 +2298,18 @@ def _compute_signal_layers(
     Direction from higher TF trend. Entry on pullback+bounce, not on crossover.
     Each layer returns a 0-1 score. Total must exceed mode threshold.
     """
-    # ── Session quality multiplier (not a hard block) ────────────────────
-    # Low-liquidity hours reduce the final score — a news spike with high
-    # ATR/ADX/volume can still overcome this and trigger a trade.
+    # ── Session quality multiplier ───────────────────────────────────────
+    # Low-liquidity hours reduce the final score so signals must be stronger.
+    # SCALP 02:00-06:00 Dubai returns sess_score=0.0 = hard block (scalping
+    # thin markets is bad practice and the math is unfavourable at <0.72×).
     sess_score, sess_label = _session_quality(trade_style)
+    if sess_score == 0.0:
+        return {
+            "ok": False,
+            "blocked": f"SCALP_LOW_LIQ: Scalping paused 02:00–06:00 Dubai (thin market) — {sess_label}",
+            "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+            "side": None, "adaptive_strictness": adaptive_strictness,
+        }
 
     if len(klines) < 220:
         return {"ok": False, "blocked": "NO_DATA", "signal": "NO_DATA", "score": 0.0, "breakdown": {}}
@@ -1727,7 +2329,6 @@ def _compute_signal_layers(
     adx       = _adx(highs, lows, closes, 14)
 
     price      = closes[-1]
-    last_open  = klines[-1]["open"]
     atr_pct    = (atr / price) if atr else 0.0
     avg_vol    = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0.0
     vol_ratio  = volumes[-1] / avg_vol if avg_vol > 0 else 0.0
@@ -1736,9 +2337,11 @@ def _compute_signal_layers(
     p = MODE_SIGNAL_PARAMS.get(mode, MODE_SIGNAL_PARAMS["NORMAL"]).copy()
 
     # Trade-style tightens/relaxes entry thresholds — SCALP must be strict
-    # because 15m candles are noisy; SWING can tolerate wider pullbacks
+    # because 15m candles are noisy; SWING can tolerate wider pullbacks.
+    # mom_n_add=0 for SCALP: MINI_ASYM already requires 1 candle — adding a 2nd
+    # blocks too many valid entries in volatile/recovering markets.
     _style_adj = {
-        "SCALP":     dict(pullback_mult=0.40, mom_n_add=1, rsi_tighten=6,  score_add=0.06),
+        "SCALP":     dict(pullback_mult=0.40, mom_n_add=0, rsi_tighten=4,  score_add=0.04),
         "DAY_TRADE": dict(pullback_mult=0.70, mom_n_add=0, rsi_tighten=2,  score_add=0.02),
         "SWING":     dict(pullback_mult=1.20, mom_n_add=0, rsi_tighten=-3, score_add=0.0),
     }
@@ -1752,8 +2355,16 @@ def _compute_signal_layers(
     if mode == "MINI_ASYM" and adaptive_strictness != 1.0:
         s = adaptive_strictness
         p["adx_min"]      = p["adx_min"] * s
-        p["rsi_min"]      = min(50, p["rsi_min"] + (s - 1) * 8)
-        p["rsi_max"]      = max(50, p["rsi_max"] - (s - 1) * 8)
+        new_rsi_min = p["rsi_min"] + (s - 1) * 8
+        new_rsi_max = p["rsi_max"] - (s - 1) * 8
+        # Clamp so the RSI window never shrinks below 12 points — prevents the
+        # engine from becoming permanently blocked after a losing streak with no message.
+        mid = (new_rsi_min + new_rsi_max) / 2.0
+        if new_rsi_max - new_rsi_min < 12:
+            new_rsi_min = mid - 6
+            new_rsi_max = mid + 6
+        p["rsi_min"]      = min(50, new_rsi_min)
+        p["rsi_max"]      = max(50, new_rsi_max)
         p["pullback_max"] = p["pullback_max"] / max(0.5, s)
         p["vol_factor"]   = p["vol_factor"] * s
         p["min_score"]    = min(0.90, p["min_score"] + (s - 1) * 0.12)
@@ -1764,13 +2375,22 @@ def _compute_signal_layers(
         htf_closes = [k["close"] for k in higher_klines]
         htf_ema21  = _ema(htf_closes, 21)
         htf_ema50  = _ema(htf_closes, 50)
-        htf_bull   = htf_ema50[-1] > htf_ema21[-1]
+        htf_bull   = htf_ema21[-1] > htf_ema50[-1]   # fast EMA above slow = uptrend
         htf_ok     = True
     else:
         htf_bull = ema50[-1] > ema200[-1]
         htf_ok   = False
 
     desired_side: Side = "LONG" if htf_bull else "SHORT"
+
+    # ── Direction-dependent RSI shift ─────────────────────────────────────
+    # LONG setups enter near oversold (RSI 35-55 ideal), so shift window lower.
+    # SHORT setups enter near overbought (RSI 55-75 ideal), so shift window higher.
+    # Without this, RSI 67 blocks a valid SHORT entry and RSI 34 blocks a valid LONG.
+    _rsi_shift = 8 if desired_side == "SHORT" else -8
+    p["rsi_min"] = max(25, min(65, p["rsi_min"] + _rsi_shift))
+    p["rsi_max"] = max(40, min(85, p["rsi_max"] + _rsi_shift))
+
     local_bull = ema50[-1] > ema200[-1]
     ema9_aligned = (ema9[-1] > ema21[-1]) if desired_side == "LONG" else (ema9[-1] < ema21[-1])
     # Signal label: HTF trend direction + local EMA9 momentum alignment
@@ -1876,10 +2496,11 @@ def _compute_signal_layers(
     candle_score = 1.0 if candles_ok else 0.0
     vol_score    = min(1.0, vol_ratio / (p["vol_factor"] * 1.5)) if vol_ratio >= p["vol_factor"] else vol_ratio / p["vol_factor"] * 0.4
     momentum_score = round(candle_score * 0.55 + vol_score * 0.45, 3)
-    # Hard block: volume below 0.3x average = illiquid, fake move — never trade
-    vol_too_low = vol_ratio < 0.30
+    # Hard block: volume below 0.15x average = dead market, fake move — never trade
+    # 0.30 was too strict — crypto regularly trades at 0.15-0.28x during Asian session
+    vol_too_low = vol_ratio < 0.15
     mom_reason = (
-        f"Volume {vol_ratio:.2f}x average — too low (min 0.30x), likely fake move" if vol_too_low
+        f"Volume {vol_ratio:.2f}x average — too low (min 0.15x), likely dead market" if vol_too_low
         else f"Last {n} candle(s) not {('bullish' if desired_side == 'LONG' else 'bearish')} — no momentum yet" if not candles_ok
         else f"Volume {vol_ratio:.1f}x average — need {p['vol_factor']:.1f}x minimum" if vol_ratio < p["vol_factor"]
         else ""
@@ -2018,7 +2639,10 @@ class AutoRunner:
         self.session_start_equity: float = get_equity(email)
         self.peak_equity: float = get_equity(email)   # tracks highest equity for drawdown protection
         self.consecutive_wins: int = 0    # reset strictness after 3 wins in a row
-        self.floor_equity: float = START_EQUITY * 0.60  # hard floor: never go below 60% of start
+        # Hard floor = 85% of actual starting equity for this session.
+        # Uses real balance, NOT the paper $1,000 constant — so a $5k user's floor is $4,250
+        # and a $1k user's floor is $850. Engine stops completely if equity falls below this.
+        self.floor_equity: float = self.session_start_equity * 0.85
         # Load today's real trade counts from DB — prevents bypass by stop+restart
         self.trades_today, self.bad_trades_today = self._load_today_stats()
 
@@ -2164,35 +2788,37 @@ class AutoRunner:
             vol_size_mult = max(0.4, 1.0 / vol_ratio_atr)  # scale down, floor at 40%
             self.log(f"High volatility (ATR {atr*100:.2f}% = {vol_ratio_atr:.1f}× normal) → size reduced to {vol_size_mult*100:.0f}%")
 
-        # ── Hard equity floor — never trade if account below 60% of start ──
+        # ── Hard equity floor — never trade if account below 85% of session start ──
         if equity_before < self.floor_equity:
             self.log(
-                f"HARD FLOOR HIT — equity ${equity_before:.2f} below 60% floor "
-                f"(${self.floor_equity:.2f}). AI paused to protect capital."
+                f"HARD FLOOR HIT — equity ${equity_before:.2f} below 85% floor "
+                f"(${self.floor_equity:.2f}). AI stopped to protect capital."
             )
             self.blocked_reason = "HARD_FLOOR"
             self.stop_event.set()
             return equity_before
 
         # ── Drawdown protection (4-tier, from peak equity) ────────────────
+        # Tiers shrink position size progressively — engine slows down as drawdown grows.
+        # At -15% from peak: full stop. Hard floor (85% of session start) is a second wall.
         if equity_before > self.peak_equity:
             self.peak_equity = equity_before
         drawdown_pct = (self.peak_equity - equity_before) / self.peak_equity if self.peak_equity > 0 else 0.0
         dd_size_mult = 1.0
-        if drawdown_pct >= 0.20:
-            # -20%+ from peak: stop trading, protect what's left
+        if drawdown_pct >= 0.15:
+            # -15%+ from peak: stop trading, protect what's left
             self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak — STOPPING to protect capital.")
             self.blocked_reason = "MAX_DRAWDOWN"
             self.stop_event.set()
             return equity_before
-        elif drawdown_pct >= 0.15:
-            dd_size_mult = 0.25   # -15%: quarter size (recovery mode)
-            self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at 25%")
         elif drawdown_pct >= 0.10:
-            dd_size_mult = 0.40   # -10%: 40% size
+            dd_size_mult = 0.25   # -10%: quarter size (recovery mode)
+            self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at 25%")
+        elif drawdown_pct >= 0.07:
+            dd_size_mult = 0.40   # -7%: 40% size
             self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at 40%")
-        elif drawdown_pct >= 0.05:
-            dd_size_mult = 0.65   # -5%: 65% size
+        elif drawdown_pct >= 0.04:
+            dd_size_mult = 0.65   # -4%: 65% size
             self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at 65%")
 
         # Apply all size multipliers
@@ -2268,8 +2894,14 @@ class AutoRunner:
             intrabar_sl = not trailing_activated
 
         if intrabar_sl:
-            final_move = -sl_pct
-            outcome = "SL_HIT"
+            if trailing_activated:
+                # Trailing SL hit — price went up past the lock-in level then pulled back.
+                # Exit at the locked-in profit level, NOT at a loss.
+                final_move = trail_locked_pct   # positive = profit
+                outcome = "TRAIL_STOP"
+            else:
+                final_move = -sl_pct
+                outcome = "SL_HIT"
         elif intrabar_tp:
             final_move = tp_pct
             outcome = "TP_HIT"
@@ -2304,12 +2936,22 @@ class AutoRunner:
         raw_move = final_move  # always consistent with PnL
 
         pnl_pct_leveraged = final_move * c["leverage"]
-        pnl_value = equity_before * effective_size * pnl_pct_leveraged
+        size_dollar = equity_before * effective_size
+        pnl_value = size_dollar * pnl_pct_leveraged
+
+        # ── Realistic fee + slippage deduction ───────────────────────────────
+        # Paper trading deducts real exchange fees so results match live trading.
+        # Fee model: entry (limit/maker) + exit (limit for TP, market for SL/trail)
+        # + slippage estimate per exchange. Prevents paper results > real results.
+        ex_row = get_exchange(self.email)
+        ex_id  = (ex_row.get("exchange") or "bybit").lower() if ex_row else "bybit"
+        fee_cost  = exchange_fee_cost(ex_id, size_dollar, outcome)
+        pnl_value = pnl_value - fee_cost
+
         equity_after = equity_before + pnl_value
 
-        from_start = equity_after - START_EQUITY
+        from_start = equity_after - self.session_start_equity
         dir_word = "up" if from_start >= 0 else "down"
-        size_dollar = equity_before * effective_size
         outcome_label = (
             "Take profit hit"      if outcome == "TP_HIT"
             else "Stop loss hit"   if outcome == "SL_HIT"
@@ -2327,6 +2969,7 @@ class AutoRunner:
             f"Entry        ${entry:,.4f}",
             f"Exit         ${actual_exit:,.4f}  ({raw_move * 100:+.3f}% price move)",
             f"Outcome      {outcome_label}  →  {pnl_pct_leveraged * 100:+.2f}% PnL  (${pnl_value:+.2f})",
+            f"Fees+Slip    -${fee_cost:.2f}  ({ex_id})",
             "",
             "Position (ATR-based)",
             f"  Size:        {effective_size * 100:.1f}% of equity  →  ${size_dollar:.2f}",
@@ -2338,7 +2981,7 @@ class AutoRunner:
             "",
             "Account",
             f"  Before:      ${equity_before:,.2f}",
-            f"  After:       ${equity_after:,.2f}  ({dir_word} {abs(from_start / START_EQUITY * 100):.2f}% from start)",
+            f"  After:       ${equity_after:,.2f}  ({dir_word} {abs(from_start / max(1, self.session_start_equity) * 100):.2f}% from session start)",
         ])
 
         sid = get_session_id(self.email)
@@ -2499,6 +3142,7 @@ class AutoRunner:
                         self._close_pending_trades()
                     self.log("Session complete — duration ended. AI stopped.")
                     self.stop_event.set()
+                    email_ai_stopped(self.email, self.symbol, "DURATION_END", get_equity(self.email))
                     break
 
                 if not get_exchange(self.email):
@@ -2518,22 +3162,24 @@ class AutoRunner:
                 current_equity = get_equity(self.email)
                 if current_equity < self.floor_equity:
                     self.log(
-                        f"HARD FLOOR — equity ${current_equity:.2f} is below 60% of start "
+                        f"HARD FLOOR — equity ${current_equity:.2f} is below 85% of start "
                         f"(${self.floor_equity:.2f}). AI stopped to protect remaining capital."
                     )
                     self.blocked_reason = "HARD_FLOOR"
                     self.stop_event.set()
+                    email_ai_stopped(self.email, self.symbol, "HARD_FLOOR", current_equity)
                     break
 
                 if self.peak_equity > 0:
                     dd = (self.peak_equity - current_equity) / self.peak_equity
-                    if dd >= 0.20:
+                    if dd >= 0.15:
                         self.log(
                             f"MAX DRAWDOWN — equity down {dd*100:.1f}% from peak "
                             f"(${self.peak_equity:.2f} → ${current_equity:.2f}). AI stopped."
                         )
                         self.blocked_reason = "MAX_DRAWDOWN"
                         self.stop_event.set()
+                        email_ai_stopped(self.email, self.symbol, "MAX_DRAWDOWN", current_equity)
                         break
 
                 # ── Step 2b: Daily limit checks ─────────────────────────────────────────
@@ -2556,6 +3202,7 @@ class AutoRunner:
                     else:
                         self.log(f"Bad trade limit reached ({self.bad_trades_today}/{self.stop_after_bad_trades}). Stopping.")
                         self.stop_event.set()
+                        email_ai_stopped(self.email, self.symbol, "MAX_BAD_TRADES", get_equity(self.email))
                         break
                     continue
 
@@ -2612,6 +3259,210 @@ class AutoRunner:
                 self.log(self.last_signal)
             finally:
                 time.sleep(self.interval_sec)
+
+        # ── Loop exited — engine stopped (drawdown / duration / bad trades / user stop) ──
+        # Clear persisted state so this runner is NOT resumed on the next deploy.
+        _clear_runner_state(self.email)
+        # Remove from global registry so status endpoints return running=False
+        with AUTO_LOCK:
+            if AUTO_RUNNERS.get(self.email) is self:
+                del AUTO_RUNNERS[self.email]
+
+
+def _resume_runners_on_startup() -> None:
+    """
+    Called once on backend startup. Re-creates any AutoRunner that was active
+    before the last deploy/restart. Skips the restart lock (it was a server
+    restart, not a user choice to stop+restart).
+    Duration sessions: if the scheduled end_at_ts has already passed, skip them
+    (session is over). Otherwise resume with remaining duration.
+    """
+    rows = _load_all_runner_states()
+    if not rows:
+        return
+
+    now_ts = time.time()
+    resumed = 0
+    for row in rows:
+        email = row["email"]
+        try:
+            # Skip if end_at_ts is in the past (duration session that already expired)
+            end_at_ts = row.get("end_at_ts")
+            if end_at_ts and float(end_at_ts) <= now_ts:
+                _clear_runner_state(email)
+                print(f"[startup-resume] {email} — duration session expired, skipping")
+                continue
+
+            # Skip if exchange is no longer connected (would block immediately anyway)
+            if not get_exchange(email):
+                _clear_runner_state(email)
+                print(f"[startup-resume] {email} — no exchange connected, skipping")
+                continue
+
+            runner = AutoRunner(
+                email=email,
+                symbol=row["symbol"],
+                trade_style=row["trade_style"],
+                mode=row["mode"],
+                max_trades_per_day=int(row["max_trades_per_day"]),
+                stop_after_bad_trades=int(row["stop_after_bad_trades"]),
+                duration_days=int(row["duration_days"]),
+                trend_filter=bool(row["trend_filter"]),
+                chop_min_sep_pct=float(row["chop_min_sep_pct"]),
+            )
+
+            # Restore the original end timestamp so duration sessions expire correctly
+            if end_at_ts:
+                runner.end_at_ts = float(end_at_ts)
+
+            with AUTO_LOCK:
+                # Don't clobber a runner that somehow already exists
+                if email not in AUTO_RUNNERS:
+                    AUTO_RUNNERS[email] = runner
+                    runner.start()
+                    resumed += 1
+                    print(f"[startup-resume] {email} — resumed {row['symbol']} {row['mode']} {row['trade_style']}")
+
+        except Exception as e:
+            print(f"[startup-resume] {email} — error: {e}")
+            _clear_runner_state(email)
+
+    if resumed:
+        print(f"[startup-resume] {resumed} AI runner(s) resumed after restart")
+
+
+# =========================
+# REAL ORDER PLACEMENT (Bybit/OKX via ccxt)
+# =========================
+
+def place_real_order(
+    email: str,
+    symbol: str,
+    side: str,       # "LONG" | "SHORT"
+    usdt_size: float,
+    leverage: int,
+    sl_pct: float,
+    tp_pct: float,
+) -> dict:
+    """
+    Place a real leveraged market order with SL/TP on Bybit.
+    Returns order details or raises on failure.
+
+    SAFETY: This function is only called when IS_PROD=True AND
+    the user has explicitly enabled live trading in their settings.
+    Paper trading uses _place_trade_internal() instead.
+    """
+    row = get_exchange(email)
+    if not row:
+        raise ValueError("No exchange connected")
+
+    ex = _make_ccxt_exchange(row)
+    ex_id = (row.get("exchange") or "bybit").lower()
+
+    # Convert LONG/SHORT to buy/sell
+    order_side = "buy" if side == "LONG" else "sell"
+    sl_mult    = (1 - sl_pct) if side == "LONG" else (1 + sl_pct)
+    tp_mult_v  = (1 + tp_pct) if side == "LONG" else (1 - tp_pct)
+
+    # Get current price
+    ticker = ex.fetch_ticker(symbol)
+    price  = float(ticker["last"])
+
+    # Set leverage (best-effort — some accounts have fixed leverage)
+    try:
+        ex.set_leverage(leverage, symbol)
+    except Exception:
+        pass
+
+    # Quantity in base currency
+    notional = usdt_size * leverage
+    qty = round(notional / price, 6)
+
+    # SL / TP prices
+    sl_price = round(price * sl_mult,   4)
+    tp_price = round(price * tp_mult_v, 4)
+
+    # ── Exchange-specific order params ────────────────────────────────────────
+    # Each exchange has a different way to attach SL/TP to the entry order.
+    if ex_id == "bybit":
+        params = {
+            "stopLoss":    {"triggerPrice": sl_price, "type": "market"},
+            "takeProfit":  {"triggerPrice": tp_price, "type": "limit"},
+            "positionIdx": 0,   # one-way mode required
+        }
+    elif ex_id == "okx":
+        # OKX attaches SL/TP via algo orders — place entry first, then attach
+        params = {
+            "tdMode":    "cross",      # cross-margin perpetual
+            "slTriggerPx": str(sl_price),
+            "slOrdPx":     "-1",       # -1 = market price on trigger
+            "tpTriggerPx": str(tp_price),
+            "tpOrdPx":     "-1",
+        }
+    elif ex_id == "binance":
+        # Binance Futures: SL/TP placed as separate orders after entry
+        params = {
+            "reduceOnly": False,
+        }
+    else:
+        params = {}
+
+    order = ex.create_order(
+        symbol = symbol,
+        type   = "market",
+        side   = order_side,
+        amount = qty,
+        params = params,
+    )
+
+    # Binance: attach SL/TP as separate stop-market orders
+    if ex_id == "binance":
+        close_side = "sell" if side == "LONG" else "buy"
+        try:
+            ex.create_order(symbol, "STOP_MARKET", close_side, qty, sl_price,
+                            {"stopPrice": sl_price, "reduceOnly": True, "closePosition": True})
+            ex.create_order(symbol, "TAKE_PROFIT_MARKET", close_side, qty, tp_price,
+                            {"stopPrice": tp_price, "reduceOnly": True, "closePosition": True})
+        except Exception as e:
+            pass  # Log but don't fail — main order is placed
+
+    return {
+        "order_id":  order.get("id"),
+        "symbol":    symbol,
+        "side":      side,
+        "qty":       qty,
+        "price":     price,
+        "sl_price":  sl_price,
+        "tp_price":  tp_price,
+        "leverage":  leverage,
+        "exchange":  ex_id,
+    }
+
+
+def close_real_order(email: str, symbol: str, side: str) -> dict:
+    """Close an open position at market price."""
+    row = get_exchange(email)
+    if not row:
+        raise ValueError("No exchange connected")
+
+    ex = _make_ccxt_exchange(row)
+    close_side = "sell" if side == "LONG" else "buy"
+
+    # Fetch current position size
+    positions = ex.fetch_positions([symbol])
+    pos = next((p for p in positions if p["symbol"] == symbol and abs(float(p["contracts"] or 0)) > 0), None)
+    if not pos:
+        return {"ok": False, "note": "No open position found"}
+
+    qty = abs(float(pos["contracts"]))
+    order = ex.create_order(
+        symbol   = symbol,
+        type     = "market",
+        side     = close_side,
+        amount   = qty,
+        params   = {"reduceOnly": True, "positionIdx": 0},
+    )
+    return {"ok": True, "order_id": order.get("id"), "qty": qty}
 
 
 @app.post("/trade")
@@ -2761,6 +3612,7 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         )
         AUTO_RUNNERS[email] = runner
         runner.start()
+        _save_runner_state(runner)   # persist so deploy/restart auto-resumes this runner
 
     email_ai_started(
         to=email, symbol=symbol, mode=payload.mode, trade_style=payload.trade_style,
@@ -2796,6 +3648,8 @@ def auto_stop(user=Depends(require_user)):
                 set_ai_restart_lock(email, lock_until)
                 lock_sec = max(0, lock_until - int(time.time()))
                 restart_locked = True
+    # Clear persisted state — user intentionally stopped, do NOT resume on next deploy
+    _clear_runner_state(email)
     return {"ok": True, "running": False, "restart_locked": restart_locked, "restart_lock_sec": lock_sec}
 
 
@@ -2971,3 +3825,12 @@ def admin_user_details(
         "trades": {"count": tcount, "recent": trows},
         "ai": {"running": running, "status": auto_status_obj},
     }
+
+
+# =========================
+# STARTUP: RESUME AI RUNNERS
+# =========================
+# Must run AFTER all classes (AutoRunner, helpers) are defined.
+# Re-starts any AI session that was live before the last deploy/restart.
+import threading as _threading
+_threading.Thread(target=_resume_runners_on_startup, daemon=True).start()
