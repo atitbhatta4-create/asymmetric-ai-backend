@@ -2625,8 +2625,9 @@ class AutoRunner:
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.last_signal: str = "-"
         self.last_side: Side = "LONG"
-        # Set to now so first trade requires a full cooldown — prevents blind trade on start
-        self.last_trade_ts: float = time.time()
+        # Allow first trade after 60s (enough to initialize) — not a full interval wait.
+        # Previous: set to now() which blocked SWING for 4h after every restart.
+        self.last_trade_ts: float = time.time() - self.interval_sec + 60
         self.last_run_ts: float = 0.0
         self.blocked_reason: Optional[str] = None
         self.day_key = dubai_day_key()
