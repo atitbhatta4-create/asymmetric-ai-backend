@@ -2405,10 +2405,17 @@ def _compute_signal_layers(
     desired_side: Side = "LONG" if htf_bull else "SHORT"
 
     # ── Direction-dependent RSI shift ─────────────────────────────────────
-    # LONG setups enter near oversold (RSI 35-55 ideal), so shift window lower.
-    # SHORT setups enter near overbought (RSI 55-75 ideal), so shift window higher.
-    # Without this, RSI 67 blocks a valid SHORT entry and RSI 34 blocks a valid LONG.
-    _rsi_shift = 8 if desired_side == "SHORT" else -8
+    # LONG setups enter near oversold, so shift window lower.
+    # SHORT setups enter near overbought, so shift window higher.
+    # SWING uses a smaller shift — 4h bull trends sustain RSI 65-72 normally,
+    # so a full -8 shift would block valid continuation entries.
+    # SCALP uses full ±8 — 15m candles are noisy, tighter RSI = better entries.
+    _shift_magnitude = {
+        "SCALP":     8,
+        "DAY_TRADE": 6,
+        "SWING":     3,
+    }.get(trade_style, 6)
+    _rsi_shift = _shift_magnitude if desired_side == "SHORT" else -_shift_magnitude
     p["rsi_min"] = max(25, min(65, p["rsi_min"] + _rsi_shift))
     p["rsi_max"] = max(40, min(85, p["rsi_max"] + _rsi_shift))
 
@@ -2706,7 +2713,7 @@ class AutoRunner:
             return 0, 0
 
     def log(self, msg):
-        self.history.appendleft({"t": now_utc_str(), "msg": msg})
+        self.history.appendleft({"t": now_dubai().strftime("%Y-%m-%d %H:%M:%S"), "msg": msg})
 
     def start(self):
         self.log("AI started.")
