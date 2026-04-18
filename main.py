@@ -2330,8 +2330,14 @@ def _compute_signal_layers(
 
     price      = closes[-1]
     atr_pct    = (atr / price) if atr else 0.0
-    avg_vol    = sum(volumes[-21:-1]) / 20 if len(volumes) >= 21 else 0.0
-    vol_ratio  = volumes[-1] / avg_vol if avg_vol > 0 else 0.0
+    # Use volumes[-2] = last COMPLETED candle (OKX returns the in-progress candle
+    # as volumes[-1], which has only partial volume — e.g. 1 minute into a 15m
+    # candle shows 0.07x, making the volume filter block valid setups).
+    # Use median of 40 completed candles as baseline (robust to spike candles
+    # from big moves like BTC 74→77 inflating the mean and blocking normal vol).
+    _vol_window = sorted(volumes[-42:-2]) if len(volumes) >= 42 else sorted(volumes[:-2])
+    avg_vol    = _vol_window[len(_vol_window) // 2] if _vol_window else 0.0
+    vol_ratio  = volumes[-2] / avg_vol if avg_vol > 0 and len(volumes) >= 3 else 0.0
 
     # Apply adaptive strictness for MINI_ASYM
     p = MODE_SIGNAL_PARAMS.get(mode, MODE_SIGNAL_PARAMS["NORMAL"]).copy()
@@ -2341,7 +2347,7 @@ def _compute_signal_layers(
     # mom_n_add=0 for SCALP: MINI_ASYM already requires 1 candle — adding a 2nd
     # blocks too many valid entries in volatile/recovering markets.
     _style_adj = {
-        "SCALP":     dict(pullback_mult=0.40, mom_n_add=0, rsi_tighten=4,  score_add=0.04),
+        "SCALP":     dict(pullback_mult=0.40, mom_n_add=0, rsi_tighten=4,  score_add=0.02),
         "DAY_TRADE": dict(pullback_mult=0.70, mom_n_add=0, rsi_tighten=2,  score_add=0.02),
         "SWING":     dict(pullback_mult=1.20, mom_n_add=0, rsi_tighten=-3, score_add=0.0),
     }
@@ -2498,9 +2504,9 @@ def _compute_signal_layers(
     momentum_score = round(candle_score * 0.55 + vol_score * 0.45, 3)
     # Hard block: volume below 0.15x average = dead market, fake move — never trade
     # 0.30 was too strict — crypto regularly trades at 0.15-0.28x during Asian session
-    vol_too_low = vol_ratio < 0.15
+    vol_too_low = vol_ratio < 0.10
     mom_reason = (
-        f"Volume {vol_ratio:.2f}x average — too low (min 0.15x), likely dead market" if vol_too_low
+        f"Volume {vol_ratio:.2f}x average — too low (min 0.10x), likely dead market" if vol_too_low
         else f"Last {n} candle(s) not {('bullish' if desired_side == 'LONG' else 'bearish')} — no momentum yet" if not candles_ok
         else f"Volume {vol_ratio:.1f}x average — need {p['vol_factor']:.1f}x minimum" if vol_ratio < p["vol_factor"]
         else ""
