@@ -2155,31 +2155,46 @@ def _rsi_series(closes: List[float], period: int = 14) -> List[float]:
 
 def _session_quality(trade_style: str) -> tuple:
     """
-    Returns (quality_score 0.70-1.0, label) — NOT a hard block.
-    Low-liquidity hours reduce the effective score so the signal must be stronger.
-    SCALP during deep low-liq (02:00-06:00 Dubai) is hard-blocked — scalping thin
-    markets is bad practice and the math is unfavorable at 0.60× multiplier.
-    Dubai timezone (UTC+4):
-      02:00-06:00 → score 0.0  (SCALP hard-block; DAY_TRADE/SWING: 0.72)
-      06:00-09:00 → score 0.80 (early morning, partial liquidity)
-      09:00-13:00 → score 0.90 (Asia open, decent liquidity)
-      13:00-01:00 → score 1.00 (London + NY, best liquidity)
-      01:00-02:00 → score 0.82 (NY close wind-down)
+    Session quality multiplier — maps real market sessions to Dubai time (UTC+4).
+    Higher score = more liquidity = signal threshold easier to meet.
+    SCALP is hard-blocked 02:00-06:00 (dead zone, thin market).
+
+    Dubai (UTC+4) session schedule:
+      02:00–06:00 → Dead zone (Asia asleep, US closed)        → SCALP: 0.0, others: 0.72
+      06:00–12:00 → Asia / Tokyo session                      → 0.85
+      12:00–16:00 → London open (big moves start)             → 0.95
+      16:00–21:00 → London + NY overlap (BEST — peak volume)  → 1.00
+      21:00–01:00 → NY session solo                           → 0.92
+      01:00–02:00 → NY close / wind-down                      → 0.80
     """
     if trade_style == "SWING":
         return 1.0, "swing"
     hour = now_dubai().hour
+
+    # Dead zone — thin market, wide spreads, low volume
     if 2 <= hour < 6:
         if trade_style == "SCALP":
-            return 0.0, f"scalp-blocked {hour:02d}:xx (thin market 02-06 Dubai)"
-        return 0.72, f"low-liq {hour:02d}:xx"
-    if 6 <= hour < 9:
-        return 0.80, f"early {hour:02d}:xx"
-    if 9 <= hour < 13:
-        return 0.90, f"Asia {hour:02d}:xx"
-    if 1 <= hour < 2:
-        return 0.82, f"NY-close {hour:02d}:xx"
-    return 1.00, f"active {hour:02d}:xx"
+            return 0.0, f"scalp-blocked {hour:02d}:xx (dead zone 02-06 Dubai)"
+        return 0.72, f"dead-zone {hour:02d}:xx"
+
+    # Asia / Tokyo session — decent crypto liquidity
+    if 6 <= hour < 12:
+        return 0.85, f"Asia {hour:02d}:xx"
+
+    # London open — institutions enter, volume spikes, big directional moves
+    if 12 <= hour < 16:
+        return 0.95, f"London {hour:02d}:xx"
+
+    # London + NY overlap — peak volume, best setups, highest probability
+    if 16 <= hour < 21:
+        return 1.00, f"London+NY {hour:02d}:xx"
+
+    # NY solo session — still active, good liquidity
+    if 21 <= hour <= 23:
+        return 0.92, f"NY {hour:02d}:xx"
+
+    # NY close / wind-down (01:00-02:00)
+    return 0.80, f"NY-close {hour:02d}:xx"
 
 
 def _ema_spread_trend(ema_fast: List[float], ema_slow: List[float], n: int = 4) -> tuple:
