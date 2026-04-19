@@ -3313,6 +3313,11 @@ class AutoRunner:
                 # ── Step 3: 4-layer signal analysis ─────────────────────────────────────
                 res = self._signal_and_filters()
                 self.last_signal = res.get("signal") or "-"
+                # Always reflect the HTF-computed direction, even when blocked.
+                # Without this, last_side stays at "LONG" init default forever
+                # and the status bar shows the wrong side while direction is blocked.
+                if res.get("side"):
+                    self.last_side = res["side"]
                 if not res.get("ok"):
                     self.blocked_reason = res.get("blocked") or "BLOCKED"
                     self.log(f"Blocked: {self.blocked_reason[:100]}")
@@ -3321,7 +3326,6 @@ class AutoRunner:
 
                 self.blocked_reason = None
                 desired_side: Side = res["side"]
-                self.last_side = desired_side
 
                 now_ts = time.time()
                 # After a bad trade wait 2× the normal cooldown before entering again
