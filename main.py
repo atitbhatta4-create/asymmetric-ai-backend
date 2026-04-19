@@ -2483,9 +2483,8 @@ def _compute_signal_layers(
     _DIR_PASS = 0.65
     dir_reason = (
         "" if direction_score >= _DIR_PASS
-        else "EMA spread narrowing — trend losing momentum, wait for re-acceleration" if not spread_widening and htf_aligned and local_aligned
-        else f"{'4h' if htf_ok else 'Higher TF'} trend {'bearish' if desired_side == 'LONG' else 'bullish'} — only trade WITH the trend"
-        if not htf_aligned
+        else "EMA spread narrowing — trend losing momentum, wait for re-acceleration" if not spread_widening and htf_score > 0.5 and local_aligned
+        else "HTF trend weak — EMAs nearly crossed, wait for stronger separation" if htf_score < 0.30
         else f"Price {'below' if desired_side == 'LONG' else 'above'} EMA50 — wait for local trend to confirm"
     )
     breakdown_direction = {
