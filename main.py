@@ -2908,7 +2908,17 @@ class AutoRunner:
         sl_price = entry * (1 - sl_pct) if side == "LONG" else entry * (1 + sl_pct)
         tp_price = entry * (1 + tp_pct) if side == "LONG" else entry * (1 - tp_pct)
 
-        intrabar_sl = candle_high > 0 and (
+        # Breakeven SL uses CLOSE price only — not the wick.
+        # A normal SL (real capital at risk) triggers on intrabar wick: your broker
+        # fills the stop the moment price touches it, even on a wick.
+        # A breakeven SL is different: its purpose is "exit if the trade goes to a
+        # net loss." A wick below entry that closes back above is NOT a net loss.
+        # Using wick for breakeven causes T2 to be stopped out of strong trending
+        # trades by a single tick below entry, leaving profit on the table.
+        # Fix: skip intrabar check when breakeven is active — the close-based
+        # branch below handles it correctly (exits only if close < entry).
+        _is_breakeven_sl = pt.get("breakeven", False) or sl_pct <= 0.0002
+        intrabar_sl = (not _is_breakeven_sl) and candle_high > 0 and (
             (side == "LONG"  and candle_low  <= sl_price) or
             (side == "SHORT" and candle_high >= sl_price)
         )
