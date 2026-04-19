@@ -2670,7 +2670,9 @@ class AutoRunner:
         self.interval_sec = sp["interval"]
         self.mode = mode
         self.max_trades_per_day = int(max(0, max_trades_per_day))
-        self.stop_after_bad_trades = int(max(0, stop_after_bad_trades))
+        # Minimum of 1 — 0 would disable bad-trade protection entirely.
+        # Users can raise the limit but cannot turn it off completely via parameter.
+        self.stop_after_bad_trades = int(max(1, stop_after_bad_trades))
         self.duration_days = int(max(0, duration_days))
         self.trend_filter = bool(trend_filter)
         self.chop_min_sep_pct = float(max(0.0, chop_min_sep_pct))
