@@ -2445,11 +2445,29 @@ def _compute_signal_layers(
     }
 
     # ── Layer 2: Direction — higher TF trend + local confirmation + spread ──
-    htf_aligned   = htf_bull if desired_side == "LONG" else not htf_bull
+    #
+    # BUG FIXED: htf_aligned was a tautology.
+    #   desired_side = "LONG" if htf_bull else "SHORT"
+    #   htf_aligned  = htf_bull if desired_side=="LONG" else not htf_bull
+    #   → always True regardless of market — htf_score was always 1.0.
+    #
+    # Fix: replace the self-referential check with an actual quality measure.
+    # htf_score now reflects HOW STRONG the trend is (EMA spread size),
+    # not whether the trend agrees with itself (which is trivially always true).
     local_aligned = (local_bull and price > ema50[-1]) if desired_side == "LONG" else (not local_bull and price < ema50[-1])
-    htf_score     = 1.0 if htf_aligned else 0.0
-    # local_score = 0.0 when not aligned (was 0.4 — that gave free credit, letting
-    # direction pass at ~62% even when local price action was against the trend).
+
+    if htf_ok:
+        # Real 4h data: score by EMA21-EMA50 separation as % of price.
+        # Near-zero spread = EMAs just crossed or ranging = low conviction.
+        # 1.0%+ spread = established trend = full conviction.
+        # BTC 4h typical: 0.1% (just crossed) → 1-3% (strong trend).
+        _htf_spread = abs(htf_ema21[-1] - htf_ema50[-1]) / max(htf_ema50[-1], 1e-9)
+        htf_score = min(1.0, _htf_spread / 0.010)   # 0%→0.0, 1.0%+→1.0
+    else:
+        # Fallback to local EMAs (less reliable) — cap at 0.5
+        htf_score = 0.4
+
+    # local_score = 0.0 when not aligned (was 0.4 — gave free credit even against trend).
     local_score   = 1.0 if local_aligned else 0.0
     ema9_bonus    = 0.20 if ema9_aligned else 0.0
 
