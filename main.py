@@ -3657,7 +3657,12 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
     symbol = payload.symbol.upper().strip()
     if not (symbol.endswith("USDT") or symbol.endswith("-USDT")):
         raise HTTPException(status_code=400, detail="Use symbol like BTCUSDT / ETHUSDT / SOLUSDT")
-    max_trades = payload.max_trades_per_day if payload.max_trades_per_day is not None else default_max_trades_per_day(payload.mode)
+    # Mode ceiling is the maximum allowed — user may reduce but never exceed.
+    _mode_max = default_max_trades_per_day(payload.mode)
+    if payload.max_trades_per_day is not None:
+        max_trades = min(int(payload.max_trades_per_day), _mode_max)
+    else:
+        max_trades = _mode_max
 
     # ── Check 1: Duration-session restart lock ──────────────────────────────
     now_ts = int(time.time())
