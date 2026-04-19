@@ -2448,7 +2448,9 @@ def _compute_signal_layers(
     htf_aligned   = htf_bull if desired_side == "LONG" else not htf_bull
     local_aligned = (local_bull and price > ema50[-1]) if desired_side == "LONG" else (not local_bull and price < ema50[-1])
     htf_score     = 1.0 if htf_aligned else 0.0
-    local_score   = 1.0 if local_aligned else 0.4
+    # local_score = 0.0 when not aligned (was 0.4 — that gave free credit, letting
+    # direction pass at ~62% even when local price action was against the trend).
+    local_score   = 1.0 if local_aligned else 0.0
     ema9_bonus    = 0.20 if ema9_aligned else 0.0
 
     # EMA spread widening = trend accelerating = better entry quality
@@ -2457,12 +2459,16 @@ def _compute_signal_layers(
     direction_score = round(min(1.0,
         htf_score * 0.45 + local_score * 0.25 + ema9_bonus * 0.15 + spread_score * 0.15
     ), 3)
+    # Threshold raised 0.55 → 0.65: requires meaningful local + HTF agreement.
+    # At 0.55, HTF alone (0.45) + neutral spread (0.075) = 0.525 could barely pass.
+    # At 0.65, you need at least HTF confirmed + local OR HTF + ema9 + good spread.
+    _DIR_PASS = 0.65
     dir_reason = (
-        "" if direction_score >= 0.55
+        "" if direction_score >= _DIR_PASS
         else "EMA spread narrowing — trend losing momentum, wait for re-acceleration" if not spread_widening and htf_aligned and local_aligned
         else f"{'4h' if htf_ok else 'Higher TF'} trend {'bearish' if desired_side == 'LONG' else 'bullish'} — only trade WITH the trend"
         if not htf_aligned
-        else f"Price {'below' if desired_side == 'LONG' else 'above'} EMA50 — wait for trend to establish locally"
+        else f"Price {'below' if desired_side == 'LONG' else 'above'} EMA50 — wait for local trend to confirm"
     )
     breakdown_direction = {
         "htf_trend": "BULL" if htf_bull else "BEAR",
@@ -2471,7 +2477,7 @@ def _compute_signal_layers(
         "ema9_momentum": "aligned" if ema9_aligned else "not aligned",
         "ema_spread": "widening" if spread_widening else "narrowing",
         "signal": sig, "side": desired_side,
-        "score": direction_score, "ok": direction_score >= 0.55, "reason": dir_reason,
+        "score": direction_score, "ok": direction_score >= _DIR_PASS, "reason": dir_reason,
     }
 
     # ── Layer 3: Entry — pullback + candle pattern + RSI + divergence check ──
