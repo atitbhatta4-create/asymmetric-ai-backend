@@ -2521,10 +2521,16 @@ def _compute_signal_layers(
         max(0.0, pullback_score * 0.35 + pattern_score * 0.35 + rsi_score * 0.30 - div_penalty),
         3,
     )
+    # against_trend: last candle closed against the trade direction at the entry zone.
+    # This is a hard block — not a soft penalty. If price is pulling back INTO
+    # the EMA21 zone but the last candle is still bearish on a LONG setup,
+    # the entry is not ready yet. Wait for a bullish close to confirm the bounce.
+    against_trend_candle = pattern_name == "against_trend"
     ent_reason = (
         f"RSI divergence — price at new extreme but RSI disagrees, trend may be weakening" if div_detected
         else f"Price {pb_pct*100:.1f}% from EMA21 — need <{p['pullback_max']*100:.1f}% to enter" if pullback_score == 0
         else f"RSI {rsi:.0f} outside entry zone {p['rsi_min']}–{p['rsi_max']}" if not rsi_in_range
+        else f"Candle closed against trade direction — wait for {'bullish' if desired_side == 'LONG' else 'bearish'} close to confirm bounce" if against_trend_candle
         else f"Candle pattern weak ({pattern_name}) — wait for pin bar or engulfing at EMA21" if pattern_score < 0.40
         else ""
     )
@@ -2536,7 +2542,8 @@ def _compute_signal_layers(
         "rsi":                round(rsi or 0, 1),
         "rsi_range":          f"{p['rsi_min']}–{p['rsi_max']}",
         "rsi_divergence":     div_detected,
-        "score": entry_score, "ok": entry_score > 0.25, "reason": ent_reason,
+        # against_trend is a hard fail regardless of RSI/pullback quality
+        "score": entry_score, "ok": entry_score > 0.25 and not against_trend_candle, "reason": ent_reason,
     }
 
     # ── Layer 4: Momentum — candle alignment + volume confirmation ────────
