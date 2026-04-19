@@ -2838,15 +2838,29 @@ class AutoRunner:
             sl_pct = 0.0001  # near-zero SL at entry price — can only lose a tiny bit
 
         # ── Volatility-adjusted sizing ────────────────────────────────────
-        # When ATR is elevated (news / high volatility), reduce position size
-        # to keep the dollar-risk-per-trade roughly constant.
-        # Normal ATR for BTC 15m ≈ 0.3–0.5%. Above 1.0% = high volatility.
-        atr_normal = sp.get("sl_max", 1.5) / 100.0 / sp["sl_atr"]  # implied normal ATR
+        # When ATR is elevated vs the typical range for this timeframe, reduce
+        # position size so dollar-risk-per-trade stays roughly constant.
+        #
+        # BUG FIXED: atr_normal was derived from sl_max/sl_atr — a constant
+        # formula from static parameters, not from observed market ATR.
+        # SCALP: sl_max=1.5/sl_atr=0.8 → atr_normal=1.875%. Threshold = 2.8%.
+        # BTC 15m real ATR = 0.3–0.5%, so the trigger (2.8%) was never reached.
+        # Volatility sizing was effectively dead code in normal conditions.
+        #
+        # Fix: use empirical per-timeframe baselines from BTC historical ATR.
+        # These are the typical quiet-session ATRs — 1.5× of these = elevated.
+        _ATR_BASELINE = {
+            "15m": 0.0040,   # 0.40% — typical BTC 15m ATR in normal conditions
+            "1h":  0.0090,   # 0.90% — typical BTC 1h ATR
+            "4h":  0.0180,   # 1.80% — typical BTC 4h ATR
+            "1d":  0.0350,   # 3.50% — typical BTC 1d ATR
+        }
+        atr_normal = _ATR_BASELINE.get(self.tf, 0.0050)
         vol_ratio_atr = atr / atr_normal if atr_normal > 0 else 1.0
         vol_size_mult = 1.0
         if vol_ratio_atr > 1.5:
             vol_size_mult = max(0.4, 1.0 / vol_ratio_atr)  # scale down, floor at 40%
-            self.log(f"High volatility (ATR {atr*100:.2f}% = {vol_ratio_atr:.1f}× normal) → size reduced to {vol_size_mult*100:.0f}%")
+            self.log(f"High volatility (ATR {atr*100:.2f}% = {vol_ratio_atr:.1f}× normal {atr_normal*100:.2f}%) → size reduced to {vol_size_mult*100:.0f}%")
 
         # ── Hard equity floor — never trade if account below 85% of session start ──
         if equity_before < self.floor_equity:
