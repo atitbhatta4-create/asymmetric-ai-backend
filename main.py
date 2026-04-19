@@ -2932,9 +2932,18 @@ class AutoRunner:
         #   Price reaches 40% of TP  → SL trails to break-even (entry)
         #   Price reaches 70% of TP  → SL trails to +50% of SL locked in
         #   Price reaches 100% of TP → TP_HIT (handled above)
-        # The trail SL is 1×ATR behind the best price reached in the candle.
-        best_price = candle_high if (side == "LONG" and candle_high > 0) else candle_low if candle_high > 0 else exit_price
-        best_move  = (best_price - entry) / entry if side == "LONG" else (entry - best_price) / entry
+        #
+        # RATCHET FIX: best_move uses LIFETIME peak, not just current candle.
+        # Previously trail_locked_pct reset to 0.0 every interval — if price
+        # reached 70% of TP in candle 1 then retraced in candle 2, the profit
+        # lock was forgotten and the original SL came back into effect.
+        # Fix: persist peak move in pt["trail_best_move"] — can only increase.
+        candle_best = candle_high if (side == "LONG" and candle_high > 0) else candle_low if candle_high > 0 else exit_price
+        candle_best_move = (candle_best - entry) / entry if side == "LONG" else (entry - candle_best) / entry
+        # Ratchet: only ever move forward
+        lifetime_best_move = max(float(pt.get("trail_best_move", 0.0)), candle_best_move)
+        pt["trail_best_move"] = lifetime_best_move   # persist for next interval
+        best_move = lifetime_best_move
 
         trailing_activated = False
         trail_locked_pct   = 0.0   # how much profit is locked in
@@ -2948,6 +2957,16 @@ class AutoRunner:
                 # At break-even trigger — SL moves to entry
                 trail_locked_pct  = 0.0
                 trailing_activated = True
+
+        # Ratchet: if a profit lock was established in a prior candle, keep it
+        # even if the current candle didn't re-reach the trigger threshold.
+        _prev_locked = float(pt.get("trail_locked_pct", 0.0))
+        if _prev_locked > 0.0 and not trailing_activated:
+            trail_locked_pct   = _prev_locked
+            trailing_activated = True
+        # Locked profit can only increase (ratchet forward, never backward)
+        trail_locked_pct = max(trail_locked_pct, _prev_locked)
+        pt["trail_locked_pct"] = trail_locked_pct   # persist for next interval
 
         if trailing_activated:
             # New SL is at (entry + locked profit) — anything above this is safe
