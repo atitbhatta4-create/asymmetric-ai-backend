@@ -1897,6 +1897,310 @@ def trades(
     return {"trades": [dict(r) for r in rows]}
 
 
+@app.get("/portfolio/stats")
+def portfolio_stats(user=Depends(require_user)):
+    import statistics as _st
+    from datetime import timezone as _tz, timedelta as _td
+
+    email = user["email"]
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM trades WHERE email = %s ORDER BY time ASC", (email,))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+
+    if not rows:
+        return {"empty": True}
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+    def _parse_dt(s):
+        s = str(s).strip()
+        iso = s if "T" in s else s.replace(" ", "T")
+        if not iso.endswith("Z"):
+            iso += "Z"
+        try:
+            from datetime import datetime as _dt
+            return _dt.fromisoformat(iso.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _dubai_hour(s):
+        dt = _parse_dt(s)
+        if not dt:
+            return -1
+        return (dt + _td(hours=4)).hour
+
+    def _session(h):
+        if 2 <= h < 6:   return "Dead"
+        if 6 <= h < 12:  return "Asia"
+        if 12 <= h < 16: return "London"
+        if 16 <= h < 21: return "London+NY"
+        if 21 <= h <= 23: return "NY"
+        return "NY-close"
+
+    def _style(reason):
+        r = str(reason or "")
+        if "Scalp" in r or "SCALP" in r: return "SCALP"
+        if "Swing" in r or "SWING" in r: return "SWING"
+        return "DAY_TRADE"
+
+    def _grade(reason):
+        return "B" if "Grade B" in str(reason or "") else "A"
+
+    # ── base arrays ───────────────────────────────────────────────────────────
+    pnls     = [float(t["unreal_pnl_value"])   for t in rows]
+    pnl_pcts = [float(t["unreal_pnl_percent"]) for t in rows]
+    total    = len(rows)
+    wins     = [t for t in rows if float(t["unreal_pnl_value"]) >= 0]
+    losses   = [t for t in rows if float(t["unreal_pnl_value"]) <  0]
+    win_rate = len(wins) / total if total else 0
+    total_pnl = sum(pnls)
+
+    # ── equity + drawdown curve ───────────────────────────────────────────────
+    first_eq = float(rows[0]["equity_after"]) - pnls[0]
+    eq_curve = [{"time": str(rows[0]["time"]), "equity": round(first_eq, 2)}]
+    for t in rows:
+        eq_curve.append({"time": str(t["time"]), "equity": round(float(t["equity_after"]), 2)})
+
+    peak = eq_curve[0]["equity"]
+    max_dd = 0.0
+    dd_curve = [{"time": eq_curve[0]["time"], "dd": 0.0}]
+    for pt in eq_curve[1:]:
+        if pt["equity"] > peak:
+            peak = pt["equity"]
+        dd = (peak - pt["equity"]) / peak if peak > 0 else 0.0
+        max_dd = max(max_dd, dd)
+        dd_curve.append({"time": pt["time"], "dd": round(-dd * 100, 3)})
+
+    # ── avg R/R ───────────────────────────────────────────────────────────────
+    win_p  = [abs(p) for p in pnl_pcts if p >= 0]
+    loss_p = [abs(p) for p in pnl_pcts if p <  0]
+    avg_rr = ((_st.mean(win_p) if win_p else 0) / (_st.mean(loss_p) if loss_p else 1))
+
+    # ── monthly P&L ───────────────────────────────────────────────────────────
+    monthly: dict = {}
+    for t in rows:
+        dt = _parse_dt(t["time"])
+        if not dt:
+            continue
+        key = dt.strftime("%Y-%m")
+        if key not in monthly:
+            monthly[key] = {"month": key, "pnl": 0.0, "trades": 0, "wins": 0}
+        monthly[key]["pnl"]    += float(t["unreal_pnl_value"])
+        monthly[key]["trades"] += 1
+        if float(t["unreal_pnl_value"]) >= 0:
+            monthly[key]["wins"] += 1
+    monthly_list = sorted(monthly.values(), key=lambda x: x["month"])
+    for m in monthly_list:
+        m["pnl"] = round(m["pnl"], 2)
+    best_month  = max(monthly_list, key=lambda x: x["pnl"])  if monthly_list else None
+    worst_month = min(monthly_list, key=lambda x: x["pnl"]) if monthly_list else None
+
+    # ── current streak ────────────────────────────────────────────────────────
+    streak_type  = "W" if pnls[-1] >= 0 else "L"
+    streak_count = 0
+    for p in reversed(pnls):
+        if (p >= 0) == (streak_type == "W"):
+            streak_count += 1
+        else:
+            break
+
+    # ── session distribution ──────────────────────────────────────────────────
+    sessions: dict = {}
+    for t in rows:
+        h = _dubai_hour(t["time"])
+        if h < 0:
+            continue
+        s = _session(h)
+        if s not in sessions:
+            sessions[s] = {"trades": 0, "wins": 0, "pnl": 0.0}
+        sessions[s]["trades"] += 1
+        pv = float(t["unreal_pnl_value"])
+        sessions[s]["pnl"]  += pv
+        if pv >= 0:
+            sessions[s]["wins"] += 1
+    for s in sessions.values():
+        s["win_rate"] = round(s["wins"] / s["trades"] * 100, 1) if s["trades"] else 0
+        s["pnl"] = round(s["pnl"], 2)
+
+    # ── grade distribution ────────────────────────────────────────────────────
+    grades: dict = {"A": 0, "B": 0}
+    for t in rows:
+        g = _grade(t.get("reason"))
+        grades[g] = grades.get(g, 0) + 1
+
+    # ── symbol breakdown ──────────────────────────────────────────────────────
+    syms: dict = {}
+    for t in rows:
+        sym = t["symbol"]
+        if sym not in syms:
+            syms[sym] = {"symbol": sym, "trades": 0, "wins": 0, "pnl": 0.0}
+        syms[sym]["trades"] += 1
+        pv = float(t["unreal_pnl_value"])
+        syms[sym]["pnl"] += pv
+        if pv >= 0:
+            syms[sym]["wins"] += 1
+    sym_list = sorted(syms.values(), key=lambda x: -x["trades"])
+    for s in sym_list:
+        s["win_rate"] = round(s["wins"] / s["trades"] * 100, 1) if s["trades"] else 0
+        s["pnl"] = round(s["pnl"], 2)
+
+    # ── mode breakdown ────────────────────────────────────────────────────────
+    modes: dict = {}
+    for t in rows:
+        m = t["mode"]
+        if m not in modes:
+            modes[m] = {"mode": m, "trades": 0, "wins": 0, "pnl": 0.0}
+        modes[m]["trades"] += 1
+        pv = float(t["unreal_pnl_value"])
+        modes[m]["pnl"] += pv
+        if pv >= 0:
+            modes[m]["wins"] += 1
+    mode_list = sorted(modes.values(), key=lambda x: -x["trades"])
+    for m in mode_list:
+        m["win_rate"] = round(m["wins"] / m["trades"] * 100, 1) if m["trades"] else 0
+        m["pnl"] = round(m["pnl"], 2)
+
+    # ── style breakdown ───────────────────────────────────────────────────────
+    stls: dict = {}
+    hold_map = {"SCALP": "~15m", "DAY_TRADE": "~1–2h", "SWING": "~4–12h"}
+    for t in rows:
+        st = _style(t.get("reason"))
+        if st not in stls:
+            stls[st] = {"style": st, "trades": 0, "wins": 0, "pnl": 0.0}
+        stls[st]["trades"] += 1
+        pv = float(t["unreal_pnl_value"])
+        stls[st]["pnl"] += pv
+        if pv >= 0:
+            stls[st]["wins"] += 1
+    style_list = sorted(stls.values(), key=lambda x: -x["trades"])
+    for s in style_list:
+        s["win_rate"] = round(s["wins"] / s["trades"] * 100, 1) if s["trades"] else 0
+        s["pnl"] = round(s["pnl"], 2)
+        s["avg_hold"] = hold_map.get(s["style"], "~1h")
+
+    # ── time heatmap (Dubai hour) ─────────────────────────────────────────────
+    heatmap: dict = {h: {"wins": 0, "losses": 0} for h in range(24)}
+    for t in rows:
+        h = _dubai_hour(t["time"])
+        if h < 0:
+            continue
+        if float(t["unreal_pnl_value"]) >= 0:
+            heatmap[h]["wins"]   += 1
+        else:
+            heatmap[h]["losses"] += 1
+
+    # ── best / worst trade ────────────────────────────────────────────────────
+    best_trade  = max(rows, key=lambda t: float(t["unreal_pnl_value"]))
+    worst_trade = min(rows, key=lambda t: float(t["unreal_pnl_value"]))
+
+    # ── consistency & health scores ───────────────────────────────────────────
+    if len(pnls) > 1:
+        mean_abs = _st.mean(abs(p) for p in pnls)
+        std_pnl  = _st.stdev(pnls)
+        cv       = std_pnl / mean_abs if mean_abs > 0 else 2.0
+        consistency_score = max(0, min(100, int(100 - cv * 25)))
+    else:
+        consistency_score = 50
+
+    wr_pts   = min(40, int(win_rate * 80))
+    dd_pts   = max(0, int(30 * (1 - max_dd / 0.20)))
+    con_pts  = int(consistency_score * 0.30)
+    health_score = min(100, wr_pts + dd_pts + con_pts)
+
+    # ── daily returns → Sharpe / Sortino / Calmar ────────────────────────────
+    daily: dict = {}
+    for t in rows:
+        dt = _parse_dt(t["time"])
+        if not dt:
+            continue
+        key = dt.strftime("%Y-%m-%d")
+        daily[key] = daily.get(key, 0.0) + float(t["unreal_pnl_percent"])
+    daily_rets = list(daily.values())
+
+    sharpe = sortino = calmar = 0.0
+    if len(daily_rets) >= 2:
+        mean_dr  = _st.mean(daily_rets)
+        std_dr   = _st.stdev(daily_rets)
+        neg_rets = [r for r in daily_rets if r < 0]
+        sor_std  = _st.stdev(neg_rets) if len(neg_rets) > 1 else std_dr
+        if std_dr:
+            sharpe  = round(mean_dr * (365 ** 0.5) / std_dr, 2)
+        if sor_std:
+            sortino = round(mean_dr * (365 ** 0.5) / sor_std, 2)
+        eq_start = eq_curve[0]["equity"]
+        eq_end   = eq_curve[-1]["equity"]
+        days     = max(1, len(daily_rets))
+        ann_ret  = ((eq_end / eq_start) ** (365 / days) - 1) * 100 if eq_start > 0 else 0
+        if max_dd > 0.001:
+            calmar = round(ann_ret / (max_dd * 100), 2)
+
+    # ── mistake detection ─────────────────────────────────────────────────────
+    mistakes = []
+    eligible_sess = [(k, v) for k, v in sessions.items() if v["trades"] >= 2]
+    if eligible_sess:
+        worst_s = min(eligible_sess, key=lambda x: x[1]["win_rate"])
+        if worst_s[1]["win_rate"] < 40:
+            mistakes.append(
+                f"Most losses during {worst_s[0]} session "
+                f"({worst_s[1]['win_rate']:.0f}% win rate)"
+            )
+    eligible_modes = [m for m in mode_list if m["trades"] >= 2]
+    if eligible_modes:
+        worst_m = min(eligible_modes, key=lambda x: x["win_rate"])
+        if worst_m["win_rate"] < win_rate * 100 * 0.8:
+            mistakes.append(
+                f"{worst_m['mode']} underperformed "
+                f"({worst_m['win_rate']:.0f}% vs {win_rate*100:.0f}% avg)"
+            )
+    if not mistakes:
+        mistakes.append("No significant loss pattern detected yet — keep trading!")
+
+    # ── AI summary sentence ───────────────────────────────────────────────────
+    streak_str = f"{streak_count} consecutive {'win' if streak_type=='W' else 'loss'}{'s' if streak_count!=1 else ''}"
+    best_s_name = max(sessions.items(), key=lambda x: x[1]["win_rate"])[0] if sessions else None
+    summary_parts = [
+        f"{streak_str}",
+        f"{win_rate*100:.0f}% win rate over {total} trades",
+        f"{'Up' if total_pnl >= 0 else 'Down'} ${abs(total_pnl):.2f} all time",
+    ]
+    if best_s_name:
+        summary_parts.append(f"Best during {best_s_name} session")
+    ai_summary = " · ".join(summary_parts)
+
+    return {
+        "empty": False,
+        "summary": {
+            "total_pnl":        round(total_pnl, 2),
+            "total_trades":     total,
+            "win_rate":         round(win_rate * 100, 1),
+            "avg_rr":           round(avg_rr, 2),
+            "best_month":       best_month,
+            "worst_month":      worst_month,
+            "current_streak":   {"type": streak_type, "count": streak_count},
+            "max_drawdown":     round(max_dd * 100, 2),
+            "health_score":     health_score,
+            "consistency_score": consistency_score,
+        },
+        "equity_curve":        eq_curve,
+        "drawdown_curve":      dd_curve,
+        "monthly_pnl":         monthly_list,
+        "session_distribution": sessions,
+        "grade_distribution":  grades,
+        "symbol_breakdown":    sym_list[:10],
+        "mode_breakdown":      mode_list,
+        "style_breakdown":     style_list,
+        "time_heatmap":        heatmap,
+        "best_trade":          dict(best_trade),
+        "worst_trade":         dict(worst_trade),
+        "ai_summary":          ai_summary,
+        "mistake_detection":   mistakes,
+        "ratios":              {"sharpe": sharpe, "sortino": sortino, "calmar": calmar},
+        "most_traded_symbol":  sym_list[0]["symbol"] if sym_list else "-",
+    }
+
+
 async def _place_trade_internal(
     email: str,
     symbol: str,
