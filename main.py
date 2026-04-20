@@ -3023,8 +3023,18 @@ class AutoRunner:
                 final_move = tp_pct
                 outcome = "TP_HIT"
             else:
-                final_move = raw_move
-                outcome = "NATURAL_CLOSE"
+                # Multi-candle hold: close price is between SL and TP — keep position open.
+                # Update trailing/breakeven state (already written to pt dict above),
+                # then return None so _close_pending_trades keeps this trade alive.
+                candles_held_so_far = int(
+                    (time.time() - pt.get("open_ts", time.time())) / self.interval_sec
+                )
+                self.log(
+                    f"Holding ({side} @ {entry:.4f}) — candle {candles_held_so_far + 1} | "
+                    f"close {exit_price:.4f} ({((exit_price - entry)/entry if side=='LONG' else (entry - exit_price)/entry)*100:+.3f}%) | "
+                    f"SL={sl_price:.4f}  TP={tp_price:.4f}"
+                )
+                return None
 
         # Use the actual SL/TP price for display and DB when those levels were hit,
         # not the raw candle close — otherwise exit price and PnL are inconsistent.
@@ -3159,12 +3169,12 @@ class AutoRunner:
         return equity_after
 
     def _close_pending_trades(self) -> None:
-        """Close all pending trades (1 for Grade A, 2 for Grade B).
-        Uses intrabar high/low to realistically check SL/TP during the interval."""
+        """Evaluate pending trades each interval (multi-candle).
+        A trade stays alive until SL, TP, or trailing stop is hit.
+        Only then is it removed from pending_trades and written to DB."""
         if not self.pending_trades:
             return
         try:
-            # Get the latest candle to check intrabar SL/TP
             klines = _fetch_klines_sync(self.symbol, self.tf, limit=10)
             if klines:
                 last_candle = klines[-1]
@@ -3172,25 +3182,39 @@ class AutoRunner:
                 candle_low  = last_candle["low"]
                 exit_price  = last_candle["close"]
             else:
-                exit_price = self._fetch_price_sync(self.symbol)
+                exit_price  = self._fetch_price_sync(self.symbol)
                 candle_high = exit_price
                 candle_low  = exit_price
 
+            still_open: List[Dict] = []
             t1_won = False
-            for pt in list(self.pending_trades):
-                # Break-even: if T2 has breakeven_after_t1 flag and T1 won, SL moves to entry
+
+            for pt in self.pending_trades:
+                # If T1 hit TP this candle or earlier, move T2 SL to breakeven
                 if pt.get("breakeven_after_t1") and t1_won:
-                    pt = {**pt, "breakeven": True}
+                    pt["breakeven"] = True   # in-place — persists across candles
+
                 eq = get_equity(self.email)
-                outcome_eq = self._close_one_trade(pt, exit_price, eq,
-                                                   candle_high=candle_high, candle_low=candle_low)
-                # Track if T1 (primary) won so T2 can use break-even
-                if pt.get("is_primary") and outcome_eq > eq:
-                    t1_won = True
+                result = self._close_one_trade(pt, exit_price, eq,
+                                               candle_high=candle_high, candle_low=candle_low)
+
+                if result is None:
+                    # NATURAL_CLOSE — price between SL and TP, hold another candle
+                    still_open.append(pt)
+                else:
+                    # Definitively closed (SL/TP/TRAIL) — check if T1 won for T2 breakeven
+                    if pt.get("is_primary") and result > eq:
+                        t1_won = True
+                        # Immediately apply breakeven to any T2 already in still_open
+                        for open_pt in still_open:
+                            if open_pt.get("breakeven_after_t1"):
+                                open_pt["breakeven"] = True
+
+            self.pending_trades = still_open
+
         except Exception as e:
-            self.log(f"Error closing trade(s): {e}")
-        finally:
-            self.pending_trades = []
+            self.log(f"Error evaluating trade(s): {e}")
+            # On error, leave pending_trades intact — retry next interval
 
     def _signal_and_filters(self):
         klines = _fetch_klines_sync(self.symbol, self.tf, limit=260)
