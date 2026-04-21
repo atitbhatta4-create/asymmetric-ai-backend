@@ -2014,10 +2014,11 @@ def portfolio_stats(user=Depends(require_user)):
             continue
         s = _session(h)
         if s not in sessions:
-            sessions[s] = {"trades": 0, "wins": 0, "pnl": 0.0}
+            sessions[s] = {"trades": 0, "wins": 0, "pnl": 0.0, "pnl_history": []}
         sessions[s]["trades"] += 1
         pv = float(t["unreal_pnl_value"])
         sessions[s]["pnl"]  += pv
+        sessions[s]["pnl_history"].append(round(pv, 2))
         if pv >= 0:
             sessions[s]["wins"] += 1
     for s in sessions.values():
