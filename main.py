@@ -393,6 +393,18 @@ def init_db() -> None:
             cur.execute("ALTER TABLE trades ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
         if not column_exists(conn, "user_state", "session_id"):
             cur.execute("ALTER TABLE user_state ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
+        # Live runner state — persists adaptive_strictness, open positions, etc. across redeploys
+        for col, coltype, defval in [
+            ("adaptive_strictness", "REAL",    "1.0"),
+            ("last_trade_ts",       "REAL",    "0"),
+            ("last_trade_bad",      "INTEGER", "0"),
+            ("pending_trades_json", "TEXT",    "''"),
+            ("peak_equity",         "REAL",    "0"),
+            ("floor_equity",        "REAL",    "0"),
+            ("consecutive_wins",    "INTEGER", "0"),
+        ]:
+            if not column_exists(conn, "ai_runner_state", col):
+                cur.execute(f"ALTER TABLE ai_runner_state ADD COLUMN {col} {coltype} DEFAULT {defval}")
 
         # Seed admin settings defaults
         def _set_default(key: str, value: str):
@@ -2279,8 +2291,10 @@ AUTO_RUNNERS: Dict[str, "AutoRunner"] = {}
 # ── Runner state persistence (survive deploys) ────────────────────────────────
 
 def _save_runner_state(runner: "AutoRunner") -> None:
-    """Persist runner config to DB so it can be resumed after a backend restart."""
+    """Persist runner config AND live state to DB so it survives redeploys."""
+    import json as _json
     try:
+        pending_json = _json.dumps(list(runner.pending_trades))
         with DB_LOCK:
             conn = db()
             cur = conn.cursor()
@@ -2289,35 +2303,52 @@ def _save_runner_state(runner: "AutoRunner") -> None:
                     INSERT INTO ai_runner_state
                         (email, symbol, trade_style, mode, max_trades_per_day,
                          stop_after_bad_trades, duration_days, trend_filter,
-                         chop_min_sep_pct, end_at_ts, started_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         chop_min_sep_pct, end_at_ts, started_at,
+                         adaptive_strictness, last_trade_ts, last_trade_bad,
+                         pending_trades_json, peak_equity, floor_equity, consecutive_wins)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT(email) DO UPDATE SET
                         symbol=%s, trade_style=%s, mode=%s,
                         max_trades_per_day=%s, stop_after_bad_trades=%s,
                         duration_days=%s, trend_filter=%s,
-                        chop_min_sep_pct=%s, end_at_ts=%s, started_at=%s
+                        chop_min_sep_pct=%s, end_at_ts=%s, started_at=%s,
+                        adaptive_strictness=%s, last_trade_ts=%s, last_trade_bad=%s,
+                        pending_trades_json=%s, peak_equity=%s, floor_equity=%s,
+                        consecutive_wins=%s
                 """, (
                     runner.email, runner.symbol, runner.trade_style, runner.mode,
                     runner.max_trades_per_day, runner.stop_after_bad_trades,
                     runner.duration_days, int(runner.trend_filter),
                     runner.chop_min_sep_pct, runner.end_at_ts, int(time.time()),
+                    runner.adaptive_strictness, runner.last_trade_ts,
+                    int(runner._last_trade_bad), pending_json,
+                    runner.peak_equity, runner.floor_equity, runner.consecutive_wins,
+                    # UPDATE SET values
                     runner.symbol, runner.trade_style, runner.mode,
                     runner.max_trades_per_day, runner.stop_after_bad_trades,
                     runner.duration_days, int(runner.trend_filter),
                     runner.chop_min_sep_pct, runner.end_at_ts, int(time.time()),
+                    runner.adaptive_strictness, runner.last_trade_ts,
+                    int(runner._last_trade_bad), pending_json,
+                    runner.peak_equity, runner.floor_equity, runner.consecutive_wins,
                 ))
             else:
                 cur.execute("""
                     INSERT OR REPLACE INTO ai_runner_state
                         (email, symbol, trade_style, mode, max_trades_per_day,
                          stop_after_bad_trades, duration_days, trend_filter,
-                         chop_min_sep_pct, end_at_ts, started_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                         chop_min_sep_pct, end_at_ts, started_at,
+                         adaptive_strictness, last_trade_ts, last_trade_bad,
+                         pending_trades_json, peak_equity, floor_equity, consecutive_wins)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     runner.email, runner.symbol, runner.trade_style, runner.mode,
                     runner.max_trades_per_day, runner.stop_after_bad_trades,
                     runner.duration_days, int(runner.trend_filter),
                     runner.chop_min_sep_pct, runner.end_at_ts, int(time.time()),
+                    runner.adaptive_strictness, runner.last_trade_ts,
+                    int(runner._last_trade_bad), pending_json,
+                    runner.peak_equity, runner.floor_equity, runner.consecutive_wins,
                 ))
             conn.commit()
             conn.close()
@@ -3011,6 +3042,52 @@ class AutoRunner:
         self.floor_equity: float = self.session_start_equity * 0.85
         # Load today's real trade counts from DB — prevents bypass by stop+restart
         self.trades_today, self.bad_trades_today = self._load_today_stats()
+        # Restore live state (strictness, open positions, drawdown level) from last session
+        self._restore_live_state()
+
+    def _restore_live_state(self) -> None:
+        """Load adaptive_strictness, pending_trades, peak/floor equity from DB.
+        Called on init so a redeploy picks up exactly where the previous session left off."""
+        import json as _json
+        try:
+            with DB_LOCK:
+                conn = db()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT adaptive_strictness, last_trade_ts, last_trade_bad, "
+                    "pending_trades_json, peak_equity, floor_equity, consecutive_wins "
+                    "FROM ai_runner_state WHERE email = %s" if USING_PG else
+                    "SELECT adaptive_strictness, last_trade_ts, last_trade_bad, "
+                    "pending_trades_json, peak_equity, floor_equity, consecutive_wins "
+                    "FROM ai_runner_state WHERE email = ?",
+                    (self.email,),
+                )
+                row = cur.fetchone()
+                conn.close()
+            if not row:
+                return
+            row = dict(row)
+            if row.get("adaptive_strictness"):
+                self.adaptive_strictness = float(row["adaptive_strictness"])
+            if row.get("last_trade_ts"):
+                self.last_trade_ts = float(row["last_trade_ts"])
+            if row.get("last_trade_bad"):
+                self._last_trade_bad = bool(int(row["last_trade_bad"]))
+            if row.get("consecutive_wins"):
+                self.consecutive_wins = int(row["consecutive_wins"])
+            # Restore peak/floor equity — keeps drawdown protection intact across redeploys
+            if row.get("peak_equity") and float(row["peak_equity"]) > 0:
+                self.peak_equity = float(row["peak_equity"])
+            if row.get("floor_equity") and float(row["floor_equity"]) > 0:
+                self.floor_equity = float(row["floor_equity"])
+            # Restore open positions — bot continues managing them immediately
+            raw = row.get("pending_trades_json") or "[]"
+            trades = _json.loads(raw) if isinstance(raw, str) else []
+            if trades:
+                self.pending_trades = trades
+                self.log(f"Restored {len(trades)} open position(s) from previous session.")
+        except Exception as e:
+            print(f"[runner-state] restore failed for {self.email}: {e}")
 
     def is_running(self):
         return not self.stop_event.is_set()
@@ -3140,6 +3217,8 @@ class AutoRunner:
         tp_pct = max(tp_pct, 0.004)
 
         # Break-even SL: T2 after T1 wins → SL moves to entry (risk-free trade)
+        # Only activates when breakeven flag is set (via breakeven_next promotion in
+        # _close_pending_trades — never fires on the same candle T1 wins).
         if pt.get("breakeven"):
             sl_pct = 0.0001  # near-zero SL at entry price — can only lose a tiny bit
 
@@ -3210,17 +3289,6 @@ class AutoRunner:
         if sl_pct > max_sl_for_cap:
             sl_pct = max_sl_for_cap
             tp_pct = sl_pct * (sp["tp_atr"] / sp["sl_atr"]) * tp_mult
-
-        # ── Breakeven stop — no fees, no loss ────────────────────────────
-        # If trade has been open ≥ 2 intervals and price hasn't moved 30% toward TP,
-        # move SL to entry. Worst case = 0% PnL, avoids paying fees on a losing exit.
-        candles_held = int((time.time() - pt.get("open_ts", time.time())) / self.interval_sec)
-        if candles_held >= 2 and not pt.get("breakeven"):
-            raw_progress = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
-            if raw_progress < tp_pct * 0.30:
-                sl_pct = 0.0001   # SL at entry — exits at breakeven
-                pt["breakeven"] = True
-                self.log(f"Breakeven stop activated ({candles_held} candles, no progress) — SL moved to entry")
 
         # ── Intrabar SL/TP detection ──────────────────────────────────────
         # Use candle high/low to check if SL or TP was touched DURING the
@@ -3495,9 +3563,12 @@ class AutoRunner:
             t1_won = False
 
             for pt in self.pending_trades:
-                # If T1 hit TP this candle or earlier, move T2 SL to breakeven
-                if pt.get("breakeven_after_t1") and t1_won:
-                    pt["breakeven"] = True   # in-place — persists across candles
+                # Promote deferred breakeven: T1 won last candle → T2 is now risk-free.
+                # Deferred one candle so T2 is never evaluated with a 0.010% SL in the
+                # same pass that T1 won (which would kill it at near-entry immediately).
+                if pt.get("breakeven_next"):
+                    pt["breakeven"] = True
+                    del pt["breakeven_next"]
 
                 eq = get_equity(self.email)
                 result = self._close_one_trade(pt, exit_price, eq,
@@ -3507,15 +3578,20 @@ class AutoRunner:
                     # NATURAL_CLOSE — price between SL and TP, hold another candle
                     still_open.append(pt)
                 else:
-                    # Definitively closed (SL/TP/TRAIL) — check if T1 won for T2 breakeven
+                    # Definitively closed — record T1 win (T2 not in still_open yet, set below)
                     if pt.get("is_primary") and result > eq:
                         t1_won = True
-                        # Immediately apply breakeven to any T2 already in still_open
-                        for open_pt in still_open:
-                            if open_pt.get("breakeven_after_t1"):
-                                open_pt["breakeven"] = True
 
             self.pending_trades = still_open
+
+            # After the loop, still_open contains T2 — safe to activate its breakeven now
+            if t1_won:
+                for pt in still_open:
+                    if pt.get("breakeven_after_t1") and not pt.get("breakeven"):
+                        pt["breakeven_next"] = True
+
+            # Persist live state so a redeploy picks up the updated positions/strictness
+            _save_runner_state(self)
 
         except Exception as e:
             self.log(f"Error evaluating trade(s): {e}")
@@ -3685,6 +3761,7 @@ class AutoRunner:
                         ]
                         self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}")
                     self.last_trade_ts = now_ts
+                    _save_runner_state(self)   # persist open position immediately
                 else:
                     wait_sec = int(effective_cooldown - (now_ts - self.last_trade_ts))
                     cd_label = "2× cooldown (after loss)" if self._last_trade_bad else "cooldown"
