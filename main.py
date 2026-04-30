@@ -395,13 +395,14 @@ def init_db() -> None:
             cur.execute("ALTER TABLE user_state ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
         # Live runner state — persists adaptive_strictness, open positions, etc. across redeploys
         for col, coltype, defval in [
-            ("adaptive_strictness", "REAL",    "1.0"),
-            ("last_trade_ts",       "REAL",    "0"),
-            ("last_trade_bad",      "INTEGER", "0"),
-            ("pending_trades_json", "TEXT",    "''"),
-            ("peak_equity",         "REAL",    "0"),
-            ("floor_equity",        "REAL",    "0"),
-            ("consecutive_wins",    "INTEGER", "0"),
+            ("adaptive_strictness",  "REAL",    "1.0"),
+            ("last_trade_ts",        "REAL",    "0"),
+            ("last_trade_bad",       "INTEGER", "0"),
+            ("pending_trades_json",  "TEXT",    "''"),
+            ("peak_equity",          "REAL",    "0"),
+            ("floor_equity",         "REAL",    "0"),
+            ("consecutive_wins",     "INTEGER", "0"),
+            ("session_start_equity", "REAL",    "0"),
         ]:
             if not column_exists(conn, "ai_runner_state", col):
                 cur.execute(f"ALTER TABLE ai_runner_state ADD COLUMN {col} {coltype} DEFAULT {defval}")
@@ -2291,7 +2292,9 @@ AUTO_RUNNERS: Dict[str, "AutoRunner"] = {}
 # ── Runner state persistence (survive deploys) ────────────────────────────────
 
 def _save_runner_state(runner: "AutoRunner") -> None:
-    """Persist runner config AND live state to DB so it survives redeploys."""
+    """Persist runner config AND live state to DB so it survives redeploys.
+    started_at and session_start_equity are set only on INSERT — they are never
+    overwritten on UPDATE so the original session start values survive redeploys."""
     import json as _json
     try:
         pending_json = _json.dumps(list(runner.pending_trades))
@@ -2305,17 +2308,19 @@ def _save_runner_state(runner: "AutoRunner") -> None:
                          stop_after_bad_trades, duration_days, trend_filter,
                          chop_min_sep_pct, end_at_ts, started_at,
                          adaptive_strictness, last_trade_ts, last_trade_bad,
-                         pending_trades_json, peak_equity, floor_equity, consecutive_wins)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         pending_trades_json, peak_equity, floor_equity,
+                         consecutive_wins, session_start_equity)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT(email) DO UPDATE SET
                         symbol=%s, trade_style=%s, mode=%s,
                         max_trades_per_day=%s, stop_after_bad_trades=%s,
                         duration_days=%s, trend_filter=%s,
-                        chop_min_sep_pct=%s, end_at_ts=%s, started_at=%s,
+                        chop_min_sep_pct=%s, end_at_ts=%s,
                         adaptive_strictness=%s, last_trade_ts=%s, last_trade_bad=%s,
                         pending_trades_json=%s, peak_equity=%s, floor_equity=%s,
                         consecutive_wins=%s
                 """, (
+                    # INSERT values (19)
                     runner.email, runner.symbol, runner.trade_style, runner.mode,
                     runner.max_trades_per_day, runner.stop_after_bad_trades,
                     runner.duration_days, int(runner.trend_filter),
@@ -2323,32 +2328,47 @@ def _save_runner_state(runner: "AutoRunner") -> None:
                     runner.adaptive_strictness, runner.last_trade_ts,
                     int(runner._last_trade_bad), pending_json,
                     runner.peak_equity, runner.floor_equity, runner.consecutive_wins,
-                    # UPDATE SET values
+                    runner.session_start_equity,
+                    # UPDATE SET values (16 — started_at and session_start_equity kept from original INSERT)
                     runner.symbol, runner.trade_style, runner.mode,
                     runner.max_trades_per_day, runner.stop_after_bad_trades,
                     runner.duration_days, int(runner.trend_filter),
-                    runner.chop_min_sep_pct, runner.end_at_ts, int(time.time()),
+                    runner.chop_min_sep_pct, runner.end_at_ts,
                     runner.adaptive_strictness, runner.last_trade_ts,
                     int(runner._last_trade_bad), pending_json,
                     runner.peak_equity, runner.floor_equity, runner.consecutive_wins,
                 ))
             else:
+                # SQLite: preserve started_at and session_start_equity if row exists
+                cur.execute(
+                    "SELECT started_at, session_start_equity FROM ai_runner_state WHERE email = ?",
+                    (runner.email,),
+                )
+                existing = cur.fetchone()
+                orig_started_at = existing["started_at"] if existing else int(time.time())
+                orig_start_eq = (
+                    existing["session_start_equity"]
+                    if existing and existing["session_start_equity"]
+                    else runner.session_start_equity
+                )
                 cur.execute("""
                     INSERT OR REPLACE INTO ai_runner_state
                         (email, symbol, trade_style, mode, max_trades_per_day,
                          stop_after_bad_trades, duration_days, trend_filter,
                          chop_min_sep_pct, end_at_ts, started_at,
                          adaptive_strictness, last_trade_ts, last_trade_bad,
-                         pending_trades_json, peak_equity, floor_equity, consecutive_wins)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         pending_trades_json, peak_equity, floor_equity,
+                         consecutive_wins, session_start_equity)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     runner.email, runner.symbol, runner.trade_style, runner.mode,
                     runner.max_trades_per_day, runner.stop_after_bad_trades,
                     runner.duration_days, int(runner.trend_filter),
-                    runner.chop_min_sep_pct, runner.end_at_ts, int(time.time()),
+                    runner.chop_min_sep_pct, runner.end_at_ts, orig_started_at,
                     runner.adaptive_strictness, runner.last_trade_ts,
                     int(runner._last_trade_bad), pending_json,
                     runner.peak_equity, runner.floor_equity, runner.consecutive_wins,
+                    orig_start_eq,
                 ))
             conn.commit()
             conn.close()
@@ -3046,8 +3066,9 @@ class AutoRunner:
         self._restore_live_state()
 
     def _restore_live_state(self) -> None:
-        """Load adaptive_strictness, pending_trades, peak/floor equity from DB.
-        Called on init so a redeploy picks up exactly where the previous session left off."""
+        """Load adaptive_strictness, pending_trades, peak/floor equity, and
+        session_start_equity from DB. Called on init so a redeploy picks up
+        exactly where the previous session left off."""
         import json as _json
         try:
             with DB_LOCK:
@@ -3055,10 +3076,12 @@ class AutoRunner:
                 cur = conn.cursor()
                 cur.execute(
                     "SELECT adaptive_strictness, last_trade_ts, last_trade_bad, "
-                    "pending_trades_json, peak_equity, floor_equity, consecutive_wins "
+                    "pending_trades_json, peak_equity, floor_equity, consecutive_wins, "
+                    "session_start_equity "
                     "FROM ai_runner_state WHERE email = %s" if USING_PG else
                     "SELECT adaptive_strictness, last_trade_ts, last_trade_bad, "
-                    "pending_trades_json, peak_equity, floor_equity, consecutive_wins "
+                    "pending_trades_json, peak_equity, floor_equity, consecutive_wins, "
+                    "session_start_equity "
                     "FROM ai_runner_state WHERE email = ?",
                     (self.email,),
                 )
@@ -3080,6 +3103,10 @@ class AutoRunner:
                 self.peak_equity = float(row["peak_equity"])
             if row.get("floor_equity") and float(row["floor_equity"]) > 0:
                 self.floor_equity = float(row["floor_equity"])
+            # Restore original session start equity — keeps P&L% and risk calcs relative
+            # to the real session start, not the redeploy time
+            if row.get("session_start_equity") and float(row["session_start_equity"]) > 0:
+                self.session_start_equity = float(row["session_start_equity"])
             # Restore open positions — bot continues managing them immediately
             raw = row.get("pending_trades_json") or "[]"
             trades = _json.loads(raw) if isinstance(raw, str) else []
