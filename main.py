@@ -3790,9 +3790,17 @@ def _resume_runners_on_startup() -> None:
     restart, not a user choice to stop+restart).
     Duration sessions: if the scheduled end_at_ts has already passed, skip them
     (session is over). Otherwise resume with remaining duration.
+    IMPORTANT: never call _clear_runner_state here except for genuinely expired
+    sessions — any other failure just skips silently so state is preserved for
+    the next restart attempt.
     """
+    # Give the DB connection pool time to fully initialise on Render before
+    # we try to read state and reconstruct runners.
+    time.sleep(8)
+
     rows = _load_all_runner_states()
     if not rows:
+        print("[startup-resume] no saved runner states found")
         return
 
     now_ts = time.time()
@@ -3804,13 +3812,14 @@ def _resume_runners_on_startup() -> None:
             end_at_ts = row.get("end_at_ts")
             if end_at_ts and float(end_at_ts) <= now_ts:
                 _clear_runner_state(email)
-                print(f"[startup-resume] {email} — duration session expired, skipping")
+                print(f"[startup-resume] {email} — duration session expired, state cleared")
                 continue
 
-            # Skip if exchange is no longer connected (would block immediately anyway)
+            # Skip without clearing if exchange is not connected — it may be a
+            # transient startup timing issue; preserving state lets the next
+            # redeploy retry successfully.
             if not get_exchange(email):
-                _clear_runner_state(email)
-                print(f"[startup-resume] {email} — no exchange connected, skipping")
+                print(f"[startup-resume] {email} — no exchange connected, skipping (state preserved)")
                 continue
 
             runner = AutoRunner(
@@ -3838,11 +3847,10 @@ def _resume_runners_on_startup() -> None:
                     print(f"[startup-resume] {email} — resumed {row['symbol']} {row['mode']} {row['trade_style']}")
 
         except Exception as e:
-            print(f"[startup-resume] {email} — error: {e}")
-            _clear_runner_state(email)
+            # Log but do NOT clear state — preserve it so the next redeploy can retry
+            print(f"[startup-resume] {email} — error (state preserved): {e}")
 
-    if resumed:
-        print(f"[startup-resume] {resumed} AI runner(s) resumed after restart")
+    print(f"[startup-resume] done — {resumed} AI runner(s) resumed after restart")
 
 
 # =========================
