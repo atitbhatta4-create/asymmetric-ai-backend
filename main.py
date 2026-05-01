@@ -438,7 +438,7 @@ TF_MIN_INTERVAL: Dict[str, int] = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86
 # =========================
 # HELPERS
 # =========================
-START_EQUITY = 1000.0
+START_EQUITY = float(os.environ.get("SIMULATED_EQUITY", "1000"))
 RiskMode = Literal["ULTRA_SAFE", "SAFE", "NORMAL", "MINI_ASYM", "AGGRESSIVE"]
 Side = Literal["LONG", "SHORT"]
 TF = Literal["15m", "1h", "4h", "1d"]
@@ -668,6 +668,8 @@ def admin_set_setting(key: str, value: str) -> None:
 
 
 def signup_is_enabled() -> bool:
+    if os.environ.get("INVITE_ONLY", "").lower() == "true":
+        return False
     return admin_get_setting("signup_enabled", "true").lower() == "true"
 
 
