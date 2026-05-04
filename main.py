@@ -1960,8 +1960,11 @@ def portfolio_stats(user=Depends(require_user)):
         if "Swing" in r or "SWING" in r: return "SWING"
         return "DAY_TRADE"
 
-    def _grade(reason):
-        return "B" if "Grade B" in str(reason or "") else "A"
+    def _grade(trade: dict):
+        stored = trade.get("grade")
+        if stored in ("A", "B"):
+            return stored
+        return "B" if "Grade B" in str(trade.get("reason") or "") else "A"
 
     # ── base arrays ───────────────────────────────────────────────────────────
     pnls     = [float(t["unreal_pnl_value"])   for t in rows]
@@ -2043,7 +2046,7 @@ def portfolio_stats(user=Depends(require_user)):
     # ── grade distribution ────────────────────────────────────────────────────
     grades: dict = {"A": 0, "B": 0}
     for t in rows:
-        g = _grade(t.get("reason"))
+        g = _grade(t)
         grades[g] = grades.get(g, 0) + 1
 
     # ── symbol breakdown ──────────────────────────────────────────────────────
@@ -2863,6 +2866,7 @@ def _compute_signal_layers(
     pattern_name, pattern_score = _candle_pattern(klines, desired_side)
 
     # RSI: closer to center of the range = better entry quality
+    print(f"RSI check: value={rsi:.1f} zone={p['rsi_min']}-{p['rsi_max']} mode={mode} style={trade_style} direction={desired_side}", flush=True)
     rsi_in_range = rsi is not None and p["rsi_min"] <= rsi <= p["rsi_max"]
     if rsi is not None and rsi_in_range:
         mid  = (p["rsi_min"] + p["rsi_max"]) / 2.0
