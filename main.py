@@ -339,6 +339,25 @@ def init_db() -> None:
         """)
 
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS admin_notes (
+            email      TEXT PRIMARY KEY,
+            notes      TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL
+        )
+        """)
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS admin_access_log (
+            id         SERIAL PRIMARY KEY,
+            admin_email TEXT NOT NULL,
+            user_email  TEXT NOT NULL,
+            timestamp   TEXT NOT NULL,
+            tab_viewed  TEXT NOT NULL DEFAULT 'overview'
+        )
+        """)
+
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS password_resets (
             token TEXT PRIMARY KEY,
             email TEXT NOT NULL,
@@ -3051,7 +3070,7 @@ class AutoRunner:
         if self.duration_days > 0:
             end_dt = now_dubai() + timedelta(days=self.duration_days)
             self.end_at_ts = end_dt.timestamp()
-        self.history: Deque[Dict[str, str]] = deque(maxlen=120)
+        self.history: Deque[Dict[str, str]] = deque(maxlen=200)
         self.pending_trades: List[Dict] = []
         self.adaptive_strictness: float = 1.0
         self.last_breakdown: Dict = {}
@@ -4323,6 +4342,31 @@ def admin_users(
             with AUTO_LOCK:
                 rr = AUTO_RUNNERS.get(email)
                 running = bool(rr and rr.is_running())
+                # today P&L (Dubai date = UTC+4)
+            dubai_today = (now_dubai()).strftime("%Y-%m-%d")
+            cur.execute(
+                "SELECT COALESCE(SUM(unreal_pnl_value),0) AS pnl FROM trades WHERE email=%s AND time::text LIKE %s",
+                (email, f"{dubai_today}%"),
+            )
+            today_pnl = float(cur.fetchone()["pnl"])
+
+            # win rate
+            cur.execute("SELECT COUNT(*) AS w FROM trades WHERE email=%s AND unreal_pnl_value>=0", (email,))
+            wins = int(cur.fetchone()["w"])
+            win_rate = round(wins / tcount * 100, 1) if tcount else 0.0
+
+            # last active (last trade time)
+            cur.execute("SELECT time FROM trades WHERE email=%s ORDER BY id DESC LIMIT 1", (email,))
+            la_row = cur.fetchone()
+            last_active = str(la_row["time"]) if la_row else None
+
+            # open positions from runner
+            open_positions = 0
+            with AUTO_LOCK:
+                rr2 = AUTO_RUNNERS.get(email)
+                if rr2 and rr2.is_running():
+                    open_positions = len(rr2.pending_trades)
+
             out.append({
                 "email": email,
                 "created_at": r["created_at"],
@@ -4331,6 +4375,10 @@ def admin_users(
                 "exchange_connected": ex,
                 "trades_count": tcount,
                 "ai_running": running,
+                "today_pnl": round(today_pnl, 2),
+                "win_rate": win_rate,
+                "last_active": last_active,
+                "open_positions": open_positions,
             })
         conn.close()
 
@@ -4385,6 +4433,168 @@ def admin_user_details(
         "trades": {"count": tcount, "recent": trows},
         "ai": {"running": running, "status": auto_status_obj},
     }
+
+
+# =========================
+# ADMIN EXTENDED ENDPOINTS
+# =========================
+
+@app.post("/admin/log-access")
+def admin_log_access(
+    user_email: str,
+    tab: str = "overview",
+    admin=Depends(require_admin),
+):
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO admin_access_log(admin_email, user_email, timestamp, tab_viewed) VALUES(%s,%s,%s,%s)",
+            (admin, user_email, now_utc_str(), tab),
+        )
+        conn.commit()
+        conn.close()
+    return {"ok": True}
+
+
+@app.get("/admin/access-log")
+def admin_access_log_list(
+    admin=Depends(require_admin),
+    limit: int = Query(default=200, ge=1, le=2000),
+):
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT admin_email, user_email, timestamp, tab_viewed FROM admin_access_log ORDER BY id DESC LIMIT %s",
+            (int(limit),),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+    return {"ok": True, "log": rows}
+
+
+@app.get("/admin/user/{email}/log")
+def admin_user_log(
+    email: str,
+    admin=Depends(require_admin),
+    limit: int = Query(default=200, ge=1, le=200),
+):
+    email = (email or "").strip().lower()
+    with AUTO_LOCK:
+        rr = AUTO_RUNNERS.get(email)
+        events = list(rr.history)[:int(limit)] if rr else []
+    return {"ok": True, "running": bool(rr and rr.is_running()), "events": events}
+
+
+@app.get("/admin/user/{email}/portfolio")
+def admin_user_portfolio(email: str, admin=Depends(require_admin)):
+    import statistics as _st
+    from datetime import timezone as _tz, timedelta as _td
+
+    email = (email or "").strip().lower()
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM trades WHERE email = %s ORDER BY time ASC", (email,))
+        rows = [dict(r) for r in cur.fetchall()]
+        conn.close()
+
+    if not rows:
+        return {"empty": True}
+
+    def _parse_dt(s):
+        s = str(s).strip()
+        iso = s if "T" in s else s.replace(" ", "T")
+        if not iso.endswith("Z"):
+            iso += "Z"
+        try:
+            from datetime import datetime as _dt
+            return _dt.fromisoformat(iso.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _dubai_month(s):
+        dt = _parse_dt(s)
+        if not dt:
+            return "Unknown"
+        dubai = dt + _td(hours=4)
+        return dubai.strftime("%Y-%m")
+
+    pnls = [float(t["unreal_pnl_value"]) for t in rows]
+    total = len(rows)
+    wins = [t for t in rows if float(t["unreal_pnl_value"]) >= 0]
+    losses = [t for t in rows if float(t["unreal_pnl_value"]) < 0]
+    win_rate = len(wins) / total if total else 0
+    total_pnl = sum(pnls)
+
+    first_eq = float(rows[0]["equity_after"]) - pnls[0]
+    eq_curve = [{"time": str(rows[0]["time"]), "equity": round(first_eq, 2)}]
+    for t in rows:
+        eq_curve.append({"time": str(t["time"]), "equity": round(float(t["equity_after"]), 2)})
+
+    peak = eq_curve[0]["equity"]
+    max_dd = 0.0
+    for pt in eq_curve[1:]:
+        if pt["equity"] > peak:
+            peak = pt["equity"]
+        dd = (peak - pt["equity"]) / peak if peak > 0 else 0.0
+        max_dd = max(max_dd, dd)
+
+    monthly: dict = {}
+    for t in rows:
+        m = _dubai_month(str(t["time"]))
+        monthly.setdefault(m, 0.0)
+        monthly[m] += float(t["unreal_pnl_value"])
+
+    best = max(rows, key=lambda t: float(t["unreal_pnl_value"]))
+    worst = min(rows, key=lambda t: float(t["unreal_pnl_value"]))
+
+    return {
+        "empty": False,
+        "total_trades": total,
+        "win_rate": round(win_rate * 100, 1),
+        "total_pnl": round(total_pnl, 2),
+        "max_drawdown_pct": round(max_dd * 100, 2),
+        "eq_curve": eq_curve,
+        "monthly_pnl": [{"month": k, "pnl": round(v, 2)} for k, v in sorted(monthly.items())],
+        "best_trade": {"symbol": best["symbol"], "pnl": round(float(best["unreal_pnl_value"]), 2), "time": str(best["time"])},
+        "worst_trade": {"symbol": worst["symbol"], "pnl": round(float(worst["unreal_pnl_value"]), 2), "time": str(worst["time"])},
+    }
+
+
+@app.get("/admin/user/{email}/notes")
+def admin_get_notes(email: str, admin=Depends(require_admin)):
+    email = (email or "").strip().lower()
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT notes, updated_at, updated_by FROM admin_notes WHERE email=%s", (email,))
+        row = cur.fetchone()
+        conn.close()
+    if row:
+        return {"ok": True, "notes": row["notes"], "updated_at": row["updated_at"], "updated_by": row["updated_by"]}
+    return {"ok": True, "notes": "", "updated_at": None, "updated_by": None}
+
+
+class AdminNotesIn(BaseModel):
+    notes: str
+
+@app.post("/admin/user/{email}/notes")
+def admin_save_notes(email: str, payload: AdminNotesIn, admin=Depends(require_admin)):
+    email = (email or "").strip().lower()
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO admin_notes(email, notes, updated_at, updated_by)
+               VALUES(%s,%s,%s,%s)
+               ON CONFLICT(email) DO UPDATE SET notes=EXCLUDED.notes, updated_at=EXCLUDED.updated_at, updated_by=EXCLUDED.updated_by""",
+            (email, payload.notes, now_utc_str(), admin),
+        )
+        conn.commit()
+        conn.close()
+    return {"ok": True}
 
 
 # =========================
