@@ -412,6 +412,12 @@ def init_db() -> None:
             cur.execute("ALTER TABLE trades ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
         if not column_exists(conn, "user_state", "session_id"):
             cur.execute("ALTER TABLE user_state ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
+        if not column_exists(conn, "trades", "hard_floor"):
+            cur.execute("ALTER TABLE trades ADD COLUMN hard_floor REAL DEFAULT 0")
+        if not column_exists(conn, "user_state", "peak_equity"):
+            cur.execute("ALTER TABLE user_state ADD COLUMN peak_equity REAL DEFAULT 0")
+        if not column_exists(conn, "user_state", "all_time_high"):
+            cur.execute("ALTER TABLE user_state ADD COLUMN all_time_high REAL DEFAULT 0")
         # Live runner state — persists adaptive_strictness, open positions, etc. across redeploys
         for col, coltype, defval in [
             ("adaptive_strictness",  "REAL",    "1.0"),
@@ -585,6 +591,24 @@ def set_equity(email: str, equity: float) -> None:
         cur = conn.cursor()
         cur.execute("UPDATE user_state SET equity = %s WHERE email = %s", (float(equity), email))
         conn.commit()
+        conn.close()
+
+
+def update_peak_ath(email: str, peak: float, equity_after: float) -> None:
+    """Update peak_equity and all_time_high in user_state after each trade."""
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT peak_equity, all_time_high FROM user_state WHERE email = %s", (email,))
+        row = cur.fetchone()
+        if row:
+            new_peak = max(float(row["peak_equity"] or 0), peak)
+            new_ath = max(float(row["all_time_high"] or 0), equity_after)
+            cur.execute(
+                "UPDATE user_state SET peak_equity=%s, all_time_high=%s WHERE email=%s",
+                (new_peak, new_ath, email),
+            )
+            conn.commit()
         conn.close()
 
 
@@ -1897,9 +1921,32 @@ def balance(user=Depends(require_user)):
         conn = db()
         cur = conn.cursor()
         cur.execute("SELECT time FROM trades WHERE email = %s ORDER BY id DESC LIMIT 1", (email,))
-        row = cur.fetchone()
+        last_row = cur.fetchone()
+        cur.execute("SELECT peak_equity, all_time_high FROM user_state WHERE email = %s", (email,))
+        state_row = cur.fetchone()
         conn.close()
-    return {"total": equity, "equity_after_last_trade": equity, "last_trade": row["time"] if row else None, "start_equity": START_EQUITY}
+    peak = float(state_row["peak_equity"] or 0) if state_row else 0.0
+    if peak < equity:
+        peak = equity
+    hard_floor = round(peak * 0.85, 2)
+    locked_profit = round(hard_floor - START_EQUITY, 2)
+    distance_to_floor = round(equity - hard_floor, 2)
+    distance_pct = round(distance_to_floor / hard_floor * 100, 2) if hard_floor > 0 else 0.0
+    ath = float(state_row["all_time_high"] or 0) if state_row else 0.0
+    if ath < equity:
+        ath = equity
+    return {
+        "total": equity,
+        "equity_after_last_trade": equity,
+        "last_trade": last_row["time"] if last_row else None,
+        "start_equity": START_EQUITY,
+        "peak_equity": round(peak, 2),
+        "hard_floor": hard_floor,
+        "locked_profit": locked_profit,
+        "distance_to_floor": distance_to_floor,
+        "distance_pct": distance_pct,
+        "all_time_high": round(ath, 2),
+    }
 
 
 @app.get("/trades")
@@ -3318,6 +3365,7 @@ class AutoRunner:
         # At -15% from peak: full stop. Hard floor (85% of session start) is a second wall.
         if equity_before > self.peak_equity:
             self.peak_equity = equity_before
+            self.floor_equity = self.peak_equity * 0.85  # trail floor up with every new high
         drawdown_pct = (self.peak_equity - equity_before) / self.peak_equity if self.peak_equity > 0 else 0.0
         dd_size_mult = 1.0
         if drawdown_pct >= 0.15:
@@ -3546,18 +3594,19 @@ class AutoRunner:
                 """INSERT INTO trades(
                     email, time, side, symbol, mode, size, sl, tp, leverage,
                     entry_price, current_price, unreal_pnl_percent, unreal_pnl_value,
-                    equity_after, reason, session_id
-                ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    equity_after, reason, session_id, hard_floor
+                ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (self.email, tr.time, tr.side, tr.symbol, tr.mode,
                  float(tr.size), float(tr.sl), float(tr.tp), float(tr.leverage),
                  float(tr.entry_price), float(tr.current_price),
                  float(tr.unreal_pnl_percent), float(tr.unreal_pnl_value),
-                 float(tr.equity_after), tr.reason, int(sid)),
+                 float(tr.equity_after), tr.reason, int(sid), float(self.floor_equity)),
             )
             conn.commit()
             conn.close()
 
         set_equity(self.email, equity_after)
+        update_peak_ath(self.email, float(self.peak_equity), float(equity_after))
         if is_primary:
             self.trades_today += 1
             self._last_trade_bad = pnl_value < 0
@@ -4060,7 +4109,16 @@ def reset_sandbox(user=Depends(require_user)):
     new_sid = sid + 1
     set_session_id(email, new_sid)
     set_equity(email, START_EQUITY)
-    set_ai_restart_lock(email, 0)  # Clear restart lock for demo purposes
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE user_state SET peak_equity=%s WHERE email=%s",
+            (START_EQUITY, email),
+        )
+        conn.commit()
+        conn.close()
+    set_ai_restart_lock(email, 0)
     return {"ok": True, "equity": START_EQUITY, "new_session_id": new_sid}
 
 
