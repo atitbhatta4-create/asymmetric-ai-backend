@@ -3342,8 +3342,12 @@ class AutoRunner:
             print(f"[ai-session] close failed: {e}")
 
     def start(self):
-        self._open_ai_session()
-        self.log("AI started.")
+        if self.ai_session_id:
+            # Resuming existing session after server restart — don't create a new one
+            self.log("AI resumed after server restart.")
+        else:
+            self._open_ai_session()
+            self.log("AI started.")
         self.thread.start()
 
     def stop(self, reason="Stopped by user."):
