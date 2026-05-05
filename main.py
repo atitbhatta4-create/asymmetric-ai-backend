@@ -21,6 +21,9 @@ import httpx
 from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from database import db, USING_PG, column_exists, serial_pk
 
@@ -28,12 +31,16 @@ from database import db, USING_PG, column_exists, serial_pk
 # App
 # =========================
 app = FastAPI(title="Asymmetric AI Backend", version="0.9.0")
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # =========================
 # ENV / PROD SETTINGS
 # =========================
 ENV = os.getenv("ENV", "dev").lower().strip()  # dev | prod
 IS_PROD = ENV == "prod"
+REAL_TRADING = os.getenv("REAL_TRADING", "").lower() == "true"
 
 FRONTEND_ORIGINS_RAW = os.getenv("FRONTEND_ORIGINS", "")
 if FRONTEND_ORIGINS_RAW.strip():
@@ -840,7 +847,8 @@ def clear_session_cookie(response: Response) -> None:
 # AUTH ENDPOINTS
 # =========================
 @app.post("/auth/signup")
-def signup(payload: AuthIn):
+@limiter.limit("5/minute")
+def signup(request: Request, payload: AuthIn):
     email = payload.email.strip().lower()
     if not email or not payload.password:
         raise HTTPException(status_code=400, detail="Email and password required")
@@ -869,7 +877,8 @@ def signup(payload: AuthIn):
 
 
 @app.post("/auth/login", response_model=SessionOut)
-def login(payload: AuthIn, response: Response):
+@limiter.limit("10/minute")
+def login(request: Request, payload: AuthIn, response: Response):
     email = payload.email.strip().lower()
 
     with DB_LOCK:
@@ -998,7 +1007,8 @@ class VerifyOtpIn(BaseModel):
     new_password: str
 
 @app.post("/auth/forgot-password")
-def forgot_password(payload: ForgotPasswordIn):
+@limiter.limit("3/minute")
+def forgot_password(request: Request, payload: ForgotPasswordIn):
     """
     Step 1 — user enters their email.
     Generates a 6-digit OTP, stores it (15min TTL), sends to their Gmail.
@@ -1037,7 +1047,8 @@ def forgot_password(payload: ForgotPasswordIn):
 
 
 @app.post("/auth/reset-password")
-def reset_password(payload: VerifyOtpIn):
+@limiter.limit("5/minute")
+def reset_password(request: Request, payload: VerifyOtpIn):
     """
     Step 2 — user enters the 6-digit code + new password.
     Code is valid for 15 minutes, single-use.
@@ -3690,6 +3701,13 @@ class AutoRunner:
             f"  After:       ${equity_after:,.2f}  ({dir_word} {abs(from_start / max(1, self.session_start_equity) * 100):.2f}% from session start)",
         ])
 
+        if REAL_TRADING:
+            try:
+                close_real_order(email=self.email, symbol=self.symbol, side=side)
+                self.log(f"REAL POSITION CLOSED | {side} {self.symbol} | {outcome}")
+            except Exception as _ce:
+                self.log(f"REAL CLOSE note: {_ce}")
+
         sid = get_session_id(self.email)
         tr = Trade(
             time=now_utc_str(), side=side, symbol=self.symbol, mode=mode,
@@ -3962,12 +3980,35 @@ class AutoRunner:
                     entry_price = self._fetch_price_sync(self.symbol)
                     self._last_trade_bad = False
                     grade = self.market_grade
+                    c = MODE_CONFIG[self.mode]
+                    st = STYLE_CONFIG[self.trade_style]
+                    equity_now = get_equity(self.email)
+                    sl_pct_open = self.last_atr_pct * st["sl_mult"]
+                    tp_pct_open = self.last_atr_pct * st["tp_mult"]
+
+                    real_order_id = None
+                    if REAL_TRADING:
+                        try:
+                            size_pct = float(c["size"]) * 1.0  # Grade A full size
+                            usdt_size = equity_now * size_pct
+                            result = place_real_order(
+                                email=self.email, symbol=self.symbol, side=desired_side,
+                                usdt_size=usdt_size, leverage=int(c["leverage"]),
+                                sl_pct=sl_pct_open, tp_pct=tp_pct_open,
+                            )
+                            real_order_id = result.get("order_id")
+                            self.log(f"REAL ORDER PLACED | id={real_order_id} | {desired_side} {self.symbol} size=${usdt_size:.2f} lev={c['leverage']}×")
+                        except Exception as _re:
+                            self.log(f"REAL ORDER FAILED — trade skipped: {_re}")
+                            continue
+
                     base_trade = {
                         "entry_price": entry_price,
                         "side": desired_side,
                         "mode": self.mode,
                         "signal": self.last_signal,
                         "open_ts": time.time(),
+                        **({"order_id": real_order_id} if real_order_id else {}),
                     }
                     if grade == "B":
                         self.pending_trades = [
