@@ -386,6 +386,15 @@ def init_db() -> None:
         )
         """)
 
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS ai_logs (
+            id      {_serial},
+            email   TEXT NOT NULL,
+            t       TEXT NOT NULL,
+            msg     TEXT NOT NULL
+        )
+        """)
+
         # AI runner persistence — survives backend restarts / deploys.
         # Saved when user starts the AI, cleared when AI stops for any reason.
         # On startup, all rows here are auto-resumed so live sessions never drop.
@@ -3191,6 +3200,21 @@ class AutoRunner:
                 self.log(f"Restored {len(trades)} open position(s) from previous session.")
         except Exception as e:
             print(f"[runner-state] restore failed for {self.email}: {e}")
+        # Restore log history from DB so it survives redeploys
+        try:
+            with DB_LOCK:
+                conn = db()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT t, msg FROM ai_logs WHERE email = %s ORDER BY id DESC LIMIT 200",
+                    (self.email,),
+                )
+                rows = cur.fetchall()
+                conn.close()
+            for row in rows:
+                self.history.append({"t": row["t"], "msg": row["msg"]})
+        except Exception as e:
+            print(f"[runner-state] log restore failed for {self.email}: {e}")
 
     def is_running(self):
         return not self.stop_event.is_set()
@@ -3230,7 +3254,29 @@ class AutoRunner:
             return 0, 0
 
     def log(self, msg):
-        self.history.appendleft({"t": now_dubai().strftime("%Y-%m-%d %H:%M:%S"), "msg": msg})
+        entry = {"t": now_dubai().strftime("%Y-%m-%d %H:%M:%S"), "msg": msg}
+        self.history.appendleft(entry)
+        threading.Thread(target=self._persist_log, args=(entry,), daemon=True).start()
+
+    def _persist_log(self, entry: Dict) -> None:
+        try:
+            with DB_LOCK:
+                conn = db()
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO ai_logs(email, t, msg) VALUES(%s, %s, %s)",
+                    (self.email, entry["t"], entry["msg"]),
+                )
+                # Keep only last 500 entries per user to prevent unbounded growth
+                cur.execute(
+                    "DELETE FROM ai_logs WHERE email=%s AND id NOT IN "
+                    "(SELECT id FROM ai_logs WHERE email=%s ORDER BY id DESC LIMIT 500)",
+                    (self.email, self.email),
+                )
+                conn.commit()
+                conn.close()
+        except Exception:
+            pass
 
     def start(self):
         self.log("AI started.")
@@ -4149,9 +4195,19 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
     email = user["email"]
     with AUTO_LOCK:
         r = AUTO_RUNNERS.get(email)
-        if not r:
-            return {"ok": True, "events": []}
-        return {"ok": True, "events": list(r.history)[: int(limit)]}
+        if r:
+            return {"ok": True, "events": list(r.history)[: int(limit)]}
+    # No runner in memory (after redeploy) — read from DB
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT t, msg FROM ai_logs WHERE email = %s ORDER BY id DESC LIMIT %s",
+            (email, int(limit)),
+        )
+        rows = cur.fetchall()
+        conn.close()
+    return {"ok": True, "events": [{"t": r["t"], "msg": r["msg"]} for r in rows]}
 
 
 @app.get("/auto/signal")
