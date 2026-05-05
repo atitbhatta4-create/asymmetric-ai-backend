@@ -387,13 +387,29 @@ def init_db() -> None:
         """)
 
         cur.execute(f"""
-        CREATE TABLE IF NOT EXISTS ai_logs (
-            id      {_serial},
-            email   TEXT NOT NULL,
-            t       TEXT NOT NULL,
-            msg     TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS ai_sessions (
+            id          {_serial},
+            email       TEXT NOT NULL,
+            symbol      TEXT NOT NULL,
+            mode        TEXT NOT NULL,
+            trade_style TEXT NOT NULL,
+            started_at  TEXT NOT NULL,
+            ended_at    TEXT,
+            stop_reason TEXT
         )
         """)
+
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS ai_logs (
+            id          {_serial},
+            email       TEXT NOT NULL,
+            session_id  INTEGER,
+            t           TEXT NOT NULL,
+            msg         TEXT NOT NULL
+        )
+        """)
+        if not column_exists(conn, "ai_logs", "session_id"):
+            cur.execute("ALTER TABLE ai_logs ADD COLUMN session_id INTEGER")
 
         # AI runner persistence — survives backend restarts / deploys.
         # Saved when user starts the AI, cleared when AI stops for any reason.
@@ -3131,6 +3147,7 @@ class AutoRunner:
             end_dt = now_dubai() + timedelta(days=self.duration_days)
             self.end_at_ts = end_dt.timestamp()
         self.history: Deque[Dict[str, str]] = deque(maxlen=200)
+        self.ai_session_id: Optional[int] = None  # DB row id for this AI run
         self.pending_trades: List[Dict] = []
         self.adaptive_strictness: float = 1.0
         self.last_breakdown: Dict = {}
@@ -3200,15 +3217,30 @@ class AutoRunner:
                 self.log(f"Restored {len(trades)} open position(s) from previous session.")
         except Exception as e:
             print(f"[runner-state] restore failed for {self.email}: {e}")
-        # Restore log history from DB so it survives redeploys
+        # Restore log history and active session_id from DB so they survive redeploys
         try:
             with DB_LOCK:
                 conn = db()
                 cur = conn.cursor()
+                # Find the most recent open session (ended_at IS NULL)
                 cur.execute(
-                    "SELECT t, msg FROM ai_logs WHERE email = %s ORDER BY id DESC LIMIT 200",
+                    "SELECT id FROM ai_sessions WHERE email=%s AND ended_at IS NULL "
+                    "ORDER BY id DESC LIMIT 1",
                     (self.email,),
                 )
+                sess_row = cur.fetchone()
+                if sess_row:
+                    self.ai_session_id = int(sess_row["id"])
+                    cur.execute(
+                        "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
+                        "ORDER BY id DESC LIMIT 200",
+                        (self.email, self.ai_session_id),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT t, msg FROM ai_logs WHERE email=%s ORDER BY id DESC LIMIT 200",
+                        (self.email,),
+                    )
                 rows = cur.fetchall()
                 conn.close()
             for row in rows:
@@ -3264,26 +3296,59 @@ class AutoRunner:
                 conn = db()
                 cur = conn.cursor()
                 cur.execute(
-                    "INSERT INTO ai_logs(email, t, msg) VALUES(%s, %s, %s)",
-                    (self.email, entry["t"], entry["msg"]),
-                )
-                # Keep only last 500 entries per user to prevent unbounded growth
-                cur.execute(
-                    "DELETE FROM ai_logs WHERE email=%s AND id NOT IN "
-                    "(SELECT id FROM ai_logs WHERE email=%s ORDER BY id DESC LIMIT 500)",
-                    (self.email, self.email),
+                    "INSERT INTO ai_logs(email, session_id, t, msg) VALUES(%s, %s, %s, %s)",
+                    (self.email, self.ai_session_id, entry["t"], entry["msg"]),
                 )
                 conn.commit()
                 conn.close()
         except Exception:
             pass
 
+    def _open_ai_session(self) -> None:
+        try:
+            with DB_LOCK:
+                conn = db()
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO ai_sessions(email, symbol, mode, trade_style, started_at) "
+                    "VALUES(%s, %s, %s, %s, %s)",
+                    (self.email, self.symbol, self.mode, self.trade_style,
+                     now_dubai().strftime("%Y-%m-%d %H:%M:%S")),
+                )
+                if USING_PG:
+                    cur.execute("SELECT lastval()")
+                    self.ai_session_id = cur.fetchone()[0]
+                else:
+                    self.ai_session_id = cur.lastrowid
+                conn.commit()
+                conn.close()
+        except Exception as e:
+            print(f"[ai-session] open failed: {e}")
+
+    def _close_ai_session(self, reason: str) -> None:
+        if not self.ai_session_id:
+            return
+        try:
+            with DB_LOCK:
+                conn = db()
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE ai_sessions SET ended_at=%s, stop_reason=%s WHERE id=%s",
+                    (now_dubai().strftime("%Y-%m-%d %H:%M:%S"), reason, self.ai_session_id),
+                )
+                conn.commit()
+                conn.close()
+        except Exception as e:
+            print(f"[ai-session] close failed: {e}")
+
     def start(self):
+        self._open_ai_session()
         self.log("AI started.")
         self.thread.start()
 
     def stop(self, reason="Stopped by user."):
         self.log(reason)
+        self._close_ai_session(reason)
         self.stop_event.set()
         if self.pending_trades:
             self.log(f"Pending trade(s) abandoned at stop (entry={self.pending_trades[0].get('entry_price', '?')}).")
@@ -4197,14 +4262,27 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
         r = AUTO_RUNNERS.get(email)
         if r:
             return {"ok": True, "events": list(r.history)[: int(limit)]}
-    # No runner in memory (after redeploy) — read from DB
+    # No runner in memory (after redeploy) — read latest open session from DB
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
         cur.execute(
-            "SELECT t, msg FROM ai_logs WHERE email = %s ORDER BY id DESC LIMIT %s",
-            (email, int(limit)),
+            "SELECT id FROM ai_sessions WHERE email=%s AND ended_at IS NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (email,),
         )
+        sess = cur.fetchone()
+        if sess:
+            cur.execute(
+                "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
+                "ORDER BY id DESC LIMIT %s",
+                (email, sess["id"], int(limit)),
+            )
+        else:
+            cur.execute(
+                "SELECT t, msg FROM ai_logs WHERE email=%s ORDER BY id DESC LIMIT %s",
+                (email, int(limit)),
+            )
         rows = cur.fetchall()
         conn.close()
     return {"ok": True, "events": [{"t": r["t"], "msg": r["msg"]} for r in rows]}
@@ -4596,13 +4674,34 @@ def admin_access_log_list(
 def admin_user_log(
     email: str,
     admin=Depends(require_admin),
-    limit: int = Query(default=200, ge=1, le=200),
+    limit: int = Query(default=50, ge=1, le=200),
 ):
     email = (email or "").strip().lower()
     with AUTO_LOCK:
         rr = AUTO_RUNNERS.get(email)
-        events = list(rr.history)[:int(limit)] if rr else []
-    return {"ok": True, "running": bool(rr and rr.is_running()), "events": events}
+        running = bool(rr and rr.is_running())
+
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        # Fetch last 20 sessions newest first
+        cur.execute(
+            "SELECT id, symbol, mode, trade_style, started_at, ended_at, stop_reason "
+            "FROM ai_sessions WHERE email=%s ORDER BY id DESC LIMIT 20",
+            (email,),
+        )
+        sessions = [dict(r) for r in cur.fetchall()]
+        # Fetch logs for each session
+        for sess in sessions:
+            cur.execute(
+                "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
+                "ORDER BY id ASC LIMIT %s",
+                (email, sess["id"], int(limit)),
+            )
+            sess["events"] = [{"t": r["t"], "msg": r["msg"]} for r in cur.fetchall()]
+        conn.close()
+
+    return {"ok": True, "running": running, "sessions": sessions}
 
 
 @app.get("/admin/user/{email}/portfolio")
