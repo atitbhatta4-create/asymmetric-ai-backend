@@ -21,9 +21,6 @@ import httpx
 from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
 
 from database import db, USING_PG, column_exists, serial_pk
 
@@ -31,9 +28,20 @@ from database import db, USING_PG, column_exists, serial_pk
 # App
 # =========================
 app = FastAPI(title="Asymmetric AI Backend", version="0.9.0")
-limiter = Limiter(key_func=get_remote_address)
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Simple in-memory rate limiter — keyed by (endpoint, ip)
+_rl_hits: Dict[str, List[float]] = {}
+_rl_lock = threading.Lock()
+
+def _rate_limit(request: Request, limit: int, window: int = 60) -> None:
+    key = f"{request.url.path}:{(request.client.host if request.client else 'unknown')}"
+    now = time.time()
+    with _rl_lock:
+        hits = [t for t in _rl_hits.get(key, []) if now - t < window]
+        if len(hits) >= limit:
+            raise HTTPException(status_code=429, detail="Too many requests — slow down.")
+        hits.append(now)
+        _rl_hits[key] = hits
 
 # =========================
 # ENV / PROD SETTINGS
@@ -847,8 +855,8 @@ def clear_session_cookie(response: Response) -> None:
 # AUTH ENDPOINTS
 # =========================
 @app.post("/auth/signup")
-@limiter.limit("5/minute")
 def signup(request: Request, payload: AuthIn):
+    _rate_limit(request, limit=5)
     email = payload.email.strip().lower()
     if not email or not payload.password:
         raise HTTPException(status_code=400, detail="Email and password required")
@@ -877,8 +885,8 @@ def signup(request: Request, payload: AuthIn):
 
 
 @app.post("/auth/login", response_model=SessionOut)
-@limiter.limit("10/minute")
 def login(request: Request, payload: AuthIn, response: Response):
+    _rate_limit(request, limit=10)
     email = payload.email.strip().lower()
 
     with DB_LOCK:
@@ -1007,13 +1015,8 @@ class VerifyOtpIn(BaseModel):
     new_password: str
 
 @app.post("/auth/forgot-password")
-@limiter.limit("3/minute")
 def forgot_password(request: Request, payload: ForgotPasswordIn):
-    """
-    Step 1 — user enters their email.
-    Generates a 6-digit OTP, stores it (15min TTL), sends to their Gmail.
-    Always returns ok=True so attackers can't enumerate registered emails.
-    """
+    _rate_limit(request, limit=3)
     email = payload.email.strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="Email required")
@@ -1047,12 +1050,8 @@ def forgot_password(request: Request, payload: ForgotPasswordIn):
 
 
 @app.post("/auth/reset-password")
-@limiter.limit("5/minute")
 def reset_password(request: Request, payload: VerifyOtpIn):
-    """
-    Step 2 — user enters the 6-digit code + new password.
-    Code is valid for 15 minutes, single-use.
-    """
+    _rate_limit(request, limit=5)
     email = payload.email.strip().lower()
     code  = payload.code.strip()
 
