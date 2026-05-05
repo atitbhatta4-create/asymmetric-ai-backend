@@ -1899,7 +1899,7 @@ def balance(user=Depends(require_user)):
         cur.execute("SELECT time FROM trades WHERE email = %s ORDER BY id DESC LIMIT 1", (email,))
         row = cur.fetchone()
         conn.close()
-    return {"total": equity, "equity_after_last_trade": equity, "last_trade": row["time"] if row else None}
+    return {"total": equity, "equity_after_last_trade": equity, "last_trade": row["time"] if row else None, "start_equity": START_EQUITY}
 
 
 @app.get("/trades")
