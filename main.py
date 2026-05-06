@@ -1966,7 +1966,31 @@ def risk_preview(payload: RiskPreviewIn, user=Depends(require_user)):
 @app.get("/balance")
 def balance(user=Depends(require_user)):
     email = user["email"]
-    equity = get_equity(email)
+
+    if REAL_TRADING:
+        # Always read live balance from exchange for real trading
+        real_bal = get_real_usdt_balance(email)
+        if real_bal is not None:
+            equity = real_bal
+            # Sync DB so curves and history stay consistent
+            db_equity = get_equity(email)
+            if abs(db_equity - real_bal) > 0.01:
+                set_equity(email, real_bal)
+            # Auto-set start equity in DB if still at default $1000
+            if START_EQUITY <= 1000 and db_equity <= 1000.0 and real_bal > 0:
+                with DB_LOCK:
+                    conn = db()
+                    cur = conn.cursor()
+                    cur.execute("UPDATE user_state SET equity = %s WHERE email = %s", (real_bal, email))
+                    conn.commit()
+                    conn.close()
+        else:
+            equity = get_equity(email)
+        start_eq = equity if get_equity(email) <= 1000.0 else get_equity(email)
+    else:
+        equity = get_equity(email)
+        start_eq = START_EQUITY
+
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
@@ -1979,7 +2003,7 @@ def balance(user=Depends(require_user)):
     if peak < equity:
         peak = equity
     hard_floor = round(peak * 0.85, 2)
-    locked_profit = round(hard_floor - START_EQUITY, 2)
+    locked_profit = round(hard_floor - start_eq, 2)
     distance_to_floor = round(equity - hard_floor, 2)
     distance_pct = round(distance_to_floor / hard_floor * 100, 2) if hard_floor > 0 else 0.0
     ath = float(state_row["all_time_high"] or 0) if state_row else 0.0
@@ -1989,7 +2013,7 @@ def balance(user=Depends(require_user)):
         "total": equity,
         "equity_after_last_trade": equity,
         "last_trade": last_row["time"] if last_row else None,
-        "start_equity": START_EQUITY,
+        "start_equity": start_eq,
         "peak_equity": round(peak, 2),
         "hard_floor": hard_floor,
         "locked_profit": locked_profit,
