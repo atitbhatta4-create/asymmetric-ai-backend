@@ -4055,10 +4055,10 @@ class AutoRunner:
                     entry_price = self._fetch_price_sync(self.symbol)
                     self._last_trade_bad = False
                     grade = self.market_grade
-                    c = MODE_CONFIG[self.mode]
-                    st = STYLE_CONFIG[self.trade_style]
-                    sl_pct_open = self.last_atr_pct * st["sl_mult"]
-                    tp_pct_open = self.last_atr_pct * st["tp_mult"]
+                    c = presets_for_mode(self.mode)
+                    st = TRADE_STYLE_PARAMS.get(self.trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
+                    sl_pct_open = self.last_atr_pct * st["sl_atr"]
+                    tp_pct_open = self.last_atr_pct * st["tp_atr"]
 
                     if REAL_TRADING:
                         real_bal = get_real_usdt_balance(self.email)
