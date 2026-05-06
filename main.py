@@ -445,6 +445,9 @@ def init_db() -> None:
         )
         """)
 
+        if not column_exists(conn, "users", "display_name"):
+            cur.execute("ALTER TABLE users ADD COLUMN display_name TEXT DEFAULT ''")
+
         # Safe migrations for existing databases
         if not column_exists(conn, "trades", "reason"):
             cur.execute("ALTER TABLE trades ADD COLUMN reason TEXT")
@@ -1345,6 +1348,44 @@ def admin_force_reset(payload: AdminForceResetIn):
 
 
 # =========================
+# PROFILE + CONFIG
+# =========================
+
+class ProfileIn(BaseModel):
+    display_name: str
+
+@app.get("/profile")
+def get_profile(user=Depends(require_user)):
+    email = user["email"]
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT display_name FROM users WHERE email = %s", (email,))
+        row = cur.fetchone()
+        conn.close()
+    name = (row["display_name"] if row and row["display_name"] else "").strip()
+    if not name:
+        name = email.split("@")[0]
+    return {"email": email, "display_name": name}
+
+@app.post("/profile")
+def update_profile(payload: ProfileIn, user=Depends(require_user)):
+    email = user["email"]
+    name = payload.display_name.strip()[:40]
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET display_name = %s WHERE email = %s", (name, email))
+        conn.commit()
+        conn.close()
+    return {"ok": True, "display_name": name}
+
+@app.get("/config")
+def get_config():
+    return {"real_trading": REAL_TRADING}
+
+
+# =========================
 # EXCHANGE CONNECT
 # =========================
 class ExchangeConnectIn(BaseModel):
@@ -1968,25 +2009,16 @@ def balance(user=Depends(require_user)):
     email = user["email"]
 
     if REAL_TRADING:
-        # Always read live balance from exchange for real trading
         real_bal = get_real_usdt_balance(email)
         if real_bal is not None:
             equity = real_bal
-            # Sync DB so curves and history stay consistent
             db_equity = get_equity(email)
             if abs(db_equity - real_bal) > 0.01:
                 set_equity(email, real_bal)
-            # Auto-set start equity in DB if still at default $1000
-            if START_EQUITY <= 1000 and db_equity <= 1000.0 and real_bal > 0:
-                with DB_LOCK:
-                    conn = db()
-                    cur = conn.cursor()
-                    cur.execute("UPDATE user_state SET equity = %s WHERE email = %s", (real_bal, email))
-                    conn.commit()
-                    conn.close()
         else:
-            equity = get_equity(email)
-        start_eq = equity if get_equity(email) <= 1000.0 else get_equity(email)
+            # Exchange not connected or unreachable — show 0, not fake $1000
+            equity = 0.0
+        start_eq = equity
     else:
         equity = get_equity(email)
         start_eq = START_EQUITY
