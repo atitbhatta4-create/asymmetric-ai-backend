@@ -1534,6 +1534,21 @@ def exchange_balance(user=Depends(require_user)):
         }
 
 
+def get_real_usdt_balance(email: str) -> Optional[float]:
+    """Fetch live USDT balance from exchange. Returns None if exchange unreachable."""
+    row = get_exchange(email)
+    if not row:
+        return None
+    try:
+        ex = _make_ccxt_exchange(row)
+        balance = ex.fetch_balance({"accountType": "UNIFIED"})
+        usdt = balance.get("USDT", {})
+        total = float(usdt.get("total") or 0)
+        return total if total > 0 else None
+    except Exception:
+        return None
+
+
 # =========================
 # MARKET (PUBLIC) — OKX
 # =========================
@@ -3706,6 +3721,11 @@ class AutoRunner:
                 self.log(f"REAL POSITION CLOSED | {side} {self.symbol} | {outcome}")
             except Exception as _ce:
                 self.log(f"REAL CLOSE note: {_ce}")
+            # Sync real balance from exchange after close — overrides paper PnL calculation
+            real_bal_after = get_real_usdt_balance(self.email)
+            if real_bal_after is not None:
+                equity_after = real_bal_after
+                self.log(f"Post-trade balance synced: ${real_bal_after:.2f} USDT")
 
         sid = get_session_id(self.email)
         tr = Trade(
@@ -3981,9 +4001,19 @@ class AutoRunner:
                     grade = self.market_grade
                     c = MODE_CONFIG[self.mode]
                     st = STYLE_CONFIG[self.trade_style]
-                    equity_now = get_equity(self.email)
                     sl_pct_open = self.last_atr_pct * st["sl_mult"]
                     tp_pct_open = self.last_atr_pct * st["tp_mult"]
+
+                    if REAL_TRADING:
+                        real_bal = get_real_usdt_balance(self.email)
+                        if real_bal is None:
+                            self.log("REAL ORDER SKIPPED — could not fetch exchange balance.")
+                            continue
+                        equity_now = real_bal
+                        set_equity(self.email, real_bal)
+                        self.log(f"Exchange balance synced: ${real_bal:.2f} USDT")
+                    else:
+                        equity_now = get_equity(self.email)
 
                     real_order_id = None
                     if REAL_TRADING:
