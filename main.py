@@ -1523,9 +1523,9 @@ def exchange_test(user=Depends(require_user)):
     ex_id = (row.get("exchange") or "bybit").lower()
     try:
         if ex_id == "bybit":
-            bal = _bybit_direct_balance(row["api_key"], row["api_secret"])
+            bal, err_msg = _bybit_direct_balance(row["api_key"], row["api_secret"])
             if bal is None:
-                raise ValueError("Could not fetch Bybit balance — check API key, secret, and permissions (Read+Write, Unified Trading).")
+                raise ValueError(f"Bybit balance fetch failed: {err_msg}")
             return {"ok": True, "exchange": row["exchange"], "canTrade": True,
                     "accountType": "UNIFIED", "usdt_free": round(bal, 4),
                     "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
@@ -1582,8 +1582,12 @@ def exchange_balance(user=Depends(require_user)):
         }
 
 
-def _bybit_direct_balance(api_key: str, api_secret: str) -> Optional[float]:
-    """Direct Bybit V5 signed request for USDT balance — avoids ccxt's coin-info endpoint."""
+def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
+    """
+    Direct Bybit V5 signed request for USDT balance.
+    Returns (balance_float, None) on success, (None, error_str) on failure.
+    """
+    last_error = "No account types returned data"
     ts = str(int(time.time() * 1000))
     recv_window = "5000"
     for account_type in ["UNIFIED", "CONTRACT", "SPOT"]:
@@ -1603,16 +1607,21 @@ def _bybit_direct_balance(api_key: str, api_secret: str) -> Optional[float]:
                 headers=headers, timeout=10,
             )
             data = resp.json()
-            if data.get("retCode") == 0:
+            ret_code = data.get("retCode")
+            ret_msg  = data.get("retMsg", "")
+            if ret_code == 0:
                 for acc in data.get("result", {}).get("list", []):
                     for coin in acc.get("coin", []):
                         if coin.get("coin") == "USDT":
                             val = float(coin.get("walletBalance") or coin.get("equity") or 0)
-                            if val >= 0:
-                                return val
-        except Exception:
+                            return (val, None)
+                last_error = f"retCode=0 but no USDT coin found in {account_type} account"
+            else:
+                last_error = f"[{account_type}] retCode={ret_code} retMsg={ret_msg} HTTP={resp.status_code}"
+        except Exception as ex:
+            last_error = f"[{account_type}] exception: {ex}"
             continue
-    return None
+    return (None, last_error)
 
 
 def _okx_direct_balance(api_key: str, api_secret: str, passphrase: str) -> Optional[float]:
@@ -1673,7 +1682,8 @@ def get_real_usdt_balance(email: str) -> Optional[float]:
         return None
     ex_id = (row.get("exchange") or "bybit").lower()
     if ex_id == "bybit":
-        return _bybit_direct_balance(row["api_key"], row["api_secret"])
+        bal, _ = _bybit_direct_balance(row["api_key"], row["api_secret"])
+        return bal
     if ex_id == "okx":
         return _okx_direct_balance(row["api_key"], row["api_secret"], row.get("passphrase") or "")
     if ex_id == "binance":
