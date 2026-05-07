@@ -1520,40 +1520,47 @@ def exchange_test(user=Depends(require_user)):
     row = get_exchange(email)
     if not row:
         raise HTTPException(status_code=400, detail="No exchange connected.")
+    ex_id = (row.get("exchange") or "bybit").lower()
     try:
+        if ex_id == "bybit":
+            # Direct API — avoids ccxt's coin-info endpoint which is geo-blocked on some servers
+            bal = _bybit_direct_balance(row["api_key"], row["api_secret"])
+            if bal is None:
+                raise ValueError("Could not fetch balance from Bybit — check API key/secret and permissions.")
+            return {
+                "ok":         True,
+                "exchange":   row["exchange"],
+                "canTrade":   True,
+                "accountType": "UNIFIED",
+                "usdt_free":  round(bal, 4),
+                "usdt_total": round(bal, 4),
+                "note":       "Live connection verified ✓ (direct API)",
+            }
+
+        # OKX / Binance — use ccxt
         ex = _make_ccxt_exchange(row)
-        # Try UNIFIED account first, fall back to regular fetch
-        balance = None
         account_type = "UNIFIED"
         try:
             balance = ex.fetch_balance({"accountType": "UNIFIED"})
         except Exception:
-            try:
-                balance = ex.fetch_balance({})
-                account_type = "STANDARD"
-            except Exception as be:
-                raise ValueError(f"Balance fetch failed: {be}")
-
+            balance = ex.fetch_balance({})
+            account_type = "STANDARD"
         usdt = balance.get("USDT", {})
-        usdt_free  = round(float(usdt.get("free")  or 0), 4)
-        usdt_total = round(float(usdt.get("total") or 0), 4)
-
         return {
-            "ok": True,
-            "exchange": row["exchange"],
-            "canTrade": True,
+            "ok":          True,
+            "exchange":    row["exchange"],
+            "canTrade":    True,
             "accountType": account_type,
-            "usdt_free":   usdt_free,
-            "usdt_total":  usdt_total,
-            "note": f"Live connection verified ✓ ({account_type})",
+            "usdt_free":   round(float(usdt.get("free")  or 0), 4),
+            "usdt_total":  round(float(usdt.get("total") or 0), 4),
+            "note":        f"Live connection verified ✓ ({account_type})",
         }
     except Exception as e:
-        err = str(e)
         return {
-            "ok": False,
+            "ok":       False,
             "canTrade": False,
-            "error": err[:400],
-            "note": "Connection failed — see error below for exact reason.",
+            "error":    str(e)[:400],
+            "note":     "Connection failed — see error below for exact reason.",
         }
 
 
@@ -1586,14 +1593,50 @@ def exchange_balance(user=Depends(require_user)):
         }
 
 
+def _bybit_direct_balance(api_key: str, api_secret: str) -> Optional[float]:
+    """Direct Bybit V5 signed request for USDT balance — avoids ccxt's coin-info endpoint."""
+    ts = str(int(time.time() * 1000))
+    recv_window = "5000"
+    for account_type in ["UNIFIED", "CONTRACT", "SPOT"]:
+        try:
+            query = f"accountType={account_type}"
+            sign_str = ts + api_key + recv_window + query
+            sig = hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+            headers = {
+                "X-BAPI-API-KEY":      api_key,
+                "X-BAPI-TIMESTAMP":    ts,
+                "X-BAPI-SIGN":         sig,
+                "X-BAPI-RECV-WINDOW":  recv_window,
+                "Content-Type":        "application/json",
+            }
+            import httpx as _httpx
+            resp = _httpx.get(
+                f"https://api.bybit.com/v5/account/wallet-balance?{query}",
+                headers=headers, timeout=10,
+            )
+            data = resp.json()
+            if data.get("retCode") == 0:
+                for acc in data.get("result", {}).get("list", []):
+                    for coin in acc.get("coin", []):
+                        if coin.get("coin") == "USDT":
+                            val = float(coin.get("walletBalance") or coin.get("equity") or 0)
+                            if val >= 0:
+                                return val
+        except Exception:
+            continue
+    return None
+
+
 def get_real_usdt_balance(email: str) -> Optional[float]:
     """Fetch live USDT balance from exchange. Returns None if exchange unreachable."""
     row = get_exchange(email)
     if not row:
         return None
+    ex_id = (row.get("exchange") or "bybit").lower()
+    if ex_id == "bybit":
+        return _bybit_direct_balance(row["api_key"], row["api_secret"])
     try:
         ex = _make_ccxt_exchange(row)
-        # Try Unified Trading Account first, fall back to standard
         try:
             balance = ex.fetch_balance({"accountType": "UNIFIED"})
         except Exception:
