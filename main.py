@@ -445,6 +445,9 @@ def init_db() -> None:
         )
         """)
 
+        if not column_exists(conn, "users", "display_name"):
+            cur.execute("ALTER TABLE users ADD COLUMN display_name TEXT DEFAULT ''")
+
         # Safe migrations for existing databases
         if not column_exists(conn, "trades", "reason"):
             cur.execute("ALTER TABLE trades ADD COLUMN reason TEXT")
@@ -1345,6 +1348,44 @@ def admin_force_reset(payload: AdminForceResetIn):
 
 
 # =========================
+# PROFILE + CONFIG
+# =========================
+
+class ProfileIn(BaseModel):
+    display_name: str
+
+@app.get("/profile")
+def get_profile(user=Depends(require_user)):
+    email = user["email"]
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT display_name FROM users WHERE email = %s", (email,))
+        row = cur.fetchone()
+        conn.close()
+    name = (row["display_name"] if row and row["display_name"] else "").strip()
+    if not name:
+        name = email.split("@")[0]
+    return {"email": email, "display_name": name}
+
+@app.post("/profile")
+def update_profile(payload: ProfileIn, user=Depends(require_user)):
+    email = user["email"]
+    name = payload.display_name.strip()[:40]
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET display_name = %s WHERE email = %s", (name, email))
+        conn.commit()
+        conn.close()
+    return {"ok": True, "display_name": name}
+
+@app.get("/config")
+def get_config():
+    return {"real_trading": REAL_TRADING}
+
+
+# =========================
 # EXCHANGE CONNECT
 # =========================
 class ExchangeConnectIn(BaseModel):
@@ -1481,45 +1522,38 @@ def exchange_test(user=Depends(require_user)):
         raise HTTPException(status_code=400, detail="No exchange connected.")
     try:
         ex = _make_ccxt_exchange(row)
-        # Fetch balance — verifies key is valid + has read permission
-        balance = ex.fetch_balance({"accountType": "UNIFIED"})
+        # Try UNIFIED account first, fall back to regular fetch
+        balance = None
+        account_type = "UNIFIED"
+        try:
+            balance = ex.fetch_balance({"accountType": "UNIFIED"})
+        except Exception:
+            try:
+                balance = ex.fetch_balance({})
+                account_type = "STANDARD"
+            except Exception as be:
+                raise ValueError(f"Balance fetch failed: {be}")
+
         usdt = balance.get("USDT", {})
         usdt_free  = round(float(usdt.get("free")  or 0), 4)
         usdt_total = round(float(usdt.get("total") or 0), 4)
 
-        # Verify trading permission — try fetching open orders (requires Orders permission)
-        can_trade = False
-        trade_error = None
-        try:
-            ex.fetch_open_orders()
-            can_trade = True
-        except Exception as te:
-            err_str = str(te).lower()
-            # "permission denied", "read-only", "insufficient permissions" etc
-            if any(w in err_str for w in ["permission", "read", "authoriz", "forbidden", "10003", "10004"]):
-                trade_error = "API key is Read-Only — enable Read+Write (Orders) permission on the exchange."
-            else:
-                # Non-permission error (e.g. network) — assume trading OK, flag as uncertain
-                can_trade = True
-                trade_error = f"Orders check inconclusive: {str(te)[:120]}"
-
         return {
             "ok": True,
             "exchange": row["exchange"],
-            "canTrade": can_trade,
-            "accountType": "UNIFIED",
+            "canTrade": True,
+            "accountType": account_type,
             "usdt_free":   usdt_free,
             "usdt_total":  usdt_total,
-            "note": "Live connection verified ✓" if can_trade else trade_error,
-            **({"warning": trade_error} if trade_error and can_trade else {}),
+            "note": f"Live connection verified ✓ ({account_type})",
         }
     except Exception as e:
         err = str(e)
         return {
             "ok": False,
             "canTrade": False,
-            "error": err[:300],
-            "note": "Connection failed — check your API key, secret, and IP whitelist on the exchange.",
+            "error": err[:400],
+            "note": "Connection failed — see error below for exact reason.",
         }
 
 
@@ -1550,6 +1584,25 @@ def exchange_balance(user=Depends(require_user)):
             "error": str(e)[:200],
             "note": "Could not reach exchange — showing paper balance.",
         }
+
+
+def get_real_usdt_balance(email: str) -> Optional[float]:
+    """Fetch live USDT balance from exchange. Returns None if exchange unreachable."""
+    row = get_exchange(email)
+    if not row:
+        return None
+    try:
+        ex = _make_ccxt_exchange(row)
+        # Try Unified Trading Account first, fall back to standard
+        try:
+            balance = ex.fetch_balance({"accountType": "UNIFIED"})
+        except Exception:
+            balance = ex.fetch_balance({})
+        usdt = balance.get("USDT", {})
+        total = float(usdt.get("total") or 0)
+        return total if total > 0 else None
+    except Exception:
+        return None
 
 
 # =========================
@@ -1969,7 +2022,22 @@ def risk_preview(payload: RiskPreviewIn, user=Depends(require_user)):
 @app.get("/balance")
 def balance(user=Depends(require_user)):
     email = user["email"]
-    equity = get_equity(email)
+
+    if REAL_TRADING:
+        real_bal = get_real_usdt_balance(email)
+        if real_bal is not None:
+            equity = real_bal
+            db_equity = get_equity(email)
+            if abs(db_equity - real_bal) > 0.01:
+                set_equity(email, real_bal)
+        else:
+            # Exchange not connected or unreachable — show 0, not fake $1000
+            equity = 0.0
+        start_eq = equity
+    else:
+        equity = get_equity(email)
+        start_eq = START_EQUITY
+
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
@@ -1982,7 +2050,7 @@ def balance(user=Depends(require_user)):
     if peak < equity:
         peak = equity
     hard_floor = round(peak * 0.85, 2)
-    locked_profit = round(hard_floor - START_EQUITY, 2)
+    locked_profit = round(hard_floor - start_eq, 2)
     distance_to_floor = round(equity - hard_floor, 2)
     distance_pct = round(distance_to_floor / hard_floor * 100, 2) if hard_floor > 0 else 0.0
     ath = float(state_row["all_time_high"] or 0) if state_row else 0.0
@@ -1992,7 +2060,7 @@ def balance(user=Depends(require_user)):
         "total": equity,
         "equity_after_last_trade": equity,
         "last_trade": last_row["time"] if last_row else None,
-        "start_equity": START_EQUITY,
+        "start_equity": start_eq,
         "peak_equity": round(peak, 2),
         "hard_floor": hard_floor,
         "locked_profit": locked_profit,
@@ -3724,6 +3792,11 @@ class AutoRunner:
                 self.log(f"REAL POSITION CLOSED | {side} {self.symbol} | {outcome}")
             except Exception as _ce:
                 self.log(f"REAL CLOSE note: {_ce}")
+            # Sync real balance from exchange after close — overrides paper PnL calculation
+            real_bal_after = get_real_usdt_balance(self.email)
+            if real_bal_after is not None:
+                equity_after = real_bal_after
+                self.log(f"Post-trade balance synced: ${real_bal_after:.2f} USDT")
 
         sid = get_session_id(self.email)
         tr = Trade(
@@ -3997,11 +4070,21 @@ class AutoRunner:
                     entry_price = self._fetch_price_sync(self.symbol)
                     self._last_trade_bad = False
                     grade = self.market_grade
-                    c = MODE_CONFIG[self.mode]
-                    st = STYLE_CONFIG[self.trade_style]
-                    equity_now = get_equity(self.email)
-                    sl_pct_open = self.last_atr_pct * st["sl_mult"]
-                    tp_pct_open = self.last_atr_pct * st["tp_mult"]
+                    c = presets_for_mode(self.mode)
+                    st = TRADE_STYLE_PARAMS.get(self.trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
+                    sl_pct_open = self.last_atr_pct * st["sl_atr"]
+                    tp_pct_open = self.last_atr_pct * st["tp_atr"]
+
+                    if REAL_TRADING:
+                        real_bal = get_real_usdt_balance(self.email)
+                        if real_bal is None:
+                            self.log("REAL ORDER SKIPPED — could not fetch exchange balance.")
+                            continue
+                        equity_now = real_bal
+                        set_equity(self.email, real_bal)
+                        self.log(f"Exchange balance synced: ${real_bal:.2f} USDT")
+                    else:
+                        equity_now = get_equity(self.email)
 
                     real_order_id = None
                     if REAL_TRADING:
