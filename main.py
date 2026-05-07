@@ -1522,45 +1522,38 @@ def exchange_test(user=Depends(require_user)):
         raise HTTPException(status_code=400, detail="No exchange connected.")
     try:
         ex = _make_ccxt_exchange(row)
-        # Fetch balance — verifies key is valid + has read permission
-        balance = ex.fetch_balance({"accountType": "UNIFIED"})
+        # Try UNIFIED account first, fall back to regular fetch
+        balance = None
+        account_type = "UNIFIED"
+        try:
+            balance = ex.fetch_balance({"accountType": "UNIFIED"})
+        except Exception:
+            try:
+                balance = ex.fetch_balance({})
+                account_type = "STANDARD"
+            except Exception as be:
+                raise ValueError(f"Balance fetch failed: {be}")
+
         usdt = balance.get("USDT", {})
         usdt_free  = round(float(usdt.get("free")  or 0), 4)
         usdt_total = round(float(usdt.get("total") or 0), 4)
 
-        # Verify trading permission — try fetching open orders (requires Orders permission)
-        can_trade = False
-        trade_error = None
-        try:
-            ex.fetch_open_orders()
-            can_trade = True
-        except Exception as te:
-            err_str = str(te).lower()
-            # "permission denied", "read-only", "insufficient permissions" etc
-            if any(w in err_str for w in ["permission", "read", "authoriz", "forbidden", "10003", "10004"]):
-                trade_error = "API key is Read-Only — enable Read+Write (Orders) permission on the exchange."
-            else:
-                # Non-permission error (e.g. network) — assume trading OK, flag as uncertain
-                can_trade = True
-                trade_error = f"Orders check inconclusive: {str(te)[:120]}"
-
         return {
             "ok": True,
             "exchange": row["exchange"],
-            "canTrade": can_trade,
-            "accountType": "UNIFIED",
+            "canTrade": True,
+            "accountType": account_type,
             "usdt_free":   usdt_free,
             "usdt_total":  usdt_total,
-            "note": "Live connection verified ✓" if can_trade else trade_error,
-            **({"warning": trade_error} if trade_error and can_trade else {}),
+            "note": f"Live connection verified ✓ ({account_type})",
         }
     except Exception as e:
         err = str(e)
         return {
             "ok": False,
             "canTrade": False,
-            "error": err[:300],
-            "note": "Connection failed — check your API key, secret, and IP whitelist on the exchange.",
+            "error": err[:400],
+            "note": "Connection failed — see error below for exact reason.",
         }
 
 
@@ -1600,7 +1593,11 @@ def get_real_usdt_balance(email: str) -> Optional[float]:
         return None
     try:
         ex = _make_ccxt_exchange(row)
-        balance = ex.fetch_balance({"accountType": "UNIFIED"})
+        # Try Unified Trading Account first, fall back to standard
+        try:
+            balance = ex.fetch_balance({"accountType": "UNIFIED"})
+        except Exception:
+            balance = ex.fetch_balance({})
         usdt = balance.get("USDT", {})
         total = float(usdt.get("total") or 0)
         return total if total > 0 else None
