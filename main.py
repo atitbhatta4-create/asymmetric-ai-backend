@@ -859,7 +859,7 @@ def clear_session_cookie(response: Response) -> None:
 # =========================
 @app.post("/auth/signup")
 def signup(request: Request, payload: AuthIn):
-    _rate_limit(request, limit=5)
+    _rate_limit(request, limit=3, window=3600)  # 3 per hour per IP
     email = payload.email.strip().lower()
     if not email or not payload.password:
         raise HTTPException(status_code=400, detail="Email and password required")
@@ -889,7 +889,7 @@ def signup(request: Request, payload: AuthIn):
 
 @app.post("/auth/login", response_model=SessionOut)
 def login(request: Request, payload: AuthIn, response: Response):
-    _rate_limit(request, limit=10)
+    _rate_limit(request, limit=5, window=900)  # 5 per 15 minutes per IP
     email = payload.email.strip().lower()
 
     with DB_LOCK:
@@ -1019,7 +1019,7 @@ class VerifyOtpIn(BaseModel):
 
 @app.post("/auth/forgot-password")
 def forgot_password(request: Request, payload: ForgotPasswordIn):
-    _rate_limit(request, limit=3)
+    _rate_limit(request, limit=3, window=3600)  # 3 per hour per IP
     email = payload.email.strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="Email required")
@@ -1054,7 +1054,7 @@ def forgot_password(request: Request, payload: ForgotPasswordIn):
 
 @app.post("/auth/reset-password")
 def reset_password(request: Request, payload: VerifyOtpIn):
-    _rate_limit(request, limit=5)
+    _rate_limit(request, limit=3, window=3600)  # 3 per hour per IP
     email = payload.email.strip().lower()
     code  = payload.code.strip()
 
@@ -1522,19 +1522,37 @@ def exchange_test(user=Depends(require_user)):
         raise HTTPException(status_code=400, detail="No exchange connected.")
     try:
         ex = _make_ccxt_exchange(row)
-        # Fetch account info to verify key is valid and has trading permissions
-        status = ex.fetch_status()
-        # Try a lightweight authenticated call
+        # Fetch balance — verifies key is valid + has read permission
         balance = ex.fetch_balance({"accountType": "UNIFIED"})
         usdt = balance.get("USDT", {})
+        usdt_free  = round(float(usdt.get("free")  or 0), 4)
+        usdt_total = round(float(usdt.get("total") or 0), 4)
+
+        # Verify trading permission — try fetching open orders (requires Orders permission)
+        can_trade = False
+        trade_error = None
+        try:
+            ex.fetch_open_orders()
+            can_trade = True
+        except Exception as te:
+            err_str = str(te).lower()
+            # "permission denied", "read-only", "insufficient permissions" etc
+            if any(w in err_str for w in ["permission", "read", "authoriz", "forbidden", "10003", "10004"]):
+                trade_error = "API key is Read-Only — enable Read+Write (Orders) permission on the exchange."
+            else:
+                # Non-permission error (e.g. network) — assume trading OK, flag as uncertain
+                can_trade = True
+                trade_error = f"Orders check inconclusive: {str(te)[:120]}"
+
         return {
             "ok": True,
             "exchange": row["exchange"],
-            "canTrade": True,
+            "canTrade": can_trade,
             "accountType": "UNIFIED",
-            "usdt_free": round(float(usdt.get("free") or 0), 4),
-            "usdt_total": round(float(usdt.get("total") or 0), 4),
-            "note": "Live connection verified ✓",
+            "usdt_free":   usdt_free,
+            "usdt_total":  usdt_total,
+            "note": "Live connection verified ✓" if can_trade else trade_error,
+            **({"warning": trade_error} if trade_error and can_trade else {}),
         }
     except Exception as e:
         err = str(e)
@@ -4236,15 +4254,23 @@ def place_real_order(
     ticker = ex.fetch_ticker(symbol)
     price  = float(ticker["last"])
 
-    # Set leverage (best-effort — some accounts have fixed leverage)
+    # Set leverage — logged if it fails (non-fatal, order still placed with current exchange leverage)
     try:
         ex.set_leverage(leverage, symbol)
-    except Exception:
-        pass
+    except Exception as lev_e:
+        print(f"[place_real_order] leverage set failed ({leverage}x on {symbol}): {lev_e}")
 
     # Quantity in base currency
     notional = usdt_size * leverage
     qty = round(notional / price, 6)
+
+    # Minimum order size guard — reject before hitting exchange
+    min_qty = EXCHANGE_FEES.get(ex_id, EXCHANGE_FEES["bybit"]).get("min_qty", 0)
+    if min_qty and qty < min_qty:
+        raise ValueError(
+            f"Position too small: {qty:.6f} {symbol} is below exchange minimum {min_qty}. "
+            f"Notional ${notional:.2f} insufficient — increase account size or use a higher-size mode."
+        )
 
     # SL / TP prices
     sl_price = round(price * sl_mult,   4)
