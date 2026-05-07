@@ -1523,45 +1523,34 @@ def exchange_test(user=Depends(require_user)):
     ex_id = (row.get("exchange") or "bybit").lower()
     try:
         if ex_id == "bybit":
-            # Direct API — avoids ccxt's coin-info endpoint which is geo-blocked on some servers
             bal = _bybit_direct_balance(row["api_key"], row["api_secret"])
             if bal is None:
-                raise ValueError("Could not fetch balance from Bybit — check API key/secret and permissions.")
-            return {
-                "ok":         True,
-                "exchange":   row["exchange"],
-                "canTrade":   True,
-                "accountType": "UNIFIED",
-                "usdt_free":  round(bal, 4),
-                "usdt_total": round(bal, 4),
-                "note":       "Live connection verified ✓ (direct API)",
-            }
+                raise ValueError("Could not fetch Bybit balance — check API key, secret, and permissions (Read+Write, Unified Trading).")
+            return {"ok": True, "exchange": row["exchange"], "canTrade": True,
+                    "accountType": "UNIFIED", "usdt_free": round(bal, 4),
+                    "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
 
-        # OKX / Binance — use ccxt
-        ex = _make_ccxt_exchange(row)
-        account_type = "UNIFIED"
-        try:
-            balance = ex.fetch_balance({"accountType": "UNIFIED"})
-        except Exception:
-            balance = ex.fetch_balance({})
-            account_type = "STANDARD"
-        usdt = balance.get("USDT", {})
-        return {
-            "ok":          True,
-            "exchange":    row["exchange"],
-            "canTrade":    True,
-            "accountType": account_type,
-            "usdt_free":   round(float(usdt.get("free")  or 0), 4),
-            "usdt_total":  round(float(usdt.get("total") or 0), 4),
-            "note":        f"Live connection verified ✓ ({account_type})",
-        }
+        if ex_id == "okx":
+            bal = _okx_direct_balance(row["api_key"], row["api_secret"], row.get("passphrase") or "")
+            if bal is None:
+                raise ValueError("Could not fetch OKX balance — check API key, secret, passphrase, and permissions.")
+            return {"ok": True, "exchange": row["exchange"], "canTrade": True,
+                    "accountType": "UNIFIED", "usdt_free": round(bal, 4),
+                    "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
+
+        if ex_id == "binance":
+            bal = _binance_direct_balance(row["api_key"], row["api_secret"])
+            if bal is None:
+                raise ValueError("Could not fetch Binance Futures balance — check API key, secret, and Futures permissions.")
+            return {"ok": True, "exchange": row["exchange"], "canTrade": True,
+                    "accountType": "FUTURES", "usdt_free": round(bal, 4),
+                    "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
+
+        raise ValueError(f"Unsupported exchange: {ex_id}")
     except Exception as e:
-        return {
-            "ok":       False,
-            "canTrade": False,
-            "error":    str(e)[:400],
-            "note":     "Connection failed — see error below for exact reason.",
-        }
+        return {"ok": False, "canTrade": False,
+                "error": str(e)[:400],
+                "note": "Connection failed — see error below for exact reason."}
 
 
 @app.get("/exchange/balance")
@@ -1603,14 +1592,13 @@ def _bybit_direct_balance(api_key: str, api_secret: str) -> Optional[float]:
             sign_str = ts + api_key + recv_window + query
             sig = hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
             headers = {
-                "X-BAPI-API-KEY":      api_key,
-                "X-BAPI-TIMESTAMP":    ts,
-                "X-BAPI-SIGN":         sig,
-                "X-BAPI-RECV-WINDOW":  recv_window,
-                "Content-Type":        "application/json",
+                "X-BAPI-API-KEY":     api_key,
+                "X-BAPI-TIMESTAMP":   ts,
+                "X-BAPI-SIGN":        sig,
+                "X-BAPI-RECV-WINDOW": recv_window,
+                "Content-Type":       "application/json",
             }
-            import httpx as _httpx
-            resp = _httpx.get(
+            resp = httpx.get(
                 f"https://api.bybit.com/v5/account/wallet-balance?{query}",
                 headers=headers, timeout=10,
             )
@@ -1627,25 +1615,70 @@ def _bybit_direct_balance(api_key: str, api_secret: str) -> Optional[float]:
     return None
 
 
+def _okx_direct_balance(api_key: str, api_secret: str, passphrase: str) -> Optional[float]:
+    """Direct OKX V5 signed request for USDT balance."""
+    import base64
+    from datetime import timezone as _tz
+    ts = datetime.now(_tz.utc).strftime('%Y-%m-%dT%H:%M:%S.') + \
+         str(datetime.now(_tz.utc).microsecond // 1000).zfill(3) + 'Z'
+    path = "/api/v5/account/balance"
+    sign_str = ts + "GET" + path + ""
+    sig = base64.b64encode(
+        hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()
+    ).decode()
+    headers = {
+        "OK-ACCESS-KEY":        api_key,
+        "OK-ACCESS-SIGN":       sig,
+        "OK-ACCESS-TIMESTAMP":  ts,
+        "OK-ACCESS-PASSPHRASE": passphrase,
+        "Content-Type":         "application/json",
+    }
+    try:
+        resp = httpx.get(f"https://www.okx.com{path}", headers=headers, timeout=10)
+        data = resp.json()
+        if data.get("code") == "0":
+            for detail in data.get("data", [{}])[0].get("details", []):
+                if detail.get("ccy") == "USDT":
+                    return float(detail.get("cashBal") or detail.get("availBal") or 0)
+    except Exception:
+        pass
+    return None
+
+
+def _binance_direct_balance(api_key: str, api_secret: str) -> Optional[float]:
+    """Direct Binance Futures V2 signed request for USDT balance."""
+    ts = str(int(time.time() * 1000))
+    params = f"timestamp={ts}"
+    sig = hmac.new(api_secret.encode(), params.encode(), hashlib.sha256).hexdigest()
+    headers = {"X-MBX-APIKEY": api_key}
+    try:
+        resp = httpx.get(
+            f"https://fapi.binance.com/fapi/v2/balance?{params}&signature={sig}",
+            headers=headers, timeout=10,
+        )
+        data = resp.json()
+        if isinstance(data, list):
+            for item in data:
+                if item.get("asset") == "USDT":
+                    return float(item.get("balance") or item.get("availableBalance") or 0)
+    except Exception:
+        pass
+    return None
+
+
 def get_real_usdt_balance(email: str) -> Optional[float]:
-    """Fetch live USDT balance from exchange. Returns None if exchange unreachable."""
+    """Fetch live USDT balance from exchange using direct API (no ccxt)."""
     row = get_exchange(email)
     if not row:
         return None
     ex_id = (row.get("exchange") or "bybit").lower()
     if ex_id == "bybit":
         return _bybit_direct_balance(row["api_key"], row["api_secret"])
-    try:
-        ex = _make_ccxt_exchange(row)
-        try:
-            balance = ex.fetch_balance({"accountType": "UNIFIED"})
-        except Exception:
-            balance = ex.fetch_balance({})
-        usdt = balance.get("USDT", {})
-        total = float(usdt.get("total") or 0)
-        return total if total > 0 else None
-    except Exception:
-        return None
+    if ex_id == "okx":
+        return _okx_direct_balance(row["api_key"], row["api_secret"], row.get("passphrase") or "")
+    if ex_id == "binance":
+        return _binance_direct_balance(row["api_key"], row["api_secret"])
+    return None
 
 
 # =========================
