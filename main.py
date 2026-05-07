@@ -1560,7 +1560,13 @@ def exchange_balance(user=Depends(require_user)):
     row = get_exchange(email)
     if not row:
         raise HTTPException(status_code=400, detail="No exchange connected.")
+    ex_id = (row.get("exchange") or "bybit").lower()
     try:
+        if ex_id == "bybit":
+            bal, err = _bybit_direct_balance(row["api_key"], row["api_secret"])
+            if bal is not None:
+                return {"ok": True, "balances": [{"asset": "USDT", "free": round(bal, 4), "locked": 0.0}], "note": "Live balance from exchange ✓"}
+            raise ValueError(err)
         ex = _make_ccxt_exchange(row)
         balance = ex.fetch_balance({"accountType": "UNIFIED"})
         balances = []
@@ -1572,7 +1578,6 @@ def exchange_balance(user=Depends(require_user)):
                 balances.append({"asset": asset, "free": round(free, 6), "locked": round(total - free, 6)})
         return {"ok": True, "balances": balances, "note": "Live balance from exchange ✓"}
     except Exception as e:
-        # Fallback to virtual equity when exchange unreachable
         eq = get_equity(email)
         return {
             "ok": False,
@@ -1582,31 +1587,42 @@ def exchange_balance(user=Depends(require_user)):
         }
 
 
+BYBIT_HOSTS = ["https://api.bybit.com", "https://api.bytick.com"]
+
+def _bybit_signed_get(api_key: str, api_secret: str, path: str, query: str) -> Optional[dict]:
+    """Make a signed Bybit GET request, trying both hosts. Returns parsed JSON or None."""
+    ts = str(int(time.time() * 1000))
+    recv_window = "5000"
+    sign_str = ts + api_key + recv_window + query
+    sig = hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY":     api_key,
+        "X-BAPI-TIMESTAMP":   ts,
+        "X-BAPI-SIGN":        sig,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "Content-Type":       "application/json",
+    }
+    for host in BYBIT_HOSTS:
+        try:
+            resp = httpx.get(f"{host}{path}?{query}", headers=headers, timeout=10)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            continue
+    return None
+
+
 def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
     """
     Direct Bybit V5 signed request for USDT balance.
     Returns (balance_float, None) on success, (None, error_str) on failure.
     """
-    last_error = "No account types returned data"
-    ts = str(int(time.time() * 1000))
-    recv_window = "5000"
     for account_type in ["UNIFIED", "CONTRACT", "SPOT"]:
         try:
             query = f"accountType={account_type}"
-            sign_str = ts + api_key + recv_window + query
-            sig = hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
-            headers = {
-                "X-BAPI-API-KEY":     api_key,
-                "X-BAPI-TIMESTAMP":   ts,
-                "X-BAPI-SIGN":        sig,
-                "X-BAPI-RECV-WINDOW": recv_window,
-                "Content-Type":       "application/json",
-            }
-            resp = httpx.get(
-                f"https://api.bybit.com/v5/account/wallet-balance?{query}",
-                headers=headers, timeout=10,
-            )
-            data = resp.json()
+            data = _bybit_signed_get(api_key, api_secret, "/v5/account/wallet-balance", query)
+            if data is None:
+                continue
             ret_code = data.get("retCode")
             ret_msg  = data.get("retMsg", "")
             if ret_code == 0:
@@ -1615,13 +1631,13 @@ def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
                         if coin.get("coin") == "USDT":
                             val = float(coin.get("walletBalance") or coin.get("equity") or 0)
                             return (val, None)
-                last_error = f"retCode=0 but no USDT coin found in {account_type} account"
-            else:
-                last_error = f"[{account_type}] retCode={ret_code} retMsg={ret_msg} HTTP={resp.status_code}"
+            elif ret_code in (10003, 10004):
+                return (None, f"Invalid API key or secret (retCode={ret_code}: {ret_msg})")
+            elif ret_code is not None:
+                return (None, f"Bybit API error retCode={ret_code}: {ret_msg}")
         except Exception as ex:
-            last_error = f"[{account_type}] exception: {ex}"
-            continue
-    return (None, last_error)
+            return (None, f"Exception: {ex}")
+    return (None, "Both api.bybit.com and api.bytick.com are unreachable from this server — try changing Render region to Frankfurt or Singapore.")
 
 
 def _okx_direct_balance(api_key: str, api_secret: str, passphrase: str) -> Optional[float]:
