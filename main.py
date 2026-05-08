@@ -1617,7 +1617,7 @@ def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
     Direct Bybit V5 signed request for USDT balance.
     Returns (balance_float, None) on success, (None, error_str) on failure.
     """
-    for account_type in ["UNIFIED", "CONTRACT", "SPOT"]:
+    for account_type in ["UNIFIED"]:
         try:
             query = f"accountType={account_type}"
             data = _bybit_signed_get(api_key, api_secret, "/v5/account/wallet-balance", query)
