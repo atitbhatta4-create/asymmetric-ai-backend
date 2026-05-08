@@ -3624,11 +3624,18 @@ class AutoRunner:
         risk = mini_asym_risk_engine(mode, equity_before)
         c = risk["computed"]
 
-        # ATR-based SL/TP — adapts to real market volatility
+        # SL/TP locked at trade entry — never recalculate from fresh ATR mid-trade.
+        # This ensures T1 and T2 keep their original separate SLs across candles
+        # and after server restarts. Only the trailing stop can move SL upward.
         sp = TRADE_STYLE_PARAMS.get(self.trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
         atr = self.last_atr_pct
-        sl_pct = min(atr * sp["sl_atr"], sp["sl_max"] / 100.0)
-        tp_pct = min(atr * sp["tp_atr"], sp["tp_max"] / 100.0) * tp_mult
+        if pt.get("sl_pct_open"):
+            sl_pct = float(pt["sl_pct_open"])
+            tp_pct = float(pt["tp_pct_open"]) * tp_mult
+        else:
+            # Legacy trades opened before this fix — fall back to ATR recalc
+            sl_pct = min(atr * sp["sl_atr"], sp["sl_max"] / 100.0)
+            tp_pct = min(atr * sp["tp_atr"], sp["tp_max"] / 100.0) * tp_mult
         sl_pct = max(sl_pct, 0.002)
         tp_pct = max(tp_pct, 0.004)
 
@@ -3700,12 +3707,14 @@ class AutoRunner:
         # Apply all size multipliers
         effective_size = c["size"] * size_mult * vol_size_mult * dd_size_mult
 
-        # Hard per-trade max loss cap — scales by trade style (wider SL allowed on longer TF)
-        max_loss_pct = {"SCALP": 0.015, "DAY_TRADE": 0.020, "SWING": 0.030}.get(self.trade_style, 0.020)
-        max_sl_for_cap = max_loss_pct / (effective_size * c["leverage"]) if (effective_size * c["leverage"]) > 0 else sl_pct
-        if sl_pct > max_sl_for_cap:
-            sl_pct = max_sl_for_cap
-            tp_pct = sl_pct * (sp["tp_atr"] / sp["sl_atr"]) * tp_mult
+        # Hard per-trade max loss cap — only applies to legacy trades without locked SL.
+        # For trades with sl_pct_open, the cap was already applied at entry time.
+        if not pt.get("sl_pct_open"):
+            max_loss_pct = {"SCALP": 0.015, "DAY_TRADE": 0.020, "SWING": 0.030}.get(self.trade_style, 0.020)
+            max_sl_for_cap = max_loss_pct / (effective_size * c["leverage"]) if (effective_size * c["leverage"]) > 0 else sl_pct
+            if sl_pct > max_sl_for_cap:
+                sl_pct = max_sl_for_cap
+                tp_pct = sl_pct * (sp["tp_atr"] / sp["sl_atr"]) * tp_mult
 
         # ── Intrabar SL/TP detection ──────────────────────────────────────
         # Use candle high/low to check if SL or TP was touched DURING the
@@ -4210,6 +4219,8 @@ class AutoRunner:
                         "mode": self.mode,
                         "signal": self.last_signal,
                         "open_ts": time.time(),
+                        "sl_pct_open": sl_pct_open,   # locked at entry — never recalculates
+                        "tp_pct_open": tp_pct_open,   # locked at entry — never recalculates
                         **({"order_id": real_order_id} if real_order_id else {}),
                     }
                     if grade == "B":
