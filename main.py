@@ -2143,17 +2143,18 @@ def risk_preview(payload: RiskPreviewIn, user=Depends(require_user)):
 def balance(user=Depends(require_user)):
     email = user["email"]
 
-    if REAL_TRADING:
-        real_bal = get_real_usdt_balance(email)
-        if real_bal is not None:
-            equity = real_bal
-            db_equity = get_equity(email)
-            if abs(db_equity - real_bal) > 0.01:
-                set_equity(email, real_bal)
-        else:
-            # Exchange not connected or unreachable — show 0, not fake $1000
-            equity = 0.0
+    real_bal = get_real_usdt_balance(email)
+    if real_bal is not None:
+        # Exchange connected — always show real balance on equity card
+        equity = real_bal
+        db_equity = get_equity(email)
+        if abs(db_equity - real_bal) > 0.01:
+            set_equity(email, real_bal)
         start_eq = equity
+    elif REAL_TRADING:
+        # Real trading mode but exchange unreachable — show 0, not fake balance
+        equity = 0.0
+        start_eq = 0.0
     else:
         equity = get_equity(email)
         start_eq = START_EQUITY
