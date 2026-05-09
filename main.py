@@ -4201,8 +4201,8 @@ class AutoRunner:
                     grade = self.market_grade
                     c = presets_for_mode(self.mode)
                     st = TRADE_STYLE_PARAMS.get(self.trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
-                    sl_pct_open = self.last_atr_pct * st["sl_atr"]
-                    tp_pct_open = self.last_atr_pct * st["tp_atr"]
+                    sl_pct_open = min(self.last_atr_pct * st["sl_atr"], st["sl_max"] / 100.0)
+                    tp_pct_open = min(self.last_atr_pct * st["tp_atr"], st["tp_max"] / 100.0)
 
                     if REAL_TRADING:
                         real_bal = get_real_usdt_balance(self.email)
