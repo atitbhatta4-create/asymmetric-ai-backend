@@ -1624,7 +1624,7 @@ def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
     Returns (balance_float, None) on success, (None, error_str) on failure.
     """
     last_net_error = ""
-    for account_type in ["UNIFIED"]:
+    for account_type in ["UNIFIED", "CONTRACT", "SPOT"]:
         try:
             query = f"accountType={account_type}"
             data, last_net_error = _bybit_signed_get(api_key, api_secret, "/v5/account/wallet-balance", query)
@@ -1632,11 +1632,15 @@ def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
                 continue
             ret_code = data.get("retCode")
             ret_msg  = data.get("retMsg", "")
+            print(f"[bybit-balance] accountType={account_type} retCode={ret_code} retMsg={ret_msg}")
             if ret_code == 0:
-                for acc in data.get("result", {}).get("list", []):
+                acct_list = data.get("result", {}).get("list", [])
+                print(f"[bybit-balance] accounts={len(acct_list)} coins={[c.get('coin') for a in acct_list for c in a.get('coin',[])]}")
+                for acc in acct_list:
                     for coin in acc.get("coin", []):
                         if coin.get("coin") == "USDT":
                             val = float(coin.get("walletBalance") or coin.get("equity") or 0)
+                            print(f"[bybit-balance] USDT found via {account_type}: {val}")
                             return (val, None)
             elif ret_code in (10003, 10004):
                 return (None, f"Invalid API key or secret (retCode={ret_code}: {ret_msg})")
@@ -1645,7 +1649,7 @@ def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
         except Exception as ex:
             return (None, f"Exception: {ex}")
     detail = f" ({last_net_error})" if last_net_error else ""
-    return (None, f"Both api.bybit.com and api.bytick.com are unreachable{detail}")
+    return (None, f"Both hosts unreachable or no USDT balance found across UNIFIED/CONTRACT/SPOT{detail}")
 
 
 def _okx_direct_balance(api_key: str, api_secret: str, passphrase: str) -> Optional[float]:
