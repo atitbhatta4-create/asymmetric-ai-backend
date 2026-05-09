@@ -4071,13 +4071,11 @@ class AutoRunner:
                     self.blocked_reason = "EXCHANGE_NOT_CONNECTED"
                     self.last_signal = "BLOCKED: EXCHANGE_NOT_CONNECTED"
                     self.log("Blocked: exchange not connected.")
-                    time.sleep(self.interval_sec)
                     continue
 
                 # ── Step 1: Close any pending trades first (real exit after one interval) ──
                 if self.pending_trades:
                     self._close_pending_trades()
-                    time.sleep(self.interval_sec)
                     continue
 
                 # ── Step 2a: Hard floor + max drawdown guard ─────────────────────────────
@@ -4139,7 +4137,6 @@ class AutoRunner:
                 if not res.get("ok"):
                     self.blocked_reason = res.get("blocked") or "BLOCKED"
                     self.log(f"Blocked: {self.blocked_reason[:100]}")
-                    time.sleep(self.interval_sec)
                     continue
 
                 self.blocked_reason = None
