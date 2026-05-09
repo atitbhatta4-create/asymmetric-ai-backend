@@ -1589,8 +1589,8 @@ def exchange_balance(user=Depends(require_user)):
 
 BYBIT_HOSTS = ["https://api.bybit.com", "https://api.bytick.com"]
 
-def _bybit_signed_get(api_key: str, api_secret: str, path: str, query: str) -> Optional[dict]:
-    """Make a signed Bybit GET request, trying both hosts. Returns parsed JSON or None."""
+def _bybit_signed_get(api_key: str, api_secret: str, path: str, query: str) -> tuple[Optional[dict], str]:
+    """Make a signed Bybit GET request, trying both hosts. Returns (parsed JSON or None, last_error)."""
     ts = str(int(time.time() * 1000))
     recv_window = "5000"
     sign_str = ts + api_key + recv_window + query
@@ -1602,13 +1602,19 @@ def _bybit_signed_get(api_key: str, api_secret: str, path: str, query: str) -> O
         "X-BAPI-RECV-WINDOW": recv_window,
         "Content-Type":       "application/json",
     }
+    last_error = "unknown"
     for host in BYBIT_HOSTS:
         try:
             resp = httpx.get(f"{host}{path}?{query}", headers=headers, timeout=10)
+            print(f"[bybit] {host}{path} → HTTP {resp.status_code}")
             if resp.status_code == 200:
-                return resp.json()
-        except Exception:
-            continue
+                return resp.json(), ""
+            last_error = f"HTTP {resp.status_code} from {host}: {resp.text[:200]}"
+            print(f"[bybit] non-200: {last_error}")
+        except Exception as e:
+            last_error = f"{type(e).__name__} from {host}: {e}"
+            print(f"[bybit] exception: {last_error}")
+    return None, last_error
     return None
 
 
@@ -1617,10 +1623,11 @@ def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
     Direct Bybit V5 signed request for USDT balance.
     Returns (balance_float, None) on success, (None, error_str) on failure.
     """
+    last_net_error = ""
     for account_type in ["UNIFIED"]:
         try:
             query = f"accountType={account_type}"
-            data = _bybit_signed_get(api_key, api_secret, "/v5/account/wallet-balance", query)
+            data, last_net_error = _bybit_signed_get(api_key, api_secret, "/v5/account/wallet-balance", query)
             if data is None:
                 continue
             ret_code = data.get("retCode")
@@ -1637,7 +1644,8 @@ def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
                 return (None, f"Bybit API error retCode={ret_code}: {ret_msg}")
         except Exception as ex:
             return (None, f"Exception: {ex}")
-    return (None, "Both api.bybit.com and api.bytick.com are unreachable from this server — try changing Render region to Frankfurt or Singapore.")
+    detail = f" Last error: {last_net_error}" if last_net_error else ""
+    return (None, f"Bybit balance fetch failed: Both api.bybit.com and api.bytick.com are unreachable from this server — try changing Render region to Frankfurt or Singapore.{detail}")
 
 
 def _okx_direct_balance(api_key: str, api_secret: str, passphrase: str) -> Optional[float]:
