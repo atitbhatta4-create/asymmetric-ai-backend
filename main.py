@@ -4219,7 +4219,7 @@ class AutoRunner:
                     real_order_id = None
                     if REAL_TRADING:
                         try:
-                            size_pct = float(c["size"]) * 1.0  # Grade A full size
+                            size_pct = float(c["size"])
                             usdt_size = equity_now * size_pct
                             result = place_real_order(
                                 email=self.email, symbol=self.symbol, side=desired_side,
@@ -4238,11 +4238,20 @@ class AutoRunner:
                         "mode": self.mode,
                         "signal": self.last_signal,
                         "open_ts": time.time(),
-                        "sl_pct_open": sl_pct_open,   # locked at entry — never recalculates
-                        "tp_pct_open": tp_pct_open,   # locked at entry — never recalculates
+                        "sl_pct_open": sl_pct_open,
+                        "tp_pct_open": tp_pct_open,
                         **({"order_id": real_order_id} if real_order_id else {}),
                     }
-                    if grade == "B":
+                    # Grade B in real trading = one real order, tracked as Grade A.
+                    # Two separate orders for T1/T2 would require partial closes which
+                    # Bybit one-way mode doesn't support cleanly. Paper trading keeps
+                    # full Grade B split logic.
+                    if grade == "B" and REAL_TRADING:
+                        self.pending_trades = [
+                            {**base_trade, "grade": "A", "size_mult": 1.00, "tp_mult": 1.00, "is_primary": True},
+                        ]
+                        self.log(f"TRADE OPENED Grade B→A (real) ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f}")
+                    elif grade == "B":
                         self.pending_trades = [
                             {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80, "is_primary": True,  "label": "T1"},
                             {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00, "is_primary": False, "label": "T2", "breakeven_after_t1": True},
@@ -4383,11 +4392,11 @@ def place_real_order(
     ticker = ex.fetch_ticker(symbol)
     price  = float(ticker["last"])
 
-    # Set leverage — logged if it fails (non-fatal, order still placed with current exchange leverage)
+    # Set leverage — raises if it fails so trade is skipped rather than placed at wrong leverage
     try:
         ex.set_leverage(leverage, symbol)
     except Exception as lev_e:
-        print(f"[place_real_order] leverage set failed ({leverage}x on {symbol}): {lev_e}")
+        raise ValueError(f"Leverage set failed ({leverage}x on {symbol}): {lev_e}")
 
     # Quantity in base currency
     notional = usdt_size * leverage
