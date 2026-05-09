@@ -1623,33 +1623,31 @@ def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
     Direct Bybit V5 signed request for USDT balance.
     Returns (balance_float, None) on success, (None, error_str) on failure.
     """
-    last_net_error = ""
-    for account_type in ["UNIFIED", "CONTRACT", "SPOT"]:
-        try:
-            query = f"accountType={account_type}"
-            data, last_net_error = _bybit_signed_get(api_key, api_secret, "/v5/account/wallet-balance", query)
-            if data is None:
-                continue
-            ret_code = data.get("retCode")
-            ret_msg  = data.get("retMsg", "")
-            print(f"[bybit-balance] accountType={account_type} retCode={ret_code} retMsg={ret_msg}")
-            if ret_code == 0:
-                acct_list = data.get("result", {}).get("list", [])
-                print(f"[bybit-balance] accounts={len(acct_list)} coins={[c.get('coin') for a in acct_list for c in a.get('coin',[])]}")
-                for acc in acct_list:
-                    for coin in acc.get("coin", []):
-                        if coin.get("coin") == "USDT":
-                            val = float(coin.get("walletBalance") or coin.get("equity") or 0)
-                            print(f"[bybit-balance] USDT found via {account_type}: {val}")
-                            return (val, None)
-            elif ret_code in (10003, 10004):
-                return (None, f"Invalid API key or secret (retCode={ret_code}: {ret_msg})")
-            elif ret_code is not None:
-                return (None, f"Bybit API error retCode={ret_code}: {ret_msg}")
-        except Exception as ex:
-            return (None, f"Exception: {ex}")
-    detail = f" ({last_net_error})" if last_net_error else ""
-    return (None, f"Both hosts unreachable or no USDT balance found across UNIFIED/CONTRACT/SPOT{detail}")
+    try:
+        data, last_net_error = _bybit_signed_get(api_key, api_secret, "/v5/account/wallet-balance", "accountType=UNIFIED")
+        if data is None:
+            detail = f" ({last_net_error})" if last_net_error else ""
+            return (None, f"Could not reach Bybit API{detail}")
+        ret_code = data.get("retCode")
+        ret_msg  = data.get("retMsg", "")
+        print(f"[bybit-balance] retCode={ret_code} retMsg={ret_msg}")
+        if ret_code == 0:
+            acct_list = data.get("result", {}).get("list", [])
+            all_coins = [c.get("coin") for a in acct_list for c in a.get("coin", [])]
+            print(f"[bybit-balance] coins in wallet: {all_coins}")
+            for acc in acct_list:
+                for coin in acc.get("coin", []):
+                    if coin.get("coin") == "USDT":
+                        val = float(coin.get("walletBalance") or coin.get("equity") or 0)
+                        print(f"[bybit-balance] USDT balance: {val}")
+                        return (val, None)
+            return (None, f"No USDT found in your Bybit UNIFIED wallet. Coins present: {all_coins or 'none'}")
+        elif ret_code in (10003, 10004):
+            return (None, f"Invalid API key or secret (retCode={ret_code}: {ret_msg})")
+        else:
+            return (None, f"Bybit API error retCode={ret_code}: {ret_msg}")
+    except Exception as ex:
+        return (None, f"Exception: {ex}")
 
 
 def _okx_direct_balance(api_key: str, api_secret: str, passphrase: str) -> Optional[float]:
