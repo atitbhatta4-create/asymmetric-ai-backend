@@ -1621,35 +1621,41 @@ def _bybit_signed_get(api_key: str, api_secret: str, path: str, query: str) -> t
 def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
     """
     Direct Bybit V5 signed request for USDT balance.
+    Checks Unified Trading wallet first, then Funding wallet.
     Returns (balance_float, None) on success, (None, error_str) on failure.
     """
-    last_net_error = ""
-    for account_type in ["UNIFIED", "CONTRACT", "SPOT"]:
-        try:
-            query = f"accountType={account_type}"
-            data, last_net_error = _bybit_signed_get(api_key, api_secret, "/v5/account/wallet-balance", query)
-            if data is None:
-                continue
-            ret_code = data.get("retCode")
-            ret_msg  = data.get("retMsg", "")
-            print(f"[bybit-balance] accountType={account_type} retCode={ret_code} retMsg={ret_msg}")
-            if ret_code == 0:
-                acct_list = data.get("result", {}).get("list", [])
-                print(f"[bybit-balance] accounts={len(acct_list)} coins={[c.get('coin') for a in acct_list for c in a.get('coin',[])]}")
-                for acc in acct_list:
-                    for coin in acc.get("coin", []):
-                        if coin.get("coin") == "USDT":
-                            val = float(coin.get("walletBalance") or coin.get("equity") or 0)
-                            print(f"[bybit-balance] USDT found via {account_type}: {val}")
-                            return (val, None)
-            elif ret_code in (10003, 10004):
-                return (None, f"Invalid API key or secret (retCode={ret_code}: {ret_msg})")
-            elif ret_code is not None:
-                return (None, f"Bybit API error retCode={ret_code}: {ret_msg}")
-        except Exception as ex:
-            return (None, f"Exception: {ex}")
-    detail = f" ({last_net_error})" if last_net_error else ""
-    return (None, f"Both hosts unreachable or no USDT balance found across UNIFIED/CONTRACT/SPOT{detail}")
+    try:
+        # 1. Try Unified Trading wallet (required for trading)
+        data, net_err = _bybit_signed_get(api_key, api_secret, "/v5/account/wallet-balance", "accountType=UNIFIED")
+        if data is None:
+            return (None, f"Could not reach Bybit API{' (' + net_err + ')' if net_err else ''}")
+        ret_code = data.get("retCode")
+        ret_msg  = data.get("retMsg", "")
+        print(f"[bybit-balance] UNIFIED retCode={ret_code} retMsg={ret_msg}")
+        if ret_code in (10003, 10004):
+            return (None, f"Invalid API key or secret (retCode={ret_code}: {ret_msg})")
+        if ret_code != 0:
+            return (None, f"Bybit API error retCode={ret_code}: {ret_msg}")
+        for acc in data.get("result", {}).get("list", []):
+            for coin in acc.get("coin", []):
+                if coin.get("coin") == "USDT":
+                    val = float(coin.get("walletBalance") or coin.get("equity") or 0)
+                    print(f"[bybit-balance] USDT in Unified Trading: {val}")
+                    return (val, None)
+
+        # 2. USDT not in Unified — check Funding wallet
+        print("[bybit-balance] No USDT in Unified, checking Funding wallet...")
+        fund_data, _ = _bybit_signed_get(api_key, api_secret, "/v5/asset/transfer/query-account-coins-balance", "accountType=FUND&coin=USDT")
+        if fund_data and fund_data.get("retCode") == 0:
+            for item in fund_data.get("result", {}).get("balance", []):
+                if item.get("coin") == "USDT":
+                    val = float(item.get("walletBalance") or item.get("transferBalance") or 0)
+                    print(f"[bybit-balance] USDT in Funding wallet: {val}")
+                    if val > 0:
+                        return (None, f"Your {val:.2f} USDT is in the Funding wallet — transfer it to Unified Trading in Bybit before the engine can trade.")
+        return (None, "No USDT found in Unified Trading or Funding wallet. Please deposit USDT to your Bybit account.")
+    except Exception as ex:
+        return (None, f"Exception: {ex}")
 
 
 def _okx_direct_balance(api_key: str, api_secret: str, passphrase: str) -> Optional[float]:
