@@ -1644,8 +1644,8 @@ def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
                 return (None, f"Bybit API error retCode={ret_code}: {ret_msg}")
         except Exception as ex:
             return (None, f"Exception: {ex}")
-    detail = f" Last error: {last_net_error}" if last_net_error else ""
-    return (None, f"Bybit balance fetch failed: Both api.bybit.com and api.bytick.com are unreachable from this server — try changing Render region to Frankfurt or Singapore.{detail}")
+    detail = f" ({last_net_error})" if last_net_error else ""
+    return (None, f"Both api.bybit.com and api.bytick.com are unreachable{detail}")
 
 
 def _okx_direct_balance(api_key: str, api_secret: str, passphrase: str) -> Optional[float]:
