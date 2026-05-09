@@ -1621,31 +1621,39 @@ def _bybit_signed_get(api_key: str, api_secret: str, path: str, query: str) -> t
 def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
     """
     Direct Bybit V5 signed request for USDT balance.
+    Checks Unified Trading wallet first, then Funding wallet.
     Returns (balance_float, None) on success, (None, error_str) on failure.
     """
     try:
-        data, last_net_error = _bybit_signed_get(api_key, api_secret, "/v5/account/wallet-balance", "accountType=UNIFIED")
+        # 1. Try Unified Trading wallet (required for trading)
+        data, net_err = _bybit_signed_get(api_key, api_secret, "/v5/account/wallet-balance", "accountType=UNIFIED")
         if data is None:
-            detail = f" ({last_net_error})" if last_net_error else ""
-            return (None, f"Could not reach Bybit API{detail}")
+            return (None, f"Could not reach Bybit API{' (' + net_err + ')' if net_err else ''}")
         ret_code = data.get("retCode")
         ret_msg  = data.get("retMsg", "")
-        print(f"[bybit-balance] retCode={ret_code} retMsg={ret_msg}")
-        if ret_code == 0:
-            acct_list = data.get("result", {}).get("list", [])
-            all_coins = [c.get("coin") for a in acct_list for c in a.get("coin", [])]
-            print(f"[bybit-balance] coins in wallet: {all_coins}")
-            for acc in acct_list:
-                for coin in acc.get("coin", []):
-                    if coin.get("coin") == "USDT":
-                        val = float(coin.get("walletBalance") or coin.get("equity") or 0)
-                        print(f"[bybit-balance] USDT balance: {val}")
-                        return (val, None)
-            return (None, f"No USDT found in your Bybit UNIFIED wallet. Coins present: {all_coins or 'none'}")
-        elif ret_code in (10003, 10004):
+        print(f"[bybit-balance] UNIFIED retCode={ret_code} retMsg={ret_msg}")
+        if ret_code in (10003, 10004):
             return (None, f"Invalid API key or secret (retCode={ret_code}: {ret_msg})")
-        else:
+        if ret_code != 0:
             return (None, f"Bybit API error retCode={ret_code}: {ret_msg}")
+        for acc in data.get("result", {}).get("list", []):
+            for coin in acc.get("coin", []):
+                if coin.get("coin") == "USDT":
+                    val = float(coin.get("walletBalance") or coin.get("equity") or 0)
+                    print(f"[bybit-balance] USDT in Unified Trading: {val}")
+                    return (val, None)
+
+        # 2. USDT not in Unified — check Funding wallet
+        print("[bybit-balance] No USDT in Unified, checking Funding wallet...")
+        fund_data, _ = _bybit_signed_get(api_key, api_secret, "/v5/asset/transfer/query-account-coins-balance", "accountType=FUND&coin=USDT")
+        if fund_data and fund_data.get("retCode") == 0:
+            for item in fund_data.get("result", {}).get("balance", []):
+                if item.get("coin") == "USDT":
+                    val = float(item.get("walletBalance") or item.get("transferBalance") or 0)
+                    print(f"[bybit-balance] USDT in Funding wallet: {val}")
+                    if val > 0:
+                        return (None, f"Your {val:.2f} USDT is in the Funding wallet — transfer it to Unified Trading in Bybit before the engine can trade.")
+        return (None, "No USDT found in Unified Trading or Funding wallet. Please deposit USDT to your Bybit account.")
     except Exception as ex:
         return (None, f"Exception: {ex}")
 
