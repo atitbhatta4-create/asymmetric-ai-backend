@@ -3781,7 +3781,12 @@ class AutoRunner:
         trailing_activated = False
         trail_locked_pct   = 0.0   # how much profit is locked in
 
-        if candle_high > 0 and not intrabar_tp:
+        # T2 holds its original SL until T1 wins — trailing stop only activates
+        # after breakeven is set (meaning T1 hit TP and T2 became risk-free).
+        # Before that, T2's SL never moves — it lives or dies at sl_pct_open.
+        _t2_waiting = pt.get("breakeven_after_t1") and not pt.get("breakeven") and not pt.get("breakeven_next")
+
+        if candle_high > 0 and not intrabar_tp and not _t2_waiting:
             if best_move >= tp_pct * 0.70:
                 # Deep in profit — trail SL to lock in half the SL distance as profit
                 trail_locked_pct  = sl_pct * 0.50
@@ -3793,7 +3798,8 @@ class AutoRunner:
 
         # Ratchet: if a profit lock was established in a prior candle, keep it
         # even if the current candle didn't re-reach the trigger threshold.
-        _prev_locked = float(pt.get("trail_locked_pct", 0.0))
+        # Skip ratchet for T2 waiting on T1 — ignore any stale trail state.
+        _prev_locked = float(pt.get("trail_locked_pct", 0.0)) if not _t2_waiting else 0.0
         if _prev_locked > 0.0 and not trailing_activated:
             trail_locked_pct   = _prev_locked
             trailing_activated = True
