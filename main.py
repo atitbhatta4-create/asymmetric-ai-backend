@@ -4402,12 +4402,13 @@ def place_real_order(
     notional = usdt_size * leverage
     qty = round(notional / price, 6)
 
-    # Minimum order size guard — reject before hitting exchange
-    min_qty = EXCHANGE_FEES.get(ex_id, EXCHANGE_FEES["bybit"]).get("min_qty", 0)
-    if min_qty and qty < min_qty:
+    # Minimum notional guard — $5 covers Bybit/OKX/Binance minimums for any coin.
+    # Coin-specific qty minimums vary (BTC=0.001, SOL=0.1, DOGE=1) so we use
+    # notional USD which is universal and exchange-agnostic.
+    if notional < 5.0:
         raise ValueError(
-            f"Position too small: {qty:.6f} {symbol} is below exchange minimum {min_qty}. "
-            f"Notional ${notional:.2f} insufficient — increase account size or use a higher-size mode."
+            f"Position too small: ${notional:.2f} notional (need ≥ $5). "
+            f"Increase account size or use a higher-leverage/size mode."
         )
 
     # SL / TP prices
