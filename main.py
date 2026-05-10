@@ -3064,15 +3064,22 @@ def _compute_signal_layers(
         p["min_score"]    = min(0.90, p["min_score"] + (s - 1) * 0.12)
 
     # ── Higher TF trend direction ─────────────────────────────────────────
-    # 4h (or 1d) EMA50 vs EMA21 sets the macro bias — trade WITH this trend only
+    # Primary: 4h EMA21 vs EMA50 crossover sets macro bias.
+    # Early-bear override: if EMA21 has fallen >0.5% over last 8 candles (~32h)
+    # the trend is already turning even before the full crossover — flip to SHORT early.
     if higher_klines and len(higher_klines) >= 55:
         htf_closes = [k["close"] for k in higher_klines]
         htf_ema21  = _ema(htf_closes, 21)
         htf_ema50  = _ema(htf_closes, 50)
-        htf_bull   = htf_ema21[-1] > htf_ema50[-1]   # fast EMA above slow = uptrend
-        htf_ok     = True
+        htf_bull_cross = htf_ema21[-1] > htf_ema50[-1]
+        _slope_n = min(8, len(htf_ema21) - 1)
+        _htf_slope = (htf_ema21[-1] - htf_ema21[-1 - _slope_n]) / max(htf_ema50[-1], 1e-9)
+        # EMA21 dropping >0.5% = bear momentum even without full crossover
+        _htf_bear_early = _htf_slope < -0.005
+        htf_bull = htf_bull_cross and not _htf_bear_early
+        htf_ok   = True
     else:
-        htf_bull = ema50[-1] > ema200[-1]
+        htf_bull = ema21[-1] > ema50[-1]   # fallback: local EMA21/50 (faster than ema50/200)
         htf_ok   = False
 
     desired_side: Side = "LONG" if htf_bull else "SHORT"
@@ -3092,7 +3099,7 @@ def _compute_signal_layers(
     p["rsi_min"] = max(25, min(65, p["rsi_min"] + _rsi_shift))
     p["rsi_max"] = max(40, min(85, p["rsi_max"] + _rsi_shift))
 
-    local_bull = ema50[-1] > ema200[-1]
+    local_bull = ema21[-1] > ema50[-1]   # EMA21/50 cross — 4× faster than ema50/ema200
     ema9_aligned = (ema9[-1] > ema21[-1]) if desired_side == "LONG" else (ema9[-1] < ema21[-1])
     # Signal label: HTF trend direction + local EMA9 momentum alignment
     htf_label = "4h-BULL" if htf_bull else "4h-BEAR"
