@@ -4860,6 +4860,14 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
     except Exception:
         pass  # DB error — allow start, runner will recount
 
+    # Sync real exchange balance into DB before creating runner.
+    # Without this, runner reads DB default ($1,000) for session_start_equity
+    # and floor_equity, even if the real account has a different balance.
+    if REAL_TRADING:
+        _pre_bal = get_real_usdt_balance(email, force=True)
+        if _pre_bal is not None:
+            set_equity(email, _pre_bal)
+
     with AUTO_LOCK:
         old = AUTO_RUNNERS.get(email)
         if old:
