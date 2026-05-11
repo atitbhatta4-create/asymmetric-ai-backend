@@ -694,8 +694,13 @@ def get_exchange(email: str) -> Optional[dict]:
     }
 
 
-_SESSION_CACHE: Dict[str, tuple] = {}   # token → (email, cached_at_ts)
-_SESSION_TTL = 300                       # reuse cached token for 5 minutes
+_SESSION_CACHE: Dict[str, tuple] = {}    # token → (email, cached_at_ts)
+_SESSION_TTL = 300                        # reuse cached token for 5 minutes
+
+_EX_STATUS_CACHE: Dict[str, tuple] = {}  # email → (status_dict, ts)
+_EX_STATUS_TTL = 60                       # re-read DB at most once per minute
+_EX_TEST_CACHE: Dict[str, tuple] = {}    # email → (test_result_dict, ts)
+_EX_TEST_TTL = 60                         # live Bybit test cached 60s
 
 def require_user(session: Optional[str] = Cookie(default=None)) -> Dict[str, str]:
     if not session:
@@ -1412,15 +1417,23 @@ class ExchangeConnectIn(BaseModel):
 @app.get("/exchange/status")
 def exchange_status(user=Depends(require_user)):
     email = user["email"]
+    cached = _EX_STATUS_CACHE.get(email)
+    if cached:
+        result, ts = cached
+        if time.time() - ts < _EX_STATUS_TTL:
+            return result
     row = get_exchange(email)
     if not row:
-        return {"connected": False, "exchange": None, "api_key_masked": None, "created_at": None}
-    return {
-        "connected": True,
-        "exchange": row["exchange"],
-        "api_key_masked": mask_key(row["api_key"]),
-        "created_at": row["created_at"],
-    }
+        result = {"connected": False, "exchange": None, "api_key_masked": None, "created_at": None}
+    else:
+        result = {
+            "connected": True,
+            "exchange": row["exchange"],
+            "api_key_masked": mask_key(row["api_key"]),
+            "created_at": row["created_at"],
+        }
+    _EX_STATUS_CACHE[email] = (result, time.time())
+    return result
 
 
 @app.post("/exchange/connect")
@@ -1456,6 +1469,10 @@ def exchange_connect(payload: ExchangeConnectIn, user=Depends(require_user)):
         conn.commit()
         conn.close()
 
+    # Clear caches so new keys are visible immediately
+    _EX_STATUS_CACHE.pop(email, None)
+    _EX_TEST_CACHE.pop(email, None)
+    _REAL_BAL_CACHE.pop(email, None)
     return {"ok": True}
 
 
@@ -1468,6 +1485,9 @@ def exchange_disconnect(user=Depends(require_user)):
         cur.execute("DELETE FROM exchange_keys WHERE email = %s", (email,))
         conn.commit()
         conn.close()
+    _EX_STATUS_CACHE.pop(email, None)
+    _EX_TEST_CACHE.pop(email, None)
+    _REAL_BAL_CACHE.pop(email, None)
     return {"ok": True}
 
 
@@ -1529,8 +1549,13 @@ def _make_ccxt_exchange(row: dict):
 
 @app.get("/exchange/test")
 def exchange_test(user=Depends(require_user)):
-    """Actually test the API key against the real exchange."""
+    """Test API key against the real exchange — cached 60s so page loads stay fast."""
     email = user["email"]
+    cached = _EX_TEST_CACHE.get(email)
+    if cached:
+        result, ts = cached
+        if time.time() - ts < _EX_TEST_TTL:
+            return result
     row = get_exchange(email)
     if not row:
         raise HTTPException(status_code=400, detail="No exchange connected.")
@@ -1540,31 +1565,31 @@ def exchange_test(user=Depends(require_user)):
             bal, err_msg = _bybit_direct_balance(row["api_key"], row["api_secret"])
             if bal is None:
                 raise ValueError(f"Bybit balance fetch failed: {err_msg}")
-            return {"ok": True, "exchange": row["exchange"], "canTrade": True,
-                    "accountType": "UNIFIED", "usdt_free": round(bal, 4),
-                    "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
-
-        if ex_id == "okx":
+            result = {"ok": True, "exchange": row["exchange"], "canTrade": True,
+                      "accountType": "UNIFIED", "usdt_free": round(bal, 4),
+                      "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
+        elif ex_id == "okx":
             bal = _okx_direct_balance(row["api_key"], row["api_secret"], row.get("passphrase") or "")
             if bal is None:
                 raise ValueError("Could not fetch OKX balance — check API key, secret, passphrase, and permissions.")
-            return {"ok": True, "exchange": row["exchange"], "canTrade": True,
-                    "accountType": "UNIFIED", "usdt_free": round(bal, 4),
-                    "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
-
-        if ex_id == "binance":
+            result = {"ok": True, "exchange": row["exchange"], "canTrade": True,
+                      "accountType": "UNIFIED", "usdt_free": round(bal, 4),
+                      "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
+        elif ex_id == "binance":
             bal = _binance_direct_balance(row["api_key"], row["api_secret"])
             if bal is None:
                 raise ValueError("Could not fetch Binance Futures balance — check API key, secret, and Futures permissions.")
-            return {"ok": True, "exchange": row["exchange"], "canTrade": True,
-                    "accountType": "FUTURES", "usdt_free": round(bal, 4),
-                    "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
-
-        raise ValueError(f"Unsupported exchange: {ex_id}")
+            result = {"ok": True, "exchange": row["exchange"], "canTrade": True,
+                      "accountType": "FUTURES", "usdt_free": round(bal, 4),
+                      "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
+        else:
+            raise ValueError(f"Unsupported exchange: {ex_id}")
     except Exception as e:
-        return {"ok": False, "canTrade": False,
-                "error": str(e)[:400],
-                "note": "Connection failed — see error below for exact reason."}
+        result = {"ok": False, "canTrade": False,
+                  "error": str(e)[:400],
+                  "note": "Connection failed — see error below for exact reason."}
+    _EX_TEST_CACHE[email] = (result, time.time())
+    return result
 
 
 @app.get("/exchange/balance")
@@ -1723,20 +1748,43 @@ def _binance_direct_balance(api_key: str, api_secret: str) -> Optional[float]:
     return None
 
 
-_REAL_BAL_CACHE: Dict[str, tuple] = {}   # email → (balance, fetched_at_ts)
-_REAL_BAL_TTL = 30                        # seconds — Bybit call cached for 30s
+_REAL_BAL_CACHE: Dict[str, tuple] = {}      # email → (balance, fetched_at_ts)
+_REAL_BAL_TTL = 30                           # seconds before background refresh fires
+_REAL_BAL_REFRESHING: set = set()            # emails with a refresh already in flight
+
+def _do_balance_refresh(email: str) -> None:
+    """Background thread: fetch live balance and silently update cache."""
+    try:
+        row = get_exchange(email)
+        if not row:
+            return
+        ex_id = (row.get("exchange") or "bybit").lower()
+        if ex_id == "bybit":
+            bal, _ = _bybit_direct_balance(row["api_key"], row["api_secret"])
+        elif ex_id == "okx":
+            bal = _okx_direct_balance(row["api_key"], row["api_secret"], row.get("passphrase") or "")
+        elif ex_id == "binance":
+            bal = _binance_direct_balance(row["api_key"], row["api_secret"])
+        else:
+            bal = None
+        if bal is not None:
+            _REAL_BAL_CACHE[email] = (bal, time.time())
+    finally:
+        _REAL_BAL_REFRESHING.discard(email)
 
 def get_real_usdt_balance(email: str, force: bool = False) -> Optional[float]:
-    """Fetch live USDT balance from exchange, cached for 30s to avoid hammering
-    the Bybit API on every dashboard refresh (which was causing 2-4s slowness)."""
-    now = time.time()
-    if not force:
-        cached = _REAL_BAL_CACHE.get(email)
-        if cached:
-            bal, fetched_at = cached
-            if now - fetched_at < _REAL_BAL_TTL:
-                return bal
+    """Return cached balance instantly; refresh from Bybit in background when stale.
+    force=True blocks for a fresh fetch (used before runner init)."""
+    cached = _REAL_BAL_CACHE.get(email)
 
+    if not force and cached:
+        bal, fetched_at = cached
+        if time.time() - fetched_at >= _REAL_BAL_TTL and email not in _REAL_BAL_REFRESHING:
+            _REAL_BAL_REFRESHING.add(email)
+            threading.Thread(target=_do_balance_refresh, args=(email,), daemon=True).start()
+        return bal  # always instant when any cached value exists
+
+    # No cache yet or force=True — block for fresh data
     row = get_exchange(email)
     if not row:
         return None
@@ -1749,9 +1797,8 @@ def get_real_usdt_balance(email: str, force: bool = False) -> Optional[float]:
         bal = _binance_direct_balance(row["api_key"], row["api_secret"])
     else:
         bal = None
-
     if bal is not None:
-        _REAL_BAL_CACHE[email] = (bal, now)
+        _REAL_BAL_CACHE[email] = (bal, time.time())
     return bal
 
 
@@ -3965,12 +4012,20 @@ class AutoRunner:
         ])
 
         if REAL_TRADING:
-            try:
-                close_real_order(email=self.email, symbol=self.symbol, side=side)
-                self.log(f"REAL POSITION CLOSED | {side} {self.symbol} | {outcome}")
-            except Exception as _ce:
-                self.log(f"REAL CLOSE note: {_ce}")
-            # Sync real balance from exchange after close — overrides paper PnL calculation
+            _is_b_t1 = (pt.get("grade") == "B" and pt.get("label") == "T1")
+            if _is_b_t1:
+                # T1 closes via its own reduceOnly TP limit order on Bybit — never touch the
+                # remaining 40% T2 position. SL moves to breakeven in _close_pending_trades.
+                self.log(f"REAL T1 HIT TP | {side} {self.symbol} — T2 still running, SL→breakeven next candle")
+            else:
+                # Grade A, or Grade B T2 (TP or SL hit): cancel open orders then confirm close
+                _cancel_all_real_orders(self.email, self.symbol)
+                try:
+                    close_real_order(email=self.email, symbol=self.symbol, side=side)
+                    self.log(f"REAL POSITION CLOSED | {side} {self.symbol} | {outcome}")
+                except Exception as _ce:
+                    self.log(f"REAL CLOSE note: {_ce}")
+            # Sync real balance after any close event — always bypass cache for accuracy
             real_bal_after = get_real_usdt_balance(self.email, force=True)
             if real_bal_after is not None:
                 equity_after = real_bal_after
@@ -4067,6 +4122,7 @@ class AutoRunner:
 
             still_open: List[Dict] = []
             t1_won = False
+            t1_entry_price: Optional[float] = None
 
             for pt in self.pending_trades:
                 # Promote deferred breakeven: T1 won last candle → T2 is now risk-free.
@@ -4087,6 +4143,7 @@ class AutoRunner:
                     # Definitively closed — record T1 win (T2 not in still_open yet, set below)
                     if pt.get("is_primary") and result > eq:
                         t1_won = True
+                        t1_entry_price = float(pt.get("entry_price", 0))
 
             self.pending_trades = still_open
 
@@ -4095,6 +4152,15 @@ class AutoRunner:
                 for pt in still_open:
                     if pt.get("breakeven_after_t1") and not pt.get("breakeven"):
                         pt["breakeven_next"] = True
+                        if REAL_TRADING and t1_entry_price:
+                            try:
+                                ok = _move_real_sl_to_breakeven(self.email, self.symbol, t1_entry_price)
+                                if ok:
+                                    self.log(f"REAL T2 SL→BREAKEVEN @ {t1_entry_price:.4f}")
+                                else:
+                                    self.log("REAL T2 SL breakeven move failed — T2 continues with original SL")
+                            except Exception as _slm:
+                                self.log(f"REAL T2 SL move error: {_slm}")
 
             # Persist live state so a redeploy picks up the updated positions/strictness
             _save_runner_state(self)
@@ -4261,18 +4327,35 @@ class AutoRunner:
                     else:
                         equity_now = get_equity(self.email)
 
-                    real_order_id = None
+                    real_order_id  = None
+                    real_b_result  = None   # Grade B real only
                     if REAL_TRADING:
                         try:
-                            size_pct = float(c["size"])
+                            size_pct  = float(c["size"])
                             usdt_size = equity_now * size_pct
-                            result = place_real_order(
-                                email=self.email, symbol=self.symbol, side=desired_side,
-                                usdt_size=usdt_size, leverage=int(c["leverage"]),
-                                sl_pct=sl_pct_open, tp_pct=tp_pct_open,
-                            )
-                            real_order_id = result.get("order_id")
-                            self.log(f"REAL ORDER PLACED | id={real_order_id} | {desired_side} {self.symbol} size=${usdt_size:.2f} lev={c['leverage']}×")
+                            if grade == "B":
+                                # Real Grade B: entry + two partial reduceOnly TP limit orders
+                                real_b_result = place_real_grade_b_order(
+                                    email=self.email, symbol=self.symbol, side=desired_side,
+                                    usdt_size=usdt_size, leverage=int(c["leverage"]),
+                                    sl_pct=sl_pct_open,
+                                    t1_tp_pct=tp_pct_open * 0.80,
+                                    t2_tp_pct=tp_pct_open * 1.00,
+                                )
+                                self.log(
+                                    f"REAL GRADE B | entry={real_b_result['order_id']} "
+                                    f"T1_TP={real_b_result['t1_tp_id']} T2_TP={real_b_result['t2_tp_id']} "
+                                    f"SL={real_b_result['sl_price']:.4f} "
+                                    f"T1@{real_b_result['t1_tp_price']:.4f} T2@{real_b_result['t2_tp_price']:.4f}"
+                                )
+                            else:
+                                result = place_real_order(
+                                    email=self.email, symbol=self.symbol, side=desired_side,
+                                    usdt_size=usdt_size, leverage=int(c["leverage"]),
+                                    sl_pct=sl_pct_open, tp_pct=tp_pct_open,
+                                )
+                                real_order_id = result.get("order_id")
+                                self.log(f"REAL ORDER PLACED | id={real_order_id} | {desired_side} {self.symbol} size=${usdt_size:.2f} lev={c['leverage']}×")
                         except Exception as _re:
                             self.log(f"REAL ORDER FAILED — trade skipped: {_re}")
                             continue
@@ -4287,15 +4370,15 @@ class AutoRunner:
                         "tp_pct_open": tp_pct_open,
                         **({"order_id": real_order_id} if real_order_id else {}),
                     }
-                    # Grade B in real trading = one real order, tracked as Grade A.
-                    # Two separate orders for T1/T2 would require partial closes which
-                    # Bybit one-way mode doesn't support cleanly. Paper trading keeps
-                    # full Grade B split logic.
                     if grade == "B" and REAL_TRADING:
+                        _b = real_b_result or {}
                         self.pending_trades = [
-                            {**base_trade, "grade": "A", "size_mult": 1.00, "tp_mult": 1.00, "is_primary": True},
+                            {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80,
+                             "is_primary": True,  "label": "T1", "order_id": _b.get("order_id")},
+                            {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00,
+                             "is_primary": False, "label": "T2", "breakeven_after_t1": True},
                         ]
-                        self.log(f"TRADE OPENED Grade B→A (real) ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f}")
+                        self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP T2 40%+100%TP+BE | score={self.last_score:.2f}")
                     elif grade == "B":
                         self.pending_trades = [
                             {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80, "is_primary": True,  "label": "T1"},
@@ -4541,6 +4624,139 @@ def close_real_order(email: str, symbol: str, side: str) -> dict:
         params   = {"reduceOnly": True, "positionIdx": 0},
     )
     return {"ok": True, "order_id": order.get("id"), "qty": qty}
+
+
+# ── Real Grade B helpers ────────────────────────────────────────────────────
+
+def _cancel_all_real_orders(email: str, symbol: str) -> None:
+    """Cancel all open orders for symbol. Best-effort cleanup — never raises."""
+    try:
+        row = get_exchange(email)
+        if not row:
+            return
+        ex = _make_ccxt_exchange(row)
+        open_orders = ex.fetch_open_orders(symbol)
+        for o in open_orders:
+            try:
+                ex.cancel_order(o["id"], symbol)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _move_real_sl_to_breakeven(email: str, symbol: str, entry_price: float) -> bool:
+    """
+    Move position-level SL to entry price (breakeven) when T1 hits TP.
+    Uses Bybit's /v5/position/trading-stop — one atomic call, zero gap.
+    Safer than cancel+replace because the position is never unprotected.
+    Returns True on success.
+    """
+    try:
+        row = get_exchange(email)
+        if not row:
+            return False
+        ex = _make_ccxt_exchange(row)
+        mkt = ex.market(symbol)
+        bybit_sym = mkt["id"]   # "BTC/USDT:USDT" → "BTCUSDT"
+        ex.privatePostV5PositionTradingStop({
+            "category":    "linear",
+            "symbol":      bybit_sym,
+            "stopLoss":    str(round(entry_price, 4)),
+            "slTriggerBy": "MarkPrice",
+            "positionIdx": 0,
+        })
+        return True
+    except Exception:
+        return False
+
+
+def place_real_grade_b_order(
+    email: str,
+    symbol: str,
+    side: str,          # "LONG" | "SHORT"
+    usdt_size: float,   # full position size in USDT (T1 + T2 combined)
+    leverage: int,
+    sl_pct: float,
+    t1_tp_pct: float,   # T1 TP distance (80% of full ATR TP)
+    t2_tp_pct: float,   # T2 TP distance (100% of full ATR TP)
+) -> dict:
+    """
+    Place a real Grade B position on Bybit.
+
+    Order layout:
+      Entry:  one market order for full qty (T1 60% + T2 40%)
+      SL:     position-level stop attached to entry (moved to breakeven after T1 fires)
+      T1 TP:  reduceOnly limit order for 60% of qty at t1_tp_pct from entry
+      T2 TP:  reduceOnly limit order for 40% of qty at t2_tp_pct from entry
+
+    When T1's limit TP fires on Bybit, 60% of the position closes automatically.
+    The engine then calls _move_real_sl_to_breakeven() to protect the remaining 40%.
+    T2 then runs risk-free to its own TP or the breakeven SL.
+
+    Paper tracking is unchanged — Grade B T1/T2 paper logic handles PnL accounting.
+    """
+    row = get_exchange(email)
+    if not row:
+        raise ValueError("No exchange connected")
+
+    ex = _make_ccxt_exchange(row)
+    order_side = "buy"  if side == "LONG" else "sell"
+    close_side = "sell" if side == "LONG" else "buy"
+    sl_mult  = (1 - sl_pct)    if side == "LONG" else (1 + sl_pct)
+    t1_mult  = (1 + t1_tp_pct) if side == "LONG" else (1 - t1_tp_pct)
+    t2_mult  = (1 + t2_tp_pct) if side == "LONG" else (1 - t2_tp_pct)
+
+    ticker = ex.fetch_ticker(symbol)
+    price  = float(ticker["last"])
+
+    try:
+        ex.set_leverage(leverage, symbol)
+    except Exception as lev_e:
+        raise ValueError(f"Leverage set failed ({leverage}×): {lev_e}")
+
+    notional = usdt_size * leverage
+    qty      = round(notional / price, 6)
+    if notional < 5.0:
+        raise ValueError(f"Position too small: ${notional:.2f} notional (need ≥ $5)")
+
+    sl_price    = round(price * sl_mult, 4)
+    t1_tp_price = round(price * t1_mult, 4)
+    t2_tp_price = round(price * t2_mult, 4)
+    t1_qty = round(qty * 0.60, 6)
+    t2_qty = round(qty * 0.40, 6)
+
+    # Entry: market order with position-level SL (no TP — handled by partial limit orders below)
+    entry_order = ex.create_order(symbol, "market", order_side, qty, params={
+        "stopLoss":    {"triggerPrice": sl_price, "type": "market"},
+        "positionIdx": 0,
+    })
+
+    # T1 TP: partial reduceOnly limit at 60% qty
+    t1_order = ex.create_order(symbol, "limit", close_side, t1_qty, t1_tp_price, params={
+        "reduceOnly": True,
+        "positionIdx": 0,
+    })
+
+    # T2 TP: partial reduceOnly limit at 40% qty
+    t2_order = ex.create_order(symbol, "limit", close_side, t2_qty, t2_tp_price, params={
+        "reduceOnly": True,
+        "positionIdx": 0,
+    })
+
+    return {
+        "order_id":    entry_order.get("id"),
+        "t1_tp_id":    t1_order.get("id"),
+        "t2_tp_id":    t2_order.get("id"),
+        "qty":         qty,
+        "t1_qty":      t1_qty,
+        "t2_qty":      t2_qty,
+        "price":       price,
+        "sl_price":    sl_price,
+        "t1_tp_price": t1_tp_price,
+        "t2_tp_price": t2_tp_price,
+        "leverage":    leverage,
+    }
 
 
 @app.post("/trade")
