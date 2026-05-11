@@ -3303,8 +3303,13 @@ def _compute_signal_layers(
     min_score = p.get("min_score", 0.62)
     breakdown["session"] = {"label": sess_label, "quality": round(sess_score, 2), "raw_score": round(raw_score, 3), "ok": True, "reason": ""}
 
-    # Market grade: A = high conviction (≥0.78), B = good setup (≥0.65), C = weak (blocked)
-    grade = "A" if total_score >= 0.78 else "B" if total_score >= 0.65 else "C"
+    # Market grade for trades that FIRE (ok=True path only):
+    # A = high conviction (≥0.78) → full position
+    # B = anything that passes min_score but < 0.78 → T1+T2 split
+    # "C" never appears in the ok=True return — only in the blocked path below.
+    # Bug fixed: scores like 0.62 in AGGRESSIVE (min=0.58) were graded "C" here,
+    # then fell to the else-branch in _run_loop and fired as accidental Grade A.
+    grade = "A" if total_score >= 0.78 else "B"
 
     failed = [k for k, v in breakdown.items() if not v.get("ok")]
     if failed or total_score < min_score:
