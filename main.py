@@ -694,9 +694,20 @@ def get_exchange(email: str) -> Optional[dict]:
     }
 
 
+_SESSION_CACHE: Dict[str, tuple] = {}   # token → (email, cached_at_ts)
+_SESSION_TTL = 300                       # reuse cached token for 5 minutes
+
 def require_user(session: Optional[str] = Cookie(default=None)) -> Dict[str, str]:
     if not session:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    now = time.time()
+    cached = _SESSION_CACHE.get(session)
+    if cached:
+        email, ts = cached
+        if now - ts < _SESSION_TTL:
+            return {"email": email}
+
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
@@ -704,7 +715,9 @@ def require_user(session: Optional[str] = Cookie(default=None)) -> Dict[str, str
         row = cur.fetchone()
         conn.close()
     if not row:
+        _SESSION_CACHE.pop(session, None)
         raise HTTPException(status_code=401, detail="Unauthorized")
+    _SESSION_CACHE[session] = (row["email"], now)
     return {"email": row["email"]}
 
 
@@ -935,6 +948,7 @@ def login(request: Request, payload: AuthIn, response: Response):
 @app.post("/auth/logout")
 def logout(response: Response, session: Optional[str] = Cookie(default=None)):
     if session:
+        _SESSION_CACHE.pop(session, None)   # evict from auth cache immediately
         with DB_LOCK:
             conn = db()
             cur = conn.cursor()
