@@ -694,8 +694,13 @@ def get_exchange(email: str) -> Optional[dict]:
     }
 
 
-_SESSION_CACHE: Dict[str, tuple] = {}   # token → (email, cached_at_ts)
-_SESSION_TTL = 300                       # reuse cached token for 5 minutes
+_SESSION_CACHE: Dict[str, tuple] = {}    # token → (email, cached_at_ts)
+_SESSION_TTL = 300                        # reuse cached token for 5 minutes
+
+_EX_STATUS_CACHE: Dict[str, tuple] = {}  # email → (status_dict, ts)
+_EX_STATUS_TTL = 60                       # re-read DB at most once per minute
+_EX_TEST_CACHE: Dict[str, tuple] = {}    # email → (test_result_dict, ts)
+_EX_TEST_TTL = 60                         # live Bybit test cached 60s
 
 def require_user(session: Optional[str] = Cookie(default=None)) -> Dict[str, str]:
     if not session:
@@ -1412,15 +1417,23 @@ class ExchangeConnectIn(BaseModel):
 @app.get("/exchange/status")
 def exchange_status(user=Depends(require_user)):
     email = user["email"]
+    cached = _EX_STATUS_CACHE.get(email)
+    if cached:
+        result, ts = cached
+        if time.time() - ts < _EX_STATUS_TTL:
+            return result
     row = get_exchange(email)
     if not row:
-        return {"connected": False, "exchange": None, "api_key_masked": None, "created_at": None}
-    return {
-        "connected": True,
-        "exchange": row["exchange"],
-        "api_key_masked": mask_key(row["api_key"]),
-        "created_at": row["created_at"],
-    }
+        result = {"connected": False, "exchange": None, "api_key_masked": None, "created_at": None}
+    else:
+        result = {
+            "connected": True,
+            "exchange": row["exchange"],
+            "api_key_masked": mask_key(row["api_key"]),
+            "created_at": row["created_at"],
+        }
+    _EX_STATUS_CACHE[email] = (result, time.time())
+    return result
 
 
 @app.post("/exchange/connect")
@@ -1456,6 +1469,10 @@ def exchange_connect(payload: ExchangeConnectIn, user=Depends(require_user)):
         conn.commit()
         conn.close()
 
+    # Clear caches so new keys are visible immediately
+    _EX_STATUS_CACHE.pop(email, None)
+    _EX_TEST_CACHE.pop(email, None)
+    _REAL_BAL_CACHE.pop(email, None)
     return {"ok": True}
 
 
@@ -1468,6 +1485,9 @@ def exchange_disconnect(user=Depends(require_user)):
         cur.execute("DELETE FROM exchange_keys WHERE email = %s", (email,))
         conn.commit()
         conn.close()
+    _EX_STATUS_CACHE.pop(email, None)
+    _EX_TEST_CACHE.pop(email, None)
+    _REAL_BAL_CACHE.pop(email, None)
     return {"ok": True}
 
 
@@ -1529,8 +1549,13 @@ def _make_ccxt_exchange(row: dict):
 
 @app.get("/exchange/test")
 def exchange_test(user=Depends(require_user)):
-    """Actually test the API key against the real exchange."""
+    """Test API key against the real exchange — cached 60s so page loads stay fast."""
     email = user["email"]
+    cached = _EX_TEST_CACHE.get(email)
+    if cached:
+        result, ts = cached
+        if time.time() - ts < _EX_TEST_TTL:
+            return result
     row = get_exchange(email)
     if not row:
         raise HTTPException(status_code=400, detail="No exchange connected.")
@@ -1540,31 +1565,31 @@ def exchange_test(user=Depends(require_user)):
             bal = _bybit_direct_balance(row["api_key"], row["api_secret"])
             if bal is None:
                 raise ValueError("Could not fetch Bybit balance — check API key, secret, and permissions (Read+Write, Unified Trading).")
-            return {"ok": True, "exchange": row["exchange"], "canTrade": True,
-                    "accountType": "UNIFIED", "usdt_free": round(bal, 4),
-                    "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
-
-        if ex_id == "okx":
+            result = {"ok": True, "exchange": row["exchange"], "canTrade": True,
+                      "accountType": "UNIFIED", "usdt_free": round(bal, 4),
+                      "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
+        elif ex_id == "okx":
             bal = _okx_direct_balance(row["api_key"], row["api_secret"], row.get("passphrase") or "")
             if bal is None:
                 raise ValueError("Could not fetch OKX balance — check API key, secret, passphrase, and permissions.")
-            return {"ok": True, "exchange": row["exchange"], "canTrade": True,
-                    "accountType": "UNIFIED", "usdt_free": round(bal, 4),
-                    "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
-
-        if ex_id == "binance":
+            result = {"ok": True, "exchange": row["exchange"], "canTrade": True,
+                      "accountType": "UNIFIED", "usdt_free": round(bal, 4),
+                      "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
+        elif ex_id == "binance":
             bal = _binance_direct_balance(row["api_key"], row["api_secret"])
             if bal is None:
                 raise ValueError("Could not fetch Binance Futures balance — check API key, secret, and Futures permissions.")
-            return {"ok": True, "exchange": row["exchange"], "canTrade": True,
-                    "accountType": "FUTURES", "usdt_free": round(bal, 4),
-                    "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
-
-        raise ValueError(f"Unsupported exchange: {ex_id}")
+            result = {"ok": True, "exchange": row["exchange"], "canTrade": True,
+                      "accountType": "FUTURES", "usdt_free": round(bal, 4),
+                      "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
+        else:
+            raise ValueError(f"Unsupported exchange: {ex_id}")
     except Exception as e:
-        return {"ok": False, "canTrade": False,
-                "error": str(e)[:400],
-                "note": "Connection failed — see error below for exact reason."}
+        result = {"ok": False, "canTrade": False,
+                  "error": str(e)[:400],
+                  "note": "Connection failed — see error below for exact reason."}
+    _EX_TEST_CACHE[email] = (result, time.time())
+    return result
 
 
 @app.get("/exchange/balance")
@@ -1680,20 +1705,43 @@ def _binance_direct_balance(api_key: str, api_secret: str) -> Optional[float]:
     return None
 
 
-_REAL_BAL_CACHE: Dict[str, tuple] = {}   # email → (balance, fetched_at_ts)
-_REAL_BAL_TTL = 30                        # seconds — Bybit call cached for 30s
+_REAL_BAL_CACHE: Dict[str, tuple] = {}      # email → (balance, fetched_at_ts)
+_REAL_BAL_TTL = 30                           # seconds before background refresh fires
+_REAL_BAL_REFRESHING: set = set()            # emails with a refresh already in flight
+
+def _do_balance_refresh(email: str) -> None:
+    """Background thread: fetch live balance and silently update cache."""
+    try:
+        row = get_exchange(email)
+        if not row:
+            return
+        ex_id = (row.get("exchange") or "bybit").lower()
+        if ex_id == "bybit":
+            bal, _ = _bybit_direct_balance(row["api_key"], row["api_secret"])
+        elif ex_id == "okx":
+            bal = _okx_direct_balance(row["api_key"], row["api_secret"], row.get("passphrase") or "")
+        elif ex_id == "binance":
+            bal = _binance_direct_balance(row["api_key"], row["api_secret"])
+        else:
+            bal = None
+        if bal is not None:
+            _REAL_BAL_CACHE[email] = (bal, time.time())
+    finally:
+        _REAL_BAL_REFRESHING.discard(email)
 
 def get_real_usdt_balance(email: str, force: bool = False) -> Optional[float]:
-    """Fetch live USDT balance from exchange, cached for 30s to avoid hammering
-    the Bybit API on every dashboard refresh (which was causing 2-4s slowness)."""
-    now = time.time()
-    if not force:
-        cached = _REAL_BAL_CACHE.get(email)
-        if cached:
-            bal, fetched_at = cached
-            if now - fetched_at < _REAL_BAL_TTL:
-                return bal
+    """Return cached balance instantly; refresh from Bybit in background when stale.
+    force=True blocks for a fresh fetch (used before runner init)."""
+    cached = _REAL_BAL_CACHE.get(email)
 
+    if not force and cached:
+        bal, fetched_at = cached
+        if time.time() - fetched_at >= _REAL_BAL_TTL and email not in _REAL_BAL_REFRESHING:
+            _REAL_BAL_REFRESHING.add(email)
+            threading.Thread(target=_do_balance_refresh, args=(email,), daemon=True).start()
+        return bal  # always instant when any cached value exists
+
+    # No cache yet or force=True — block for fresh data
     row = get_exchange(email)
     if not row:
         return None
@@ -1706,9 +1754,8 @@ def get_real_usdt_balance(email: str, force: bool = False) -> Optional[float]:
         bal = _binance_direct_balance(row["api_key"], row["api_secret"])
     else:
         bal = None
-
     if bal is not None:
-        _REAL_BAL_CACHE[email] = (bal, now)
+        _REAL_BAL_CACHE[email] = (bal, time.time())
     return bal
 
 
