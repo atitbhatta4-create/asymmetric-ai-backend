@@ -1666,19 +1666,36 @@ def _binance_direct_balance(api_key: str, api_secret: str) -> Optional[float]:
     return None
 
 
-def get_real_usdt_balance(email: str) -> Optional[float]:
-    """Fetch live USDT balance from exchange using direct API (no ccxt)."""
+_REAL_BAL_CACHE: Dict[str, tuple] = {}   # email → (balance, fetched_at_ts)
+_REAL_BAL_TTL = 30                        # seconds — Bybit call cached for 30s
+
+def get_real_usdt_balance(email: str, force: bool = False) -> Optional[float]:
+    """Fetch live USDT balance from exchange, cached for 30s to avoid hammering
+    the Bybit API on every dashboard refresh (which was causing 2-4s slowness)."""
+    now = time.time()
+    if not force:
+        cached = _REAL_BAL_CACHE.get(email)
+        if cached:
+            bal, fetched_at = cached
+            if now - fetched_at < _REAL_BAL_TTL:
+                return bal
+
     row = get_exchange(email)
     if not row:
         return None
     ex_id = (row.get("exchange") or "bybit").lower()
     if ex_id == "bybit":
-        return _bybit_direct_balance(row["api_key"], row["api_secret"])
-    if ex_id == "okx":
-        return _okx_direct_balance(row["api_key"], row["api_secret"], row.get("passphrase") or "")
-    if ex_id == "binance":
-        return _binance_direct_balance(row["api_key"], row["api_secret"])
-    return None
+        bal, _ = _bybit_direct_balance(row["api_key"], row["api_secret"])
+    elif ex_id == "okx":
+        bal = _okx_direct_balance(row["api_key"], row["api_secret"], row.get("passphrase") or "")
+    elif ex_id == "binance":
+        bal = _binance_direct_balance(row["api_key"], row["api_secret"])
+    else:
+        bal = None
+
+    if bal is not None:
+        _REAL_BAL_CACHE[email] = (bal, now)
+    return bal
 
 
 # =========================
@@ -3891,7 +3908,7 @@ class AutoRunner:
             except Exception as _ce:
                 self.log(f"REAL CLOSE note: {_ce}")
             # Sync real balance from exchange after close — overrides paper PnL calculation
-            real_bal_after = get_real_usdt_balance(self.email)
+            real_bal_after = get_real_usdt_balance(self.email, force=True)
             if real_bal_after is not None:
                 equity_after = real_bal_after
                 self.log(f"Post-trade balance synced: ${real_bal_after:.2f} USDT")
@@ -4171,7 +4188,7 @@ class AutoRunner:
                     tp_pct_open = min(self.last_atr_pct * st["tp_atr"], st["tp_max"] / 100.0)
 
                     if REAL_TRADING:
-                        real_bal = get_real_usdt_balance(self.email)
+                        real_bal = get_real_usdt_balance(self.email, force=True)
                         if real_bal is None:
                             self.log("REAL ORDER SKIPPED — could not fetch exchange balance.")
                             continue
