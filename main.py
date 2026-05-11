@@ -902,7 +902,7 @@ def signup(request: Request, payload: AuthIn):
 
 @app.post("/auth/login", response_model=SessionOut)
 def login(request: Request, payload: AuthIn, response: Response):
-    _rate_limit(request, limit=5, window=900)  # 5 per 15 minutes per IP
+    _rate_limit(request, limit=15, window=900)  # 15 per 15 minutes per IP
     email = payload.email.strip().lower()
 
     with DB_LOCK:
