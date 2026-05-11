@@ -4,11 +4,6 @@ Database layer — supports both PostgreSQL (prod) and SQLite (local dev).
 When DATABASE_URL env var is set → uses psycopg3 (PostgreSQL).
 When not set → falls back to SQLite with a thin compatibility wrapper
 that makes it behave identically (dict rows, %s placeholders).
-
-PostgreSQL mode uses a persistent connection (autocommit=True) instead of
-opening a new TCP connection on every db() call. A new connection costs
-50-200ms over the network; the persistent proxy costs ~0ms. Reconnects
-automatically if the connection drops.
 """
 import os
 
@@ -24,44 +19,8 @@ if DATABASE_URL:
 
     USING_PG = True
 
-    def _new_pg_conn():
-        return psycopg.connect(_url, row_factory=dict_row, autocommit=True)
-
-    _pg_conn = None   # module-level persistent connection
-
-    class _PgProxy:
-        """
-        Persistent-connection proxy. Returned by db() instead of a fresh
-        psycopg.connect() each time.
-
-        close()  → no-op  (keeps TCP connection alive for next call)
-        commit() → no-op  (autocommit=True — each statement commits instantly)
-        cursor() → reconnects transparently if the connection was dropped
-        """
-
-        def cursor(self):
-            global _pg_conn
-            try:
-                if _pg_conn is None or _pg_conn.closed:
-                    _pg_conn = _new_pg_conn()
-                return _pg_conn.cursor()
-            except Exception:
-                try:
-                    _pg_conn = _new_pg_conn()
-                    return _pg_conn.cursor()
-                except Exception as e:
-                    raise RuntimeError(f"DB reconnect failed: {e}") from e
-
-        def commit(self):
-            pass   # autocommit=True — every statement is already committed
-
-        def close(self):
-            pass   # no-op — keep the TCP connection alive
-
-    _proxy = _PgProxy()
-
     def db():
-        return _proxy
+        return psycopg.connect(_url, row_factory=dict_row)
 
     def serial_pk() -> str:
         return "SERIAL PRIMARY KEY"
