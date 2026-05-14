@@ -4392,6 +4392,82 @@ def _resume_runners_on_startup() -> None:
             print(f"[startup-resume] {email} — error (state preserved): {e}")
 
     print(f"[startup-resume] done — {resumed} AI runner(s) resumed after restart")
+    return resumed
+
+
+def _resume_watchdog() -> None:
+    """
+    Runs after the initial startup resume. Retries any saved runner states
+    that didn't start (e.g. because exchange check failed at boot time).
+    Checks every 2 minutes for up to 20 minutes, then gives up.
+    """
+    max_attempts = 10
+    interval_sec = 120
+
+    for attempt in range(1, max_attempts + 1):
+        time.sleep(interval_sec)
+
+        rows = _load_all_runner_states()
+        if not rows:
+            print("[watchdog] no saved states — watchdog exiting")
+            return
+
+        now_ts = time.time()
+        pending = []
+        with AUTO_LOCK:
+            for row in rows:
+                email = row["email"]
+                # Already running — no action needed
+                if email in AUTO_RUNNERS and AUTO_RUNNERS[email].is_running():
+                    continue
+                # Expired duration session — skip
+                end_at_ts = row.get("end_at_ts")
+                if end_at_ts and float(end_at_ts) <= now_ts:
+                    continue
+                pending.append(row)
+
+        if not pending:
+            print("[watchdog] all runners active — watchdog exiting")
+            return
+
+        print(f"[watchdog] attempt {attempt}/{max_attempts} — {len(pending)} runner(s) not yet started")
+        resumed = 0
+        for row in pending:
+            email = row["email"]
+            try:
+                if not get_exchange(email):
+                    print(f"[watchdog] {email} — exchange still not ready, will retry")
+                    continue
+
+                runner = AutoRunner(
+                    email=email,
+                    symbol=row["symbol"],
+                    trade_style=row["trade_style"],
+                    mode=row["mode"],
+                    max_trades_per_day=int(row["max_trades_per_day"]),
+                    stop_after_bad_trades=int(row["stop_after_bad_trades"]),
+                    duration_days=int(row["duration_days"]),
+                    trend_filter=bool(row["trend_filter"]),
+                    chop_min_sep_pct=float(row["chop_min_sep_pct"]),
+                )
+                end_at_ts = row.get("end_at_ts")
+                if end_at_ts:
+                    runner.end_at_ts = float(end_at_ts)
+
+                with AUTO_LOCK:
+                    if email not in AUTO_RUNNERS or not AUTO_RUNNERS[email].is_running():
+                        AUTO_RUNNERS[email] = runner
+                        runner.start()
+                        resumed += 1
+                        print(f"[watchdog] {email} — resumed {row['symbol']} {row['mode']} {row['trade_style']}")
+
+            except Exception as e:
+                print(f"[watchdog] {email} — error: {e}")
+
+        if resumed:
+            print(f"[watchdog] {resumed} runner(s) started this attempt")
+
+    print("[watchdog] max attempts reached — giving up (state preserved in DB)")
 
 
 # =========================
@@ -5154,3 +5230,4 @@ def admin_save_notes(email: str, payload: AdminNotesIn, admin=Depends(require_ad
 # Re-starts any AI session that was live before the last deploy/restart.
 import threading as _threading
 _threading.Thread(target=_resume_runners_on_startup, daemon=True).start()
+_threading.Thread(target=_resume_watchdog, daemon=True).start()
