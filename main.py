@@ -5180,7 +5180,7 @@ def admin_users(
             cur.execute(
                 """
                 SELECT u.email, u.created_at,
-                       COALESCE(s.equity, %s) AS equity,
+                       COALESCE(s.equity, 0) AS equity,
                        COALESCE(s.session_id, 0) AS session_id
                 FROM users u
                 LEFT JOIN user_state s ON s.email = u.email
@@ -5188,20 +5188,20 @@ def admin_users(
                 ORDER BY u.created_at DESC
                 LIMIT %s
                 """,
-                (START_EQUITY, f"%{qn}%", int(limit)),
+                (f"%{qn}%", int(limit)),
             )
         else:
             cur.execute(
                 """
                 SELECT u.email, u.created_at,
-                       COALESCE(s.equity, %s) AS equity,
+                       COALESCE(s.equity, 0) AS equity,
                        COALESCE(s.session_id, 0) AS session_id
                 FROM users u
                 LEFT JOIN user_state s ON s.email = u.email
                 ORDER BY u.created_at DESC
                 LIMIT %s
                 """,
-                (START_EQUITY, int(limit)),
+                (int(limit),),
             )
 
         rows = cur.fetchall()
