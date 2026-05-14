@@ -4817,7 +4817,11 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
     with AUTO_LOCK:
         r = AUTO_RUNNERS.get(email)
         if r:
-            return {"ok": True, "events": list(r.history)[: int(limit)]}
+            return {
+                "ok": True,
+                "session_id": r.ai_session_id,
+                "events": list(r.history)[: int(limit)],
+            }
     # No runner in memory (after redeploy) — read latest open session from DB
     with DB_LOCK:
         conn = db()
@@ -4828,11 +4832,12 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
             (email,),
         )
         sess = cur.fetchone()
-        if sess:
+        session_id = sess["id"] if sess else None
+        if session_id:
             cur.execute(
                 "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
                 "ORDER BY id DESC LIMIT %s",
-                (email, sess["id"], int(limit)),
+                (email, session_id, int(limit)),
             )
         else:
             cur.execute(
@@ -4841,7 +4846,39 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
             )
         rows = cur.fetchall()
         conn.close()
-    return {"ok": True, "events": [{"t": r["t"], "msg": r["msg"]} for r in rows]}
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "events": [{"t": r["t"], "msg": r["msg"]} for r in rows],
+    }
+
+
+@app.get("/auto/sessions")
+def auto_sessions(
+    user=Depends(require_user),
+    limit: int = Query(default=20, ge=1, le=100),
+    log_limit: int = Query(default=500, ge=1, le=2000),
+):
+    """Return all past AI sessions for this user, newest first, with full logs."""
+    email = user["email"]
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, symbol, mode, trade_style, started_at, ended_at, stop_reason "
+            "FROM ai_sessions WHERE email=%s ORDER BY id DESC LIMIT %s",
+            (email, int(limit)),
+        )
+        sessions = [dict(r) for r in cur.fetchall()]
+        for sess in sessions:
+            cur.execute(
+                "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
+                "ORDER BY id ASC LIMIT %s",
+                (email, sess["id"], int(log_limit)),
+            )
+            sess["events"] = [{"t": r["t"], "msg": r["msg"]} for r in cur.fetchall()]
+        conn.close()
+    return {"ok": True, "sessions": sessions}
 
 
 @app.get("/auto/signal")
