@@ -4014,9 +4014,15 @@ class AutoRunner:
         if REAL_TRADING:
             _is_b_t1 = (pt.get("grade") == "B" and pt.get("label") == "T1")
             if _is_b_t1:
-                # T1 closes via its own reduceOnly TP limit order on Bybit — never touch the
-                # remaining 40% T2 position. SL moves to breakeven in _close_pending_trades.
-                self.log(f"REAL T1 HIT TP | {side} {self.symbol} — T2 still running, SL→breakeven next candle")
+                # For real Grade B T1, only confirm TP if Bybit shows the T1 TP limit order
+                # as filled. Trail-stop, SL, or any other close must NOT trigger breakeven.
+                _t1_tp_id = pt.get("t1_tp_id")
+                _t1_filled = bool(_t1_tp_id) and _check_bybit_order_filled(self.email, _t1_tp_id, self.symbol)
+                if _t1_filled:
+                    self.log(f"REAL T1 HIT TP | {side} {self.symbol} — T2 still running, SL→breakeven next candle")
+                else:
+                    self.log(f"REAL T1 CLOSED ({outcome}) — Bybit T1 TP order not filled | T2 continues with original SL")
+                    # T2 is still live on Bybit — do NOT cancel/close; let T2 run to its own TP or SL
             else:
                 # Grade A, or Grade B T2 (TP or SL hit): cancel open orders then confirm close
                 _cancel_all_real_orders(self.email, self.symbol)
@@ -4140,10 +4146,17 @@ class AutoRunner:
                     # NATURAL_CLOSE — price between SL and TP, hold another candle
                     still_open.append(pt)
                 else:
-                    # Definitively closed — record T1 win (T2 not in still_open yet, set below)
-                    if pt.get("is_primary") and result > eq:
-                        t1_won = True
-                        t1_entry_price = float(pt.get("entry_price", 0))
+                    # Definitively closed — determine if T1 won for Grade B breakeven logic.
+                    # Real trading: Bybit API confirms T1 TP order fill (never trust price sim).
+                    # Paper trading / Grade A: price-simulation profit check.
+                    if pt.get("is_primary"):
+                        if REAL_TRADING and pt.get("grade") == "B" and pt.get("t1_tp_id"):
+                            if _check_bybit_order_filled(self.email, pt["t1_tp_id"], self.symbol):
+                                t1_won = True
+                                t1_entry_price = float(pt.get("entry_price", 0))
+                        elif result > eq:
+                            t1_won = True
+                            t1_entry_price = float(pt.get("entry_price", 0))
 
             self.pending_trades = still_open
 
@@ -4374,7 +4387,8 @@ class AutoRunner:
                         _b = real_b_result or {}
                         self.pending_trades = [
                             {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80,
-                             "is_primary": True,  "label": "T1", "order_id": _b.get("order_id")},
+                             "is_primary": True,  "label": "T1", "order_id": _b.get("order_id"),
+                             "t1_tp_id": _b.get("t1_tp_id")},
                             {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00,
                              "is_primary": False, "label": "T2", "breakeven_after_t1": True},
                         ]
@@ -4743,6 +4757,23 @@ def _move_real_sl_to_breakeven(email: str, symbol: str, entry_price: float) -> b
             "positionIdx": 0,
         })
         return True
+    except Exception:
+        return False
+
+
+def _check_bybit_order_filled(email: str, order_id: str, symbol: str) -> bool:
+    """
+    Return True only if the Bybit order is confirmed fully filled (ccxt status == 'closed').
+    Returns False on any error or if order is still open / canceled / unknown.
+    Used to verify T1 TP hit on real Grade B trades before moving T2 SL to breakeven.
+    """
+    try:
+        row = get_exchange(email)
+        if not row:
+            return False
+        ex = _make_ccxt_exchange(row)
+        order = ex.fetch_order(order_id, symbol)
+        return order.get("status") == "closed"
     except Exception:
         return False
 
