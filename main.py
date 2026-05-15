@@ -3968,12 +3968,26 @@ class AutoRunner:
         ])
 
         if REAL_TRADING:
-            try:
-                close_real_order(email=self.email, symbol=self.symbol, side=side)
-                self.log(f"REAL POSITION CLOSED | {side} {self.symbol} | {outcome}")
-            except Exception as _ce:
-                self.log(f"REAL CLOSE note: {_ce}")
-            # Sync real balance from exchange after close — overrides paper PnL calculation
+            _is_b_t1 = (pt.get("grade") == "B" and pt.get("label") == "T1")
+            if _is_b_t1:
+                # For real Grade B T1, only confirm TP if Bybit shows the T1 TP limit order
+                # as filled. Trail-stop, SL, or any other close must NOT trigger breakeven.
+                _t1_tp_id = pt.get("t1_tp_id")
+                _t1_filled = bool(_t1_tp_id) and _check_bybit_order_filled(self.email, _t1_tp_id, self.symbol)
+                if _t1_filled:
+                    self.log(f"REAL T1 HIT TP | {side} {self.symbol} — T2 still running, SL→breakeven next candle")
+                else:
+                    self.log(f"REAL T1 CLOSED ({outcome}) — Bybit T1 TP order not filled | T2 continues with original SL")
+                    # T2 is still live on Bybit — do NOT cancel/close; let T2 run to its own TP or SL
+            else:
+                # Grade A, or Grade B T2 (TP or SL hit): cancel open orders then confirm close
+                _cancel_all_real_orders(self.email, self.symbol)
+                try:
+                    close_real_order(email=self.email, symbol=self.symbol, side=side)
+                    self.log(f"REAL POSITION CLOSED | {side} {self.symbol} | {outcome}")
+                except Exception as _ce:
+                    self.log(f"REAL CLOSE note: {_ce}")
+            # Sync real balance after any close event — always bypass cache for accuracy
             real_bal_after = get_real_usdt_balance(self.email, force=True)
             if real_bal_after is not None:
                 equity_after = real_bal_after
@@ -4087,9 +4101,17 @@ class AutoRunner:
                     # NATURAL_CLOSE — price between SL and TP, hold another candle
                     still_open.append(pt)
                 else:
-                    # Definitively closed — record T1 win (T2 not in still_open yet, set below)
-                    if pt.get("is_primary") and result > eq:
-                        t1_won = True
+                    # Definitively closed — determine if T1 won for Grade B breakeven logic.
+                    # Real trading: Bybit API confirms T1 TP order fill (never trust price sim).
+                    # Paper trading / Grade A: price-simulation profit check.
+                    if pt.get("is_primary"):
+                        if REAL_TRADING and pt.get("grade") == "B" and pt.get("t1_tp_id"):
+                            if _check_bybit_order_filled(self.email, pt["t1_tp_id"], self.symbol):
+                                t1_won = True
+                                t1_entry_price = float(pt.get("entry_price", 0))
+                        elif result > eq:
+                            t1_won = True
+                            t1_entry_price = float(pt.get("entry_price", 0))
 
             self.pending_trades = still_open
 
@@ -4290,7 +4312,17 @@ class AutoRunner:
                         "tp_pct_open": tp_pct_open,   # locked at entry — never recalculates
                         **({"order_id": real_order_id} if real_order_id else {}),
                     }
-                    if grade == "B":
+                    if grade == "B" and REAL_TRADING:
+                        _b = real_b_result or {}
+                        self.pending_trades = [
+                            {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80,
+                             "is_primary": True,  "label": "T1", "order_id": _b.get("order_id"),
+                             "t1_tp_id": _b.get("t1_tp_id")},
+                            {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00,
+                             "is_primary": False, "label": "T2", "breakeven_after_t1": True},
+                        ]
+                        self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP T2 40%+100%TP+BE | score={self.last_score:.2f}")
+                    elif grade == "B":
                         self.pending_trades = [
                             {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80, "is_primary": True,  "label": "T1"},
                             {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00, "is_primary": False, "label": "T2", "breakeven_after_t1": True},
@@ -4610,6 +4642,156 @@ def close_real_order(email: str, symbol: str, side: str) -> dict:
         params   = {"reduceOnly": True, "positionIdx": 0},
     )
     return {"ok": True, "order_id": order.get("id"), "qty": qty}
+
+
+# ── Real Grade B helpers ────────────────────────────────────────────────────
+
+def _cancel_all_real_orders(email: str, symbol: str) -> None:
+    """Cancel all open orders for symbol. Best-effort cleanup — never raises."""
+    try:
+        row = get_exchange(email)
+        if not row:
+            return
+        ex = _make_ccxt_exchange(row)
+        open_orders = ex.fetch_open_orders(symbol)
+        for o in open_orders:
+            try:
+                ex.cancel_order(o["id"], symbol)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _move_real_sl_to_breakeven(email: str, symbol: str, entry_price: float) -> bool:
+    """
+    Move position-level SL to entry price (breakeven) when T1 hits TP.
+    Uses Bybit's /v5/position/trading-stop — one atomic call, zero gap.
+    Safer than cancel+replace because the position is never unprotected.
+    Returns True on success.
+    """
+    try:
+        row = get_exchange(email)
+        if not row:
+            return False
+        ex = _make_ccxt_exchange(row)
+        mkt = ex.market(symbol)
+        bybit_sym = mkt["id"]   # "BTC/USDT:USDT" → "BTCUSDT"
+        ex.privatePostV5PositionTradingStop({
+            "category":    "linear",
+            "symbol":      bybit_sym,
+            "stopLoss":    str(round(entry_price, 4)),
+            "slTriggerBy": "MarkPrice",
+            "positionIdx": 0,
+        })
+        return True
+    except Exception:
+        return False
+
+
+def _check_bybit_order_filled(email: str, order_id: str, symbol: str) -> bool:
+    """
+    Return True only if the Bybit order is confirmed fully filled (ccxt status == 'closed').
+    Returns False on any error or if order is still open / canceled / unknown.
+    Used to verify T1 TP hit on real Grade B trades before moving T2 SL to breakeven.
+    """
+    try:
+        row = get_exchange(email)
+        if not row:
+            return False
+        ex = _make_ccxt_exchange(row)
+        order = ex.fetch_order(order_id, symbol)
+        return order.get("status") == "closed"
+    except Exception:
+        return False
+
+
+def place_real_grade_b_order(
+    email: str,
+    symbol: str,
+    side: str,          # "LONG" | "SHORT"
+    usdt_size: float,   # full position size in USDT (T1 + T2 combined)
+    leverage: int,
+    sl_pct: float,
+    t1_tp_pct: float,   # T1 TP distance (80% of full ATR TP)
+    t2_tp_pct: float,   # T2 TP distance (100% of full ATR TP)
+) -> dict:
+    """
+    Place a real Grade B position on Bybit.
+
+    Order layout:
+      Entry:  one market order for full qty (T1 60% + T2 40%)
+      SL:     position-level stop attached to entry (moved to breakeven after T1 fires)
+      T1 TP:  reduceOnly limit order for 60% of qty at t1_tp_pct from entry
+      T2 TP:  reduceOnly limit order for 40% of qty at t2_tp_pct from entry
+
+    When T1's limit TP fires on Bybit, 60% of the position closes automatically.
+    The engine then calls _move_real_sl_to_breakeven() to protect the remaining 40%.
+    T2 then runs risk-free to its own TP or the breakeven SL.
+
+    Paper tracking is unchanged — Grade B T1/T2 paper logic handles PnL accounting.
+    """
+    row = get_exchange(email)
+    if not row:
+        raise ValueError("No exchange connected")
+
+    ex = _make_ccxt_exchange(row)
+    order_side = "buy"  if side == "LONG" else "sell"
+    close_side = "sell" if side == "LONG" else "buy"
+    sl_mult  = (1 - sl_pct)    if side == "LONG" else (1 + sl_pct)
+    t1_mult  = (1 + t1_tp_pct) if side == "LONG" else (1 - t1_tp_pct)
+    t2_mult  = (1 + t2_tp_pct) if side == "LONG" else (1 - t2_tp_pct)
+
+    ticker = ex.fetch_ticker(symbol)
+    price  = float(ticker["last"])
+
+    try:
+        ex.set_leverage(leverage, symbol)
+    except Exception as lev_e:
+        raise ValueError(f"Leverage set failed ({leverage}×): {lev_e}")
+
+    notional = usdt_size * leverage
+    qty      = round(notional / price, 6)
+    if notional < 5.0:
+        raise ValueError(f"Position too small: ${notional:.2f} notional (need ≥ $5)")
+
+    sl_price    = round(price * sl_mult, 4)
+    t1_tp_price = round(price * t1_mult, 4)
+    t2_tp_price = round(price * t2_mult, 4)
+    t1_qty = round(qty * 0.60, 6)
+    t2_qty = round(qty * 0.40, 6)
+
+    # Entry: market order with position-level SL (no TP — handled by partial limit orders below)
+    entry_order = ex.create_order(symbol, "market", order_side, qty, params={
+        "stopLoss":    {"triggerPrice": sl_price, "type": "market"},
+        "positionIdx": 0,
+    })
+
+    # T1 TP: partial reduceOnly limit at 60% qty
+    t1_order = ex.create_order(symbol, "limit", close_side, t1_qty, t1_tp_price, params={
+        "reduceOnly": True,
+        "positionIdx": 0,
+    })
+
+    # T2 TP: partial reduceOnly limit at 40% qty
+    t2_order = ex.create_order(symbol, "limit", close_side, t2_qty, t2_tp_price, params={
+        "reduceOnly": True,
+        "positionIdx": 0,
+    })
+
+    return {
+        "order_id":    entry_order.get("id"),
+        "t1_tp_id":    t1_order.get("id"),
+        "t2_tp_id":    t2_order.get("id"),
+        "qty":         qty,
+        "t1_qty":      t1_qty,
+        "t2_qty":      t2_qty,
+        "price":       price,
+        "sl_price":    sl_price,
+        "t1_tp_price": t1_tp_price,
+        "t2_tp_price": t2_tp_price,
+        "leverage":    leverage,
+    }
 
 
 @app.post("/trade")
