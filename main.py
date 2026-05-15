@@ -4091,19 +4091,27 @@ class AutoRunner:
 
         set_equity(self.email, equity_after)
         update_peak_ath(self.email, float(self.peak_equity), float(equity_after))
+
+        # A "bad trade" requires an ACTUAL loss > 0.5% of current equity.
+        # Trail stops at entry, breakeven closes, and tiny fee losses are NOT bad trades —
+        # they must not trigger strictness increases, double cooldown, or the bad-trade counter.
+        _bad_trade_threshold = equity_before * 0.005
+        _real_loss = pnl_value < -_bad_trade_threshold
+
         if is_primary:
             self.trades_today += 1
-            self._last_trade_bad = pnl_value < 0
-            if pnl_value < 0:
+            self._last_trade_bad = _real_loss
+            if _real_loss:
                 self.bad_trades_today += 1
 
         # Mini-Asym adaptive strictness — only update on primary trade
         if is_primary and mode == "MINI_ASYM":
-            if pnl_value < 0:
+            if _real_loss:
                 self.consecutive_wins = 0
                 self.adaptive_strictness = min(2.5, self.adaptive_strictness + 0.25)
                 self.log(f"MINI_ASYM strictness ↑ {self.adaptive_strictness:.2f} (after loss)")
-            else:
+            elif pnl_value > 0:
+                # Only genuine profit advances the win streak and relaxes strictness
                 self.consecutive_wins += 1
                 if self.consecutive_wins >= 3:
                     # 3 wins in a row → reset strictness fully, AI is in good form
@@ -4112,6 +4120,7 @@ class AutoRunner:
                     self.log("MINI_ASYM strictness reset to 1.0 (3 consecutive wins)")
                 else:
                     self.adaptive_strictness = max(1.0, self.adaptive_strictness - 0.10)
+            # else: breakeven or sub-threshold fee loss — no strictness change, no win streak
 
         mt = self.max_trades_per_day if self.max_trades_per_day > 0 else "∞"
         self.log(
