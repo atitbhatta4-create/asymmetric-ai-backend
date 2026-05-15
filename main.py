@@ -4064,7 +4064,15 @@ class AutoRunner:
         if is_primary and mode == "MINI_ASYM":
             if _real_loss:
                 self.consecutive_wins = 0
-                self.adaptive_strictness = min(2.5, self.adaptive_strictness + 0.25)
+                # Graduated steps: 1.0 → 1.10 → 1.25 → 1.50 → 2.50
+                # First loss is gentle (+0.10); escalates with each consecutive loss.
+                _STRICT_STEPS = [1.0, 1.10, 1.25, 1.50, 2.50]
+                _next_strict = 2.50
+                for _s in _STRICT_STEPS:
+                    if _s > self.adaptive_strictness + 0.001:
+                        _next_strict = _s
+                        break
+                self.adaptive_strictness = _next_strict
                 self.log(f"MINI_ASYM strictness ↑ {self.adaptive_strictness:.2f} (after loss)")
             elif pnl_value > 0:
                 # Only genuine profit advances the win streak and relaxes strictness
