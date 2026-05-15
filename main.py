@@ -2245,6 +2245,11 @@ def balance(user=Depends(require_user)):
         state_row = cur.fetchone()
         conn.close()
     peak = float(state_row["peak_equity"] or 0) if state_row else 0.0
+    # Include live runner's peak — more up-to-date than DB value between saves
+    with AUTO_LOCK:
+        _r = AUTO_RUNNERS.get(email)
+    if _r and _r.is_running():
+        peak = max(peak, _r.peak_equity)
     if peak < equity:
         peak = equity
     hard_floor = round(peak * 0.85, 2)
@@ -3462,12 +3467,27 @@ class AutoRunner:
         self.market_grade: str = "-"
         self._last_trade_bad: bool = False
         self.session_start_equity: float = get_equity(email)
-        self.peak_equity: float = get_equity(email)   # tracks highest equity for drawdown protection
+        # Peak must be the highest equity ever seen — read from user_state which survives
+        # AI stop/restart (ai_runner_state is deleted on stop, user_state is permanent).
+        # This prevents floor from drifting down when equity dips between sessions.
+        _saved_peak = 0.0
+        try:
+            with DB_LOCK:
+                _pc = db()
+                _pcur = _pc.cursor()
+                _pcur.execute("SELECT peak_equity FROM user_state WHERE email = %s", (email,))
+                _prow = _pcur.fetchone()
+                _pc.close()
+                _saved_peak = float(_prow["peak_equity"] or 0) if _prow else 0.0
+        except Exception:
+            _saved_peak = 0.0
+        self.peak_equity: float = max(get_equity(email), _saved_peak)
         self.consecutive_wins: int = 0    # reset strictness after 3 wins in a row
-        # Hard floor = 85% of actual starting equity for this session.
-        # Uses real balance, NOT the paper $1,000 constant — so a $5k user's floor is $4,250
-        # and a $1k user's floor is $850. Engine stops completely if equity falls below this.
-        self.floor_equity: float = self.session_start_equity * 0.85
+        # Hard floor = 85% of peak equity — trails UP with new highs, never decreases.
+        self.floor_equity: float = self.peak_equity * 0.85
+        # Persist the correct peak immediately so /balance endpoint shows the right floor
+        # even before the first trade is recorded.
+        update_peak_ath(email, self.peak_equity, self.peak_equity)
         # Load today's real trade counts from DB — prevents bypass by stop+restart
         self.trades_today, self.bad_trades_today = self._load_today_stats()
         # Restore live state (strictness, open positions, drawdown level) from last session
@@ -3506,11 +3526,13 @@ class AutoRunner:
                 self._last_trade_bad = bool(int(row["last_trade_bad"]))
             if row.get("consecutive_wins"):
                 self.consecutive_wins = int(row["consecutive_wins"])
-            # Restore peak/floor equity — keeps drawdown protection intact across redeploys
+            # Restore peak/floor equity — always take the MAX so floor never drifts down.
+            # ai_runner_state may have been saved with a lower value if equity had dipped.
             if row.get("peak_equity") and float(row["peak_equity"]) > 0:
-                self.peak_equity = float(row["peak_equity"])
+                self.peak_equity = max(self.peak_equity, float(row["peak_equity"]))
+                self.floor_equity = self.peak_equity * 0.85
             if row.get("floor_equity") and float(row["floor_equity"]) > 0:
-                self.floor_equity = float(row["floor_equity"])
+                self.floor_equity = max(self.floor_equity, float(row["floor_equity"]))
             # Restore original session start equity — keeps P&L% and risk calcs relative
             # to the real session start, not the redeploy time
             if row.get("session_start_equity") and float(row["session_start_equity"]) > 0:
