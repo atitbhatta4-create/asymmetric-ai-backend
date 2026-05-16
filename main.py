@@ -520,6 +520,17 @@ TRADE_STYLE_PARAMS: Dict[str, Dict] = {
     "SWING":     {"tf": "4h",  "interval": 14400, "sl_atr": 1.5, "tp_atr": 3.0, "sl_max": 4.0, "tp_max": 8.0},
 }
 
+# Mid-candle monitor: price-move thresholds and signal score minimum
+# These are separate from the main signal thresholds — incomplete candle data
+# requires a stricter 75%+ score to compensate for noisier readings.
+_MID_CANDLE_THRESHOLDS: Dict[str, float] = {
+    "SCALP":     0.010,   # 1.0% — 15m candles move fast, lower bar to catch breakouts
+    "DAY_TRADE": 0.015,   # 1.5% — 1h candles need a meaningful move to justify early entry
+    "SWING":     0.015,   # 1.5% — 4h candles: only clear momentum moves qualify
+}
+_MID_CANDLE_MIN_SCORE = 0.75    # higher than normal 65%/78% — incomplete candle is noisier
+_MID_CANDLE_INTERVAL  = 300     # check every 5 minutes
+
 DUBAI_TZ = timezone(timedelta(hours=4))
 
 
@@ -3381,6 +3392,10 @@ class AutoStartIn(BaseModel):
     chop_min_sep_pct: float = 0.005
 
 
+class _MidCandleSkip(Exception):
+    """Raised inside _run_mid_candle_monitor to break out of nested blocks cleanly."""
+
+
 class AutoRunner:
     def __init__(self, email, symbol, trade_style, mode,
                  max_trades_per_day, stop_after_bad_trades, duration_days,
@@ -3633,6 +3648,8 @@ class AutoRunner:
             self._open_ai_session()
             self.log("AI started.")
         self.thread.start()
+        # Mid-candle monitor runs in parallel — fires early trades on big price moves
+        threading.Thread(target=self._run_mid_candle_monitor, daemon=True).start()
 
     def stop(self, reason="Stopped by user."):
         self.log(reason)
@@ -4208,6 +4225,188 @@ class AutoRunner:
             self.last_trade_ts = time.time()
             self.log("New Dubai day — daily limits reset. Resuming AI.")
 
+    def _run_mid_candle_monitor(self):
+        """
+        Background thread: checks for significant intra-candle price moves every
+        5 minutes. If price has moved > threshold% from the current candle's open,
+        runs a full signal analysis. Fires a trade immediately if score >= 0.75.
+
+        Fires LONG on upward moves, SHORT on downward moves.
+        Sets last_trade_ts after firing so the main loop's cooldown naturally
+        prevents double-firing at the next scheduled candle close.
+        Stops cleanly when stop_event is set.
+        """
+        threshold = _MID_CANDLE_THRESHOLDS.get(self.trade_style, 0.015)
+        cooldown_sec = max(60, self.interval_sec)
+
+        # Wait one full check interval before starting — give the main loop time
+        # to compute the first signal and initialise last_atr_pct / market_grade.
+        for _ in range(_MID_CANDLE_INTERVAL // 10):
+            if self.stop_event.is_set():
+                return
+            time.sleep(10)
+
+        while not self.stop_event.is_set():
+            try:
+                # ── Pre-checks — skip quickly if conditions aren't right ───────────
+                if self.pending_trades:
+                    pass  # fall through to next sleep; main loop will handle them
+                else:
+                    # Respect daily limits and cooldown
+                    _daily_bad_ok = (self.stop_after_bad_trades <= 0 or
+                                     self.bad_trades_today < self.stop_after_bad_trades)
+                    _daily_trade_ok = (self.max_trades_per_day <= 0 or
+                                       self.trades_today < self.max_trades_per_day)
+                    now_ts = time.time()
+                    _effective_cd = cooldown_sec * (2 if self._last_trade_bad else 1)
+                    _cooldown_ok = (now_ts - self.last_trade_ts) >= _effective_cd
+
+                    if _daily_bad_ok and _daily_trade_ok and _cooldown_ok:
+                        # ── Fetch current candle open and live price ───────────────
+                        klines = _fetch_klines_sync(self.symbol, self.tf, limit=3)
+                        if klines:
+                            candle_open  = float(klines[-1]["open"])
+                            current_px   = self._fetch_price_sync(self.symbol)
+                            move_pct     = (current_px - candle_open) / candle_open
+                            abs_move     = abs(move_pct)
+
+                            if abs_move >= threshold:
+                                self.log(
+                                    f"MID_CANDLE: price moved {move_pct*100:+.2f}% from candle open "
+                                    f"(open={candle_open:.4f} now={current_px:.4f}) — "
+                                    f"triggering early signal check"
+                                )
+
+                                # ── Full 4-layer signal analysis ──────────────────
+                                res = self._signal_and_filters()
+                                score      = res.get("score", 0.0)
+                                signal_ok  = res.get("ok", False)
+                                signal_side: Side = res.get("side", "LONG")
+
+                                if not signal_ok:
+                                    self.log(
+                                        f"MID_CANDLE: signal blocked ({(res.get('blocked') or '?')[:60]}) — skipped"
+                                    )
+                                elif score < _MID_CANDLE_MIN_SCORE:
+                                    self.log(
+                                        f"MID_CANDLE: score {score:.2f} below "
+                                        f"{_MID_CANDLE_MIN_SCORE:.2f} threshold — skipped. "
+                                        f"Next candle close check unchanged."
+                                    )
+                                else:
+                                    # Direction gate: price move must align with signal
+                                    expected_side: Side = "LONG" if move_pct > 0 else "SHORT"
+                                    if signal_side != expected_side:
+                                        self.log(
+                                            f"MID_CANDLE: score {score:.2f} OK but move direction "
+                                            f"({expected_side}) conflicts with signal ({signal_side}) — skipped"
+                                        )
+                                    else:
+                                        # ── Fire trade ────────────────────────────
+                                        entry_price = self._fetch_price_sync(self.symbol)
+                                        grade = self.market_grade
+                                        c   = presets_for_mode(self.mode)
+                                        st  = TRADE_STYLE_PARAMS.get(self.trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
+                                        sl_pct_open = min(self.last_atr_pct * st["sl_atr"], st["sl_max"] / 100.0)
+                                        tp_pct_open = min(self.last_atr_pct * st["tp_atr"], st["tp_max"] / 100.0)
+
+                                        if REAL_TRADING:
+                                            real_bal = get_real_usdt_balance(self.email, force=True)
+                                            if real_bal is None:
+                                                self.log("MID_CANDLE REAL ORDER SKIPPED — could not fetch balance")
+                                                # skip to next sleep
+                                                raise _MidCandleSkip()
+                                            equity_now = real_bal
+                                            set_equity(self.email, real_bal)
+                                        else:
+                                            equity_now = get_equity(self.email)
+
+                                        real_order_id = None
+                                        real_b_result = None
+                                        if REAL_TRADING:
+                                            try:
+                                                size_pct  = float(c["size"])
+                                                usdt_size = equity_now * size_pct
+                                                if grade == "B":
+                                                    real_b_result = place_real_grade_b_order(
+                                                        email=self.email, symbol=self.symbol,
+                                                        side=signal_side, usdt_size=usdt_size,
+                                                        leverage=int(c["leverage"]),
+                                                        sl_pct=sl_pct_open,
+                                                        t1_tp_pct=tp_pct_open * 0.80,
+                                                        t2_tp_pct=tp_pct_open * 1.00,
+                                                    )
+                                                else:
+                                                    _ro = place_real_order(
+                                                        email=self.email, symbol=self.symbol,
+                                                        side=signal_side, usdt_size=usdt_size,
+                                                        leverage=int(c["leverage"]),
+                                                        sl_pct=sl_pct_open, tp_pct=tp_pct_open,
+                                                    )
+                                                    real_order_id = _ro.get("order_id")
+                                            except Exception as _re:
+                                                self.log(f"MID_CANDLE REAL ORDER FAILED — {_re}")
+                                                raise _MidCandleSkip()
+
+                                        base_trade = {
+                                            "entry_price": entry_price,
+                                            "side":        signal_side,
+                                            "mode":        self.mode,
+                                            "signal":      self.last_signal,
+                                            "open_ts":     time.time(),
+                                            "sl_pct_open": sl_pct_open,
+                                            "tp_pct_open": tp_pct_open,
+                                            "mid_candle":  True,
+                                            **({"order_id": real_order_id} if real_order_id else {}),
+                                        }
+                                        if grade == "B" and REAL_TRADING:
+                                            _b = real_b_result or {}
+                                            self.pending_trades = [
+                                                {**base_trade, "grade": "B", "size_mult": 0.60,
+                                                 "tp_mult": 0.80, "is_primary": True, "label": "T1",
+                                                 "order_id": _b.get("order_id"),
+                                                 "t1_tp_id": _b.get("t1_tp_id")},
+                                                {**base_trade, "grade": "B", "size_mult": 0.40,
+                                                 "tp_mult": 1.00, "is_primary": False, "label": "T2",
+                                                 "breakeven_after_t1": True},
+                                            ]
+                                        elif grade == "B":
+                                            self.pending_trades = [
+                                                {**base_trade, "grade": "B", "size_mult": 0.60,
+                                                 "tp_mult": 0.80, "is_primary": True, "label": "T1"},
+                                                {**base_trade, "grade": "B", "size_mult": 0.40,
+                                                 "tp_mult": 1.00, "is_primary": False, "label": "T2",
+                                                 "breakeven_after_t1": True},
+                                            ]
+                                        else:
+                                            self.pending_trades = [
+                                                {**base_trade, "grade": "A", "size_mult": 1.00,
+                                                 "tp_mult": 1.00, "is_primary": True},
+                                            ]
+
+                                        # Setting last_trade_ts prevents main loop from
+                                        # double-firing a new trade at the next scheduled
+                                        # candle close (cooldown won't have passed yet).
+                                        self.last_trade_ts = time.time()
+                                        _save_runner_state(self)
+
+                                        self.log(
+                                            f"MID_CANDLE TRADE OPENED Grade {grade} ({signal_side}) "
+                                            f"@ {entry_price:.4f} | score={score:.2f} | "
+                                            f"{abs_move*100:.1f}% price move triggered"
+                                        )
+
+            except _MidCandleSkip:
+                pass
+            except Exception as _mc_err:
+                self.log(f"MID_CANDLE monitor error: {_mc_err}")
+
+            # Sleep in 10-second chunks so stop_event is respected quickly
+            for _ in range(_MID_CANDLE_INTERVAL // 10):
+                if self.stop_event.is_set():
+                    return
+                time.sleep(10)
+
     def _run_loop(self):
         cooldown_sec = max(60, self.interval_sec)
         while not self.stop_event.is_set():
@@ -4384,7 +4583,14 @@ class AutoRunner:
                 self.last_signal = f"ERROR: {str(e)[:120]}"
                 self.log(self.last_signal)
             finally:
-                time.sleep(self.interval_sec)
+                # Sleep in 30-second chunks so the loop wakes up quickly when
+                # the mid-candle monitor opens a trade and sets pending_trades.
+                _rem = self.interval_sec
+                while _rem > 0 and not self.stop_event.is_set():
+                    time.sleep(min(30, _rem))
+                    _rem -= 30
+                    if self.pending_trades:   # mid-candle trade opened — process it now
+                        break
 
         # ── Loop exited — engine stopped (drawdown / duration / bad trades / user stop) ──
         # Clear persisted state so this runner is NOT resumed on the next deploy.
