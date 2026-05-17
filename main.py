@@ -3667,6 +3667,21 @@ class AutoRunner:
             self.bad_trades_today = 0
             self.log("Daily counters reset (Dubai timezone).")
 
+            # Reset adaptive strictness at Dubai midnight so a bad day never
+            # bleeds into the next. Step down gradually if very elevated.
+            STEP_DOWN = {2.50: 1.50, 1.50: 1.25}
+            if self.adaptive_strictness <= 1.25:
+                self.adaptive_strictness = 1.0
+                self.consecutive_wins = 0
+                self.log("Midnight reset — strictness cleared to 1.0x. Fresh start.")
+            else:
+                self.adaptive_strictness = STEP_DOWN.get(
+                    round(self.adaptive_strictness, 2), 1.25
+                )
+                self.log(f"Midnight reset — strictness stepped down to {self.adaptive_strictness:.2f}x")
+            # Persist immediately so a server restart won't revert the reset
+            _save_runner_state(self)
+
     def _reset_in_sec(self):
         now_dt = now_dubai()
         next_midnight = (now_dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
