@@ -4307,13 +4307,17 @@ class AutoRunner:
         self.market_grade = res.get("grade", "-")
         if res.get("atr_pct"):
             self.last_atr_pct = res["atr_pct"]
-        # Always log the early bear check so the calculation is visible in logs
-        if res.get("htf_bear_debug"):
-            self.log(res["htf_bear_debug"])
-        if res.get("htf_bear_triggered") and res.get("htf_bear_slope_pct") is not None:
+        slope_pct = res.get("htf_bear_slope_pct")
+        if res.get("htf_bear_triggered") and slope_pct is not None:
+            # Override fired — always log
             self.log(
-                f"EARLY BEAR OVERRIDE: EMA21 dropped {abs(res['htf_bear_slope_pct']):.3f}% "
+                f"EARLY BEAR OVERRIDE: EMA21 dropped {abs(slope_pct):.3f}% "
                 f"over 8 candles — flipping direction to SHORT mode"
+            )
+        elif slope_pct is not None and slope_pct < -0.002:
+            # Within 0.10% of the -0.30% trigger — log a warning
+            self.log(
+                f"Early bear check: EMA21 at {slope_pct:+.3f}% — approaching trigger at -0.30%"
             )
         return res
 
