@@ -426,6 +426,11 @@ def init_db() -> None:
         if not column_exists(conn, "ai_logs", "session_id"):
             cur.execute("ALTER TABLE ai_logs ADD COLUMN session_id INTEGER")
 
+        # Performance indexes for AI log queries
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_ai_sessions_email ON ai_sessions(email)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_ai_logs_session ON ai_logs(session_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_ai_logs_email ON ai_logs(email)")
+
         # AI runner persistence — survives backend restarts / deploys.
         # Saved when user starts the AI, cleared when AI stops for any reason.
         # On startup, all rows here are auto-resumed so live sessions never drop.
@@ -3669,17 +3674,29 @@ class AutoRunner:
             with DB_LOCK:
                 conn = db()
                 cur = conn.cursor()
-                cur.execute(
-                    "INSERT INTO ai_sessions(email, symbol, mode, trade_style, started_at) "
-                    "VALUES(%s, %s, %s, %s, %s)",
-                    (self.email, self.symbol, self.mode, self.trade_style,
-                     now_dubai().strftime("%Y-%m-%d %H:%M:%S")),
-                )
                 if USING_PG:
-                    cur.execute("SELECT lastval()")
-                    self.ai_session_id = cur.fetchone()[0]
+                    # RETURNING id avoids SELECT lastval() which returns a dict row
+                    # in psycopg3 — dict[0] raised TypeError and prevented conn.commit()
+                    # causing the INSERT to silently roll back every time.
+                    cur.execute(
+                        "INSERT INTO ai_sessions(email, symbol, mode, trade_style, started_at) "
+                        "VALUES(%s, %s, %s, %s, %s) RETURNING id",
+                        (self.email, self.symbol, self.mode, self.trade_style,
+                         now_dubai().strftime("%Y-%m-%d %H:%M:%S")),
+                    )
+                    row = cur.fetchone()
+                    self.ai_session_id = row["id"] if isinstance(row, dict) else row[0]
                 else:
-                    self.ai_session_id = cur.lastrowid
+                    cur.execute(
+                        "INSERT INTO ai_sessions(email, symbol, mode, trade_style, started_at) "
+                        "VALUES(%s, %s, %s, %s, %s)",
+                        (self.email, self.symbol, self.mode, self.trade_style,
+                         now_dubai().strftime("%Y-%m-%d %H:%M:%S")),
+                    )
+                    # SQLite: _Cursor wrapper has no lastrowid — use SELECT instead
+                    cur.execute("SELECT last_insert_rowid()")
+                    row = cur.fetchone()
+                    self.ai_session_id = list(row.values())[0] if isinstance(row, dict) else row[0]
                 conn.commit()
                 conn.close()
         except Exception as e:
@@ -5278,30 +5295,72 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
     }
 
 
+def _classify_log_type(msg: str) -> str:
+    m = msg.upper()
+    if any(x in m for x in ["TRADE OPENED", "TRADE CLOSED", "MID_CANDLE TRADE", "REAL ORDER"]):
+        return "TRADE"
+    if m.startswith("BLOCKED") or m.startswith("EARLY BEAR"):
+        return "BLOCKED"
+    if "MID_CANDLE" in m:
+        return "MID_CANDLE"
+    if m.startswith("HOLDING"):
+        return "HOLDING"
+    if "ERROR" in m or "FAILED" in m:
+        return "ERROR"
+    if any(x in m for x in ["RESET", "MIDNIGHT", "DAILY COUNTERS", "STRICTNESS"]):
+        return "RESET"
+    return "SYSTEM"
+
+
 @app.get("/auto/sessions")
 def auto_sessions(
     user=Depends(require_user),
     limit: int = Query(default=20, ge=1, le=100),
     log_limit: int = Query(default=500, ge=1, le=2000),
+    symbol: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+    log_type: Optional[str] = Query(default=None),
 ):
-    """Return all past AI sessions for this user, newest first, with full logs."""
+    """Return AI sessions for this user, newest first, with classified logs.
+    Supports optional symbol filter, keyword search, and log_type filter."""
     email = user["email"]
     with DB_LOCK:
         conn = db()
         cur = conn.cursor()
-        cur.execute(
-            "SELECT id, symbol, mode, trade_style, started_at, ended_at, stop_reason "
-            "FROM ai_sessions WHERE email=%s ORDER BY id DESC LIMIT %s",
-            (email, int(limit)),
-        )
+        if symbol:
+            cur.execute(
+                "SELECT id, symbol, mode, trade_style, started_at, ended_at, stop_reason "
+                "FROM ai_sessions WHERE email=%s AND UPPER(symbol)=UPPER(%s) ORDER BY id DESC LIMIT %s",
+                (email, symbol.upper().strip(), int(limit)),
+            )
+        else:
+            cur.execute(
+                "SELECT id, symbol, mode, trade_style, started_at, ended_at, stop_reason "
+                "FROM ai_sessions WHERE email=%s ORDER BY id DESC LIMIT %s",
+                (email, int(limit)),
+            )
         sessions = [dict(r) for r in cur.fetchall()]
         for sess in sessions:
-            cur.execute(
-                "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
-                "ORDER BY id ASC LIMIT %s",
-                (email, sess["id"], int(log_limit)),
-            )
-            sess["events"] = [{"t": r["t"], "msg": r["msg"]} for r in cur.fetchall()]
+            if search:
+                cur.execute(
+                    "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
+                    "AND LOWER(msg) LIKE LOWER(%s) ORDER BY id ASC LIMIT %s",
+                    (email, sess["id"], f"%{search.strip()}%", int(log_limit)),
+                )
+            else:
+                cur.execute(
+                    "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
+                    "ORDER BY id ASC LIMIT %s",
+                    (email, sess["id"], int(log_limit)),
+                )
+            events = [
+                {"t": r["t"], "msg": r["msg"], "log_type": _classify_log_type(r["msg"])}
+                for r in cur.fetchall()
+            ]
+            if log_type and log_type.upper() != "ALL":
+                events = [e for e in events if e["log_type"] == log_type.upper()]
+            sess["events"] = events
+            sess["total_events"] = len(events)
         conn.close()
     return {"ok": True, "sessions": sessions}
 
