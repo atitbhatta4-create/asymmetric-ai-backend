@@ -4855,11 +4855,17 @@ def place_real_order(
     ticker = ex.fetch_ticker(symbol)
     price  = float(ticker["last"])
 
-    # Set leverage — raises if it fails so trade is skipped rather than placed at wrong leverage
+    # Set leverage.  Bybit retCode 110043 ("leverage not modified") means the
+    # leverage is ALREADY at the requested value — not an error.  Any other
+    # exception is a genuine failure and must abort the trade.
     try:
         ex.set_leverage(leverage, symbol)
     except Exception as lev_e:
-        raise ValueError(f"Leverage set failed ({leverage}x on {symbol}): {lev_e}")
+        err_str = str(lev_e)
+        if "110043" in err_str or "leverage not modified" in err_str.lower():
+            print(f"[INFO] Leverage already correct at {leverage}× on {symbol} — continuing with trade")
+        else:
+            raise ValueError(f"Leverage set failed ({leverage}×): {lev_e}")
 
     # Quantity in base currency
     notional = usdt_size * leverage
