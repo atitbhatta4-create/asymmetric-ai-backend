@@ -3437,6 +3437,7 @@ class AutoRunner:
         self.last_atr_pct: float = 0.01   # fallback 1% ATR until first signal
         self.market_grade: str = "-"
         self._last_trade_bad: bool = False
+        self._last_holding_log_ts: float = 0.0   # throttle repeated holding logs
         self.session_start_equity: float = get_equity(email)
         # Peak must be the highest equity ever seen — read from user_state which survives
         # AI stop/restart (ai_runner_state is deleted on stop, user_state is permanent).
@@ -3952,11 +3953,16 @@ class AutoRunner:
                 candles_held_so_far = int(
                     (time.time() - pt.get("open_ts", time.time())) / self.interval_sec
                 )
-                self.log(
-                    f"Holding ({side} @ {entry:.4f}) — candle {candles_held_so_far + 1} | "
-                    f"close {exit_price:.4f} ({((exit_price - entry)/entry if side=='LONG' else (entry - exit_price)/entry)*100:+.3f}%) | "
-                    f"SL={sl_price:.4f}  TP={tp_price:.4f}"
-                )
+                # Throttle: log at most once per candle interval to keep logs readable.
+                # The 30-second wake-up cycle would otherwise spam one entry every 30s.
+                _now = time.time()
+                if _now - self._last_holding_log_ts >= self.interval_sec:
+                    self._last_holding_log_ts = _now
+                    self.log(
+                        f"Holding ({side} @ {entry:.4f}) — candle {candles_held_so_far + 1} | "
+                        f"close {exit_price:.4f} ({((exit_price - entry)/entry if side=='LONG' else (entry - exit_price)/entry)*100:+.3f}%) | "
+                        f"SL={sl_price:.4f}  TP={tp_price:.4f}"
+                    )
                 return None
 
         # Use the actual SL/TP price for display and DB when those levels were hit,
