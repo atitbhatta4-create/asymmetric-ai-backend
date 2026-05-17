@@ -4499,6 +4499,28 @@ class AutoRunner:
 
                 # ── Step 3: 4-layer signal analysis ─────────────────────────────────────
                 res = self._signal_and_filters()
+
+                # Retry up to 3× on NO_DATA — price feed may just be transiently down
+                if res.get("blocked") == "NO_DATA":
+                    recovered = False
+                    for attempt in range(1, 4):
+                        self.log(f"Price data unavailable — retrying in 30s (attempt {attempt} of 3)")
+                        for _ in range(30):
+                            if self.stop_event.is_set():
+                                break
+                            time.sleep(1)
+                        if self.stop_event.is_set():
+                            break
+                        res = self._signal_and_filters()
+                        if res.get("blocked") != "NO_DATA":
+                            self.log(f"Price data recovered on attempt {attempt} — continuing normally.")
+                            recovered = True
+                            break
+                    if not recovered:
+                        self.log("Price data unavailable after 3 retries — skipping this interval. Will resume next scheduled check.")
+                        self.blocked_reason = "NO_DATA"
+                        continue
+
                 self.last_signal = res.get("signal") or "-"
                 # Always reflect the HTF-computed direction, even when blocked.
                 # Without this, last_side stays at "LONG" init default forever
