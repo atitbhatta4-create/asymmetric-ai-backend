@@ -3114,8 +3114,12 @@ def _compute_signal_layers(
 
     # ── Higher TF trend direction ─────────────────────────────────────────
     # Primary: 4h EMA21 vs EMA50 crossover sets macro bias.
-    # Early-bear override: if EMA21 has fallen >0.5% over last 8 candles (~32h)
+    # Early-bear override: if EMA21 has fallen >0.3% over last 8 candles (~32h)
     # the trend is already turning even before the full crossover — flip to SHORT early.
+    # Threshold lowered from 0.5% → 0.3% to catch slow grinding bear moves (e.g. BTC -5% over 2 days).
+    _htf_bear_debug = None
+    _htf_bear_triggered = False
+    _htf_bear_slope_pct = None
     if higher_klines and len(higher_klines) >= 55:
         htf_closes = [k["close"] for k in higher_klines]
         htf_ema21  = _ema(htf_closes, 21)
@@ -3123,8 +3127,14 @@ def _compute_signal_layers(
         htf_bull_cross = htf_ema21[-1] > htf_ema50[-1]
         _slope_n = min(8, len(htf_ema21) - 1)
         _htf_slope = (htf_ema21[-1] - htf_ema21[-1 - _slope_n]) / max(htf_ema50[-1], 1e-9)
-        # EMA21 dropping >0.5% = bear momentum even without full crossover
-        _htf_bear_early = _htf_slope < -0.005
+        _htf_bear_slope_pct = _htf_slope * 100
+        # EMA21 dropping >0.3% = bear momentum even without full crossover (was 0.5%)
+        _htf_bear_early = _htf_slope < -0.003
+        _htf_bear_debug = (
+            f"Early bear check: EMA21 change over last {_slope_n} candles = "
+            f"{_htf_bear_slope_pct:+.3f}% (triggers at -0.30%)"
+        )
+        _htf_bear_triggered = _htf_bear_early
         htf_bull = htf_bull_cross and not _htf_bear_early
         htf_ok   = True
     else:
@@ -3341,6 +3351,9 @@ def _compute_signal_layers(
             "signal": sig, "side": desired_side,
             "score": total_score, "min_score": min_score, "grade": "C",
             "breakdown": breakdown, "atr_pct": atr_pct,
+            "htf_bear_debug": _htf_bear_debug,
+            "htf_bear_triggered": _htf_bear_triggered,
+            "htf_bear_slope_pct": _htf_bear_slope_pct,
         }
 
     return {
@@ -3348,6 +3361,9 @@ def _compute_signal_layers(
         "signal": sig, "side": desired_side,
         "score": total_score, "min_score": min_score, "grade": grade,
         "breakdown": breakdown, "atr_pct": atr_pct,
+        "htf_bear_debug": _htf_bear_debug,
+        "htf_bear_triggered": _htf_bear_triggered,
+        "htf_bear_slope_pct": _htf_bear_slope_pct,
     }
 
 
@@ -4220,6 +4236,14 @@ class AutoRunner:
         self.market_grade = res.get("grade", "-")
         if res.get("atr_pct"):
             self.last_atr_pct = res["atr_pct"]
+        # Always log the early bear check so the calculation is visible in logs
+        if res.get("htf_bear_debug"):
+            self.log(res["htf_bear_debug"])
+        if res.get("htf_bear_triggered") and res.get("htf_bear_slope_pct") is not None:
+            self.log(
+                f"EARLY BEAR OVERRIDE: EMA21 dropped {abs(res['htf_bear_slope_pct']):.3f}% "
+                f"over 8 candles — flipping direction to SHORT mode"
+            )
         return res
 
     def _secs_until_dubai_midnight(self) -> int:
