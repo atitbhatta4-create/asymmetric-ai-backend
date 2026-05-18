@@ -3067,7 +3067,7 @@ MODE_SIGNAL_PARAMS: Dict[str, Dict] = {
     "ULTRA_SAFE": dict(adx_min=28, atr_min=0.003, atr_max=0.020, rsi_min=42, rsi_max=58, pullback_max=0.012, vol_factor=1.40, mom_n=3, min_score=0.75),
     "SAFE":       dict(adx_min=22, atr_min=0.002, atr_max=0.025, rsi_min=40, rsi_max=62, pullback_max=0.015, vol_factor=1.25, mom_n=2, min_score=0.68),
     "NORMAL":     dict(adx_min=18, atr_min=0.002, atr_max=0.030, rsi_min=38, rsi_max=65, pullback_max=0.020, vol_factor=1.15, mom_n=2, min_score=0.62),
-    "MINI_ASYM":  dict(adx_min=16, atr_min=0.001, atr_max=0.035, rsi_min=35, rsi_max=68, pullback_max=0.025, vol_factor=1.05, mom_n=1, min_score=0.65),
+    "MINI_ASYM":  dict(adx_min=16, atr_min=0.001, atr_max=0.035, rsi_min=35, rsi_max=68, pullback_max=0.025, vol_factor=1.05, mom_n=1, min_score=0.63),
     "AGGRESSIVE": dict(adx_min=13, atr_min=0.001, atr_max=0.040, rsi_min=32, rsi_max=70, pullback_max=0.030, vol_factor=0.95, mom_n=1, min_score=0.58),
 }
 
@@ -4943,17 +4943,15 @@ def place_real_order(
     ticker = ex.fetch_ticker(symbol)
     price  = float(ticker["last"])
 
-    # Set leverage.  Bybit retCode 110043 ("leverage not modified") means the
-    # leverage is ALREADY at the requested value — not an error.  Any other
-    # exception is a genuine failure and must abort the trade.
+    # Set leverage — 110043 means already correct, safe to continue
     try:
         ex.set_leverage(leverage, symbol)
     except Exception as lev_e:
         err_str = str(lev_e)
         if "110043" in err_str or "leverage not modified" in err_str.lower():
-            print(f"[INFO] Leverage already correct at {leverage}× on {symbol} — continuing with trade")
+            print(f"[INFO] Leverage already correct at {leverage}× on {symbol} — continuing with order")
         else:
-            raise ValueError(f"Leverage set failed ({leverage}×): {lev_e}")
+            raise ValueError(f"Leverage set failed ({leverage}× on {symbol}): {lev_e}")
 
     # Quantity in base currency
     notional = usdt_size * leverage
@@ -5159,7 +5157,11 @@ def place_real_grade_b_order(
     try:
         ex.set_leverage(leverage, symbol)
     except Exception as lev_e:
-        raise ValueError(f"Leverage set failed ({leverage}×): {lev_e}")
+        err_str = str(lev_e)
+        if "110043" in err_str or "leverage not modified" in err_str.lower():
+            print(f"[INFO] Leverage already correct at {leverage}× on {symbol} — continuing with order")
+        else:
+            raise ValueError(f"Leverage set failed ({leverage}×): {lev_e}")
 
     notional = usdt_size * leverage
     qty      = round(notional / price, 6)
@@ -5515,6 +5517,39 @@ def auto_stop(user=Depends(require_user)):
     # Clear persisted state — user intentionally stopped, do NOT resume on next deploy
     _clear_runner_state(email)
     return {"ok": True, "running": False, "restart_locked": restart_locked, "restart_lock_sec": lock_sec}
+
+
+@app.post("/auto/reset-strictness")
+def auto_reset_strictness(user=Depends(require_user)):
+    """Reset adaptive_strictness to 1.0x — clears stuck/legacy values from DB and live runner."""
+    email = user["email"]
+    with AUTO_LOCK:
+        r = AUTO_RUNNERS.get(email)
+        if r:
+            r.adaptive_strictness = 1.0
+            r.consecutive_wins = 0
+            r.log("Strictness manually reset to 1.0x by user.")
+            _save_runner_state(r)
+    # Also patch DB directly so it survives restarts
+    try:
+        with DB_LOCK:
+            conn = db()
+            cur = conn.cursor()
+            if USING_PG:
+                cur.execute(
+                    "UPDATE ai_runner_state SET adaptive_strictness = 1.0, consecutive_wins = 0 WHERE email = %s",
+                    (email,),
+                )
+            else:
+                cur.execute(
+                    "UPDATE ai_runner_state SET adaptive_strictness = 1.0, consecutive_wins = 0 WHERE email = ?",
+                    (email,),
+                )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"[reset-strictness] DB patch failed: {e}")
+    return {"ok": True, "adaptive_strictness": 1.0, "message": "Strictness reset to 1.0x"}
 
 
 # =========================
