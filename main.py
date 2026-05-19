@@ -516,6 +516,7 @@ def init_db() -> None:
             ("floor_equity",         "REAL",    "0"),
             ("consecutive_wins",     "INTEGER", "0"),
             ("session_start_equity", "REAL",    "0"),
+            ("strictness_day_key",   "TEXT",    "''"),  # Dubai date when strictness was last changed
         ]:
             if not column_exists(conn, "ai_runner_state", col):
                 cur.execute(f"ALTER TABLE ai_runner_state ADD COLUMN {col} {coltype} DEFAULT {defval}")
@@ -2793,8 +2794,8 @@ def _save_runner_state(runner: "AutoRunner") -> None:
                          chop_min_sep_pct, end_at_ts, started_at,
                          adaptive_strictness, last_trade_ts, last_trade_bad,
                          pending_trades_json, peak_equity, floor_equity,
-                         consecutive_wins, session_start_equity)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         consecutive_wins, session_start_equity, strictness_day_key)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT(email) DO UPDATE SET
                         symbol=%s, trade_style=%s, mode=%s,
                         max_trades_per_day=%s, stop_after_bad_trades=%s,
@@ -2802,9 +2803,9 @@ def _save_runner_state(runner: "AutoRunner") -> None:
                         chop_min_sep_pct=%s, end_at_ts=%s,
                         adaptive_strictness=%s, last_trade_ts=%s, last_trade_bad=%s,
                         pending_trades_json=%s, peak_equity=%s, floor_equity=%s,
-                        consecutive_wins=%s
+                        consecutive_wins=%s, strictness_day_key=%s
                 """, (
-                    # INSERT values (19)
+                    # INSERT values (20)
                     runner.email, runner.symbol, runner.trade_style, runner.mode,
                     runner.max_trades_per_day, runner.stop_after_bad_trades,
                     runner.duration_days, int(runner.trend_filter),
@@ -2812,8 +2813,8 @@ def _save_runner_state(runner: "AutoRunner") -> None:
                     runner.adaptive_strictness, runner.last_trade_ts,
                     int(runner._last_trade_bad), pending_json,
                     runner.peak_equity, runner.floor_equity, runner.consecutive_wins,
-                    runner.session_start_equity,
-                    # UPDATE SET values (16 — started_at and session_start_equity kept from original INSERT)
+                    runner.session_start_equity, runner.strictness_day_key,
+                    # UPDATE SET values (17 — started_at and session_start_equity kept from original INSERT)
                     runner.symbol, runner.trade_style, runner.mode,
                     runner.max_trades_per_day, runner.stop_after_bad_trades,
                     runner.duration_days, int(runner.trend_filter),
@@ -2821,6 +2822,7 @@ def _save_runner_state(runner: "AutoRunner") -> None:
                     runner.adaptive_strictness, runner.last_trade_ts,
                     int(runner._last_trade_bad), pending_json,
                     runner.peak_equity, runner.floor_equity, runner.consecutive_wins,
+                    runner.strictness_day_key,
                 ))
             else:
                 # SQLite: preserve started_at and session_start_equity if row exists
@@ -2842,8 +2844,8 @@ def _save_runner_state(runner: "AutoRunner") -> None:
                          chop_min_sep_pct, end_at_ts, started_at,
                          adaptive_strictness, last_trade_ts, last_trade_bad,
                          pending_trades_json, peak_equity, floor_equity,
-                         consecutive_wins, session_start_equity)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         consecutive_wins, session_start_equity, strictness_day_key)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """, (
                     runner.email, runner.symbol, runner.trade_style, runner.mode,
                     runner.max_trades_per_day, runner.stop_after_bad_trades,
@@ -2852,7 +2854,7 @@ def _save_runner_state(runner: "AutoRunner") -> None:
                     runner.adaptive_strictness, runner.last_trade_ts,
                     int(runner._last_trade_bad), pending_json,
                     runner.peak_equity, runner.floor_equity, runner.consecutive_wins,
-                    orig_start_eq,
+                    orig_start_eq, runner.strictness_day_key,
                 ))
             conn.commit()
             conn.close()
@@ -3566,6 +3568,7 @@ class AutoRunner:
         self.ai_session_id: Optional[int] = None  # DB row id for this AI run
         self.pending_trades: List[Dict] = []
         self.adaptive_strictness: float = 1.0
+        self.strictness_day_key: str = dubai_day_key()  # tracks which Dubai day strictness belongs to
         self.last_breakdown: Dict = {}
         self.last_score: float = 0.0
         self.last_atr_pct: float = 0.01   # fallback 1% ATR until first signal
@@ -3598,10 +3601,6 @@ class AutoRunner:
         self.trades_today, self.bad_trades_today = self._load_today_stats()
         # Restore live state (strictness, open positions, drawdown level) from last session
         self._restore_live_state()
-        # After restoring strictness, check if we restarted on a new Dubai day.
-        # day_key is already set to today in __init__, so _reset_if_new_day() will never
-        # trigger the reset on its own after a redeploy. Apply step-down here instead.
-        self._startup_strictness_reset()
 
     def _restore_live_state(self) -> None:
         """Load adaptive_strictness, pending_trades, peak/floor equity, and
@@ -3615,11 +3614,11 @@ class AutoRunner:
                 cur.execute(
                     "SELECT adaptive_strictness, last_trade_ts, last_trade_bad, "
                     "pending_trades_json, peak_equity, floor_equity, consecutive_wins, "
-                    "session_start_equity "
+                    "session_start_equity, strictness_day_key "
                     "FROM ai_runner_state WHERE email = %s" if USING_PG else
                     "SELECT adaptive_strictness, last_trade_ts, last_trade_bad, "
                     "pending_trades_json, peak_equity, floor_equity, consecutive_wins, "
-                    "session_start_equity "
+                    "session_start_equity, strictness_day_key "
                     "FROM ai_runner_state WHERE email = ?",
                     (self.email,),
                 )
@@ -3630,6 +3629,22 @@ class AutoRunner:
             row = dict(row)
             if row.get("adaptive_strictness"):
                 self.adaptive_strictness = float(row["adaptive_strictness"])
+                saved_sdk = row.get("strictness_day_key") or ""
+                today_sdk = dubai_day_key()
+                if saved_sdk and saved_sdk != today_sdk and self.adaptive_strictness > 1.0:
+                    # Strictness was set on a previous Dubai day — apply midnight step-down now.
+                    # This fires on ANY restart (redeploy, crash, manual stop) after a day boundary.
+                    STEP_DOWN = {2.50: 1.50, 1.50: 1.25}
+                    if self.adaptive_strictness <= 1.25:
+                        self.adaptive_strictness = 1.0
+                        self.consecutive_wins = 0
+                        self.log(f"Startup [{today_sdk}]: strictness was from {saved_sdk} — cleared to 1.0x.")
+                    else:
+                        self.adaptive_strictness = STEP_DOWN.get(
+                            round(self.adaptive_strictness, 2), 1.25
+                        )
+                        self.log(f"Startup [{today_sdk}]: strictness was from {saved_sdk} — stepped down to {self.adaptive_strictness:.2f}x.")
+                self.strictness_day_key = today_sdk if (saved_sdk != today_sdk) else saved_sdk
             if row.get("last_trade_ts"):
                 self.last_trade_ts = float(row["last_trade_ts"])
             if row.get("last_trade_bad"):
@@ -3685,33 +3700,6 @@ class AutoRunner:
                 self.history.append({"t": row["t"], "msg": row["msg"]})
         except Exception as e:
             print(f"[runner-state] log restore failed for {self.email}: {e}")
-
-    def _startup_strictness_reset(self) -> None:
-        """
-        Apply midnight step-down if bot restarted on a new Dubai day.
-
-        The problem: day_key is stamped as TODAY in __init__, so _reset_if_new_day()
-        never fires on the first candle after a redeploy — it sees today==today and skips.
-        We fix this by checking last_trade_ts: if the last known trade was BEFORE today's
-        Dubai midnight, this is a fresh day and step-down should apply.
-        """
-        dubai_midnight = now_dubai().replace(hour=0, minute=0, second=0, microsecond=0)
-        utc_midnight_ts = dubai_midnight.astimezone(timezone.utc).timestamp()
-        if self.adaptive_strictness <= 1.0:
-            return  # already clean — nothing to reset
-        if self.last_trade_ts < utc_midnight_ts:
-            # Last activity was before today's Dubai midnight — new day, apply step-down
-            STEP_DOWN = {2.50: 1.50, 1.50: 1.25}
-            if self.adaptive_strictness <= 1.25:
-                self.adaptive_strictness = 1.0
-                self.consecutive_wins = 0
-                self.log("Startup: new Dubai day — strictness cleared to 1.0x. Fresh start.")
-            else:
-                self.adaptive_strictness = STEP_DOWN.get(
-                    round(self.adaptive_strictness, 2), 1.25
-                )
-                self.log(f"Startup: new Dubai day — strictness stepped down to {self.adaptive_strictness:.2f}x")
-            _save_runner_state(self)
 
     def is_running(self):
         return not self.stop_event.is_set()
@@ -3857,6 +3845,7 @@ class AutoRunner:
                     round(self.adaptive_strictness, 2), 1.25
                 )
                 self.log(f"Midnight reset — strictness stepped down to {self.adaptive_strictness:.2f}x")
+            self.strictness_day_key = dubai_day_key()
             # Persist immediately so a server restart won't revert the reset
             _save_runner_state(self)
 
@@ -4289,6 +4278,7 @@ class AutoRunner:
                         _next_strict = _s
                         break
                 self.adaptive_strictness = _next_strict
+                self.strictness_day_key = dubai_day_key()
                 self.log(f"MINI_ASYM strictness ↑ {self.adaptive_strictness:.2f} (after loss)")
             elif pnl_value > 0:
                 # Only genuine profit advances the win streak and relaxes strictness
@@ -4297,6 +4287,7 @@ class AutoRunner:
                     # 3 wins in a row → reset strictness fully, AI is in good form
                     self.adaptive_strictness = 1.0
                     self.consecutive_wins = 0
+                    self.strictness_day_key = dubai_day_key()
                     self.log("MINI_ASYM strictness reset to 1.0 (3 consecutive wins)")
                 else:
                     self.adaptive_strictness = max(1.0, self.adaptive_strictness - 0.10)
@@ -4450,6 +4441,7 @@ class AutoRunner:
                     round(self.adaptive_strictness, 2), 1.25
                 )
                 self.log(f"Midnight reset (sleep path) — strictness stepped down to {self.adaptive_strictness:.2f}x")
+            self.strictness_day_key = dubai_day_key()
             # Reload counters from DB and resume
             self.trades_today, self.bad_trades_today = self._load_today_stats()
             self.day_key = dubai_day_key()
