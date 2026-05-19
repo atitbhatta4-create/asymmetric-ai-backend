@@ -3598,6 +3598,10 @@ class AutoRunner:
         self.trades_today, self.bad_trades_today = self._load_today_stats()
         # Restore live state (strictness, open positions, drawdown level) from last session
         self._restore_live_state()
+        # After restoring strictness, check if we restarted on a new Dubai day.
+        # day_key is already set to today in __init__, so _reset_if_new_day() will never
+        # trigger the reset on its own after a redeploy. Apply step-down here instead.
+        self._startup_strictness_reset()
 
     def _restore_live_state(self) -> None:
         """Load adaptive_strictness, pending_trades, peak/floor equity, and
@@ -3681,6 +3685,33 @@ class AutoRunner:
                 self.history.append({"t": row["t"], "msg": row["msg"]})
         except Exception as e:
             print(f"[runner-state] log restore failed for {self.email}: {e}")
+
+    def _startup_strictness_reset(self) -> None:
+        """
+        Apply midnight step-down if bot restarted on a new Dubai day.
+
+        The problem: day_key is stamped as TODAY in __init__, so _reset_if_new_day()
+        never fires on the first candle after a redeploy — it sees today==today and skips.
+        We fix this by checking last_trade_ts: if the last known trade was BEFORE today's
+        Dubai midnight, this is a fresh day and step-down should apply.
+        """
+        dubai_midnight = now_dubai().replace(hour=0, minute=0, second=0, microsecond=0)
+        utc_midnight_ts = dubai_midnight.astimezone(timezone.utc).timestamp()
+        if self.adaptive_strictness <= 1.0:
+            return  # already clean — nothing to reset
+        if self.last_trade_ts < utc_midnight_ts:
+            # Last activity was before today's Dubai midnight — new day, apply step-down
+            STEP_DOWN = {2.50: 1.50, 1.50: 1.25}
+            if self.adaptive_strictness <= 1.25:
+                self.adaptive_strictness = 1.0
+                self.consecutive_wins = 0
+                self.log("Startup: new Dubai day — strictness cleared to 1.0x. Fresh start.")
+            else:
+                self.adaptive_strictness = STEP_DOWN.get(
+                    round(self.adaptive_strictness, 2), 1.25
+                )
+                self.log(f"Startup: new Dubai day — strictness stepped down to {self.adaptive_strictness:.2f}x")
+            _save_runner_state(self)
 
     def is_running(self):
         return not self.stop_event.is_set()
