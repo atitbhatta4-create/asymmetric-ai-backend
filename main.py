@@ -5044,9 +5044,30 @@ def place_real_order(
     sl_mult    = (1 - sl_pct) if side == "LONG" else (1 + sl_pct)
     tp_mult_v  = (1 + tp_pct) if side == "LONG" else (1 - tp_pct)
 
+    # Cancel any orphaned open orders before placing a new one.
+    # Previous failed Grade B attempts can leave T1/T2 limit orders that lock margin.
+    try:
+        open_orders = _ccxt_call(ex.fetch_open_orders, symbol, label=f"pre_order_cleanup {ex_id}", retries=0)
+        for o in open_orders:
+            try:
+                _ccxt_call(ex.cancel_order, o["id"], symbol, label="cancel_orphan", retries=0)
+                print(f"[order-cleanup] Cancelled orphaned order {o['id']} on {symbol}", flush=True)
+            except RuntimeError:
+                pass
+    except RuntimeError:
+        pass
+
     # Get current price — 10s timeout, 1 retry
     ticker = _ccxt_call(ex.fetch_ticker, symbol, label=f"fetch_ticker {ex_id}")
     price  = float(ticker["last"])
+
+    # Check AVAILABLE balance (not walletBalance) — Bybit sizes orders against
+    # availableToWithdraw, not total equity. Using walletBalance causes error 110007
+    # when unrealized PnL or locked margin reduces the actual free amount.
+    available = _get_available_usdt(ex, ex_id)
+    if available > 0 and usdt_size > available * 0.95:
+        usdt_size = round(available * 0.90, 4)  # cap at 90% of truly available
+        print(f"[balance-cap] Capped usdt_size to ${usdt_size:.2f} (available: ${available:.2f})", flush=True)
 
     # Set leverage — 110043 means already correct, safe to continue
     try:
@@ -5062,11 +5083,11 @@ def place_real_order(
     notional = usdt_size * leverage
     qty = round(notional / price, 6)
 
-    # Minimum notional guard — $5 covers Bybit/OKX/Binance minimums for any coin.
+    # Minimum notional guard
     if notional < 5.0:
         raise ValueError(
-            f"Position too small: ${notional:.2f} notional (need ≥ $5). "
-            f"Increase account size or use a higher-leverage/size mode."
+            f"INSUFFICIENT_BALANCE: Available ${available:.2f} USDT — notional ${notional:.2f} below $5 minimum. "
+            f"Deposit more USDT to your exchange account."
         )
 
     # SL / TP prices
@@ -5151,6 +5172,25 @@ def close_real_order(email: str, symbol: str, side: str) -> dict:
 
 
 # ── Real Grade B helpers ────────────────────────────────────────────────────
+
+def _get_available_usdt(ex, ex_id: str) -> float:
+    """
+    Return the USDT balance actually available for new orders.
+    This is availableToWithdraw (Bybit) / free (ccxt), NOT walletBalance.
+    walletBalance includes unrealized PnL — orders are sized against
+    available margin, not total equity. Using walletBalance causes 110007.
+    """
+    try:
+        params = {"accountType": "UNIFIED"} if ex_id == "bybit" else {}
+        bal = _ccxt_call(ex.fetch_balance, params=params, label=f"fetch_available_balance {ex_id}", retries=0)
+        # ccxt maps availableToWithdraw → free for Bybit, availBal → free for OKX, etc.
+        free = float((bal.get("USDT") or {}).get("free") or 0)
+        if free <= 0:
+            free = float((bal.get("free") or {}).get("USDT") or 0)
+        return free
+    except Exception:
+        return 0.0
+
 
 def _cancel_all_real_orders(email: str, symbol: str) -> None:
     """Cancel all open orders for symbol. Best-effort cleanup — never raises."""
@@ -5253,8 +5293,27 @@ def place_real_grade_b_order(
     t1_mult  = (1 + t1_tp_pct) if side == "LONG" else (1 - t1_tp_pct)
     t2_mult  = (1 + t2_tp_pct) if side == "LONG" else (1 - t2_tp_pct)
 
+    # Cancel orphaned open orders first — previous failed Grade B attempts can
+    # leave T1/T2 limit orders on the exchange that lock margin and cause 110007.
+    try:
+        open_orders = _ccxt_call(ex.fetch_open_orders, symbol, label=f"pre_order_cleanup grade_b {ex_id}", retries=0)
+        for o in open_orders:
+            try:
+                _ccxt_call(ex.cancel_order, o["id"], symbol, label="cancel_orphan_b", retries=0)
+                print(f"[order-cleanup] Cancelled orphaned order {o['id']} on {symbol}", flush=True)
+            except RuntimeError:
+                pass
+    except RuntimeError:
+        pass
+
     ticker = _ccxt_call(ex.fetch_ticker, symbol, label=f"fetch_ticker grade_b {ex_id}")
     price  = float(ticker["last"])
+
+    # Cap size against available balance — NOT walletBalance (Bybit 110007 fix)
+    available = _get_available_usdt(ex, ex_id)
+    if available > 0 and usdt_size > available * 0.95:
+        usdt_size = round(available * 0.90, 4)
+        print(f"[balance-cap] Grade B capped usdt_size to ${usdt_size:.2f} (available: ${available:.2f})", flush=True)
 
     try:
         _ccxt_call(ex.set_leverage, leverage, symbol, label=f"set_leverage grade_b {ex_id}")
@@ -5268,7 +5327,10 @@ def place_real_grade_b_order(
     notional = usdt_size * leverage
     qty      = round(notional / price, 6)
     if notional < 5.0:
-        raise ValueError(f"Position too small: ${notional:.2f} notional (need ≥ $5)")
+        raise ValueError(
+            f"INSUFFICIENT_BALANCE: Available ${available:.2f} USDT — notional ${notional:.2f} below $5 minimum. "
+            f"Deposit more USDT to your exchange account."
+        )
 
     sl_price    = round(price * sl_mult, 4)
     t1_tp_price = round(price * t1_mult, 4)
