@@ -271,6 +271,46 @@ async def strip_api_prefix(request: Request, call_next):
         request.scope["path"] = path[4:]
     return await call_next(request)
 
+
+# ── Global rate limiter: 60 req/min per user (JWT) or per IP (unauthenticated) ──
+# Keyed by JWT sub or IP. Excludes health/docs endpoints.
+_GLOBAL_RL_HITS: Dict[str, List[float]] = {}
+_GLOBAL_RL_LOCK = threading.Lock()
+_GLOBAL_RL_SKIP = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
+
+@app.middleware("http")
+async def global_rate_limit(request: Request, call_next):
+    path = request.scope.get("path", "")
+    if path in _GLOBAL_RL_SKIP:
+        return await call_next(request)
+
+    # Key: prefer JWT sub (user-level), fall back to IP
+    auth_header = request.headers.get("authorization", "")
+    rl_key = None
+    if auth_header.startswith("Bearer "):
+        try:
+            import jose.jwt as _jwt
+            payload = _jwt.get_unverified_claims(auth_header[7:])
+            rl_key = f"user:{payload.get('sub', '')}"
+        except Exception:
+            pass
+    if not rl_key:
+        rl_key = f"ip:{(request.client.host if request.client else 'unknown')}"
+
+    now = time.time()
+    with _GLOBAL_RL_LOCK:
+        hits = [t for t in _GLOBAL_RL_HITS.get(rl_key, []) if now - t < 60]
+        if len(hits) >= 60:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many requests. Please wait 60 seconds before trying again."},
+            )
+        hits.append(now)
+        _GLOBAL_RL_HITS[rl_key] = hits
+
+    return await call_next(request)
+
 # =========================
 # DB LOCK (thread safety)
 # =========================
@@ -1554,6 +1594,7 @@ def _make_ccxt_exchange(row: dict):
         "secret":   row["api_secret"],
         "options":  {"defaultType": "linear"},
         "enableRateLimit": True,
+        "timeout":  10000,   # 10-second timeout on every ccxt network call
     }
     if row.get("passphrase"):
         config["password"] = row["passphrase"]  # required for OKX
@@ -1561,6 +1602,34 @@ def _make_ccxt_exchange(row: dict):
     if cls is None:
         raise ValueError(f"Unsupported exchange: {exchange_id}")
     return cls(config)
+
+
+def _ccxt_call(fn, *args, label: str = "exchange", retries: int = 1, **kwargs):
+    """
+    Wrap any ccxt call with timeout detection, 1 retry, and clear error logging.
+    Raises a RuntimeError with a specific EXCHANGE_TIMEOUT prefix on timeout.
+    Never crashes the engine — caller catches RuntimeError and continues.
+    """
+    import ccxt
+    last_exc = None
+    for attempt in range(1, retries + 2):  # attempts = retries + 1
+        try:
+            return fn(*args, **kwargs)
+        except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
+            last_exc = e
+            is_timeout = isinstance(e, ccxt.RequestTimeout) or "timeout" in str(e).lower()
+            tag = "EXCHANGE_TIMEOUT" if is_timeout else "EXCHANGE_NETWORK_ERROR"
+            print(f"[{tag}] {label} attempt {attempt}: {e}", flush=True)
+            if attempt <= retries:
+                import time as _t
+                _t.sleep(2)
+        except ccxt.AuthenticationError as e:
+            raise RuntimeError(f"EXCHANGE_AUTH_ERROR: API key rejected by exchange — {e}")
+        except ccxt.ExchangeError as e:
+            raise RuntimeError(f"EXCHANGE_ERROR ({label}): {e}")
+        except Exception as e:
+            raise RuntimeError(f"EXCHANGE_UNEXPECTED ({label}): {type(e).__name__}: {e}")
+    raise RuntimeError(f"EXCHANGE_TIMEOUT: {label} did not respond within 10 seconds after {retries + 1} attempts")
 
 
 @app.get("/exchange/test")
@@ -4952,14 +5021,14 @@ def place_real_order(
     sl_mult    = (1 - sl_pct) if side == "LONG" else (1 + sl_pct)
     tp_mult_v  = (1 + tp_pct) if side == "LONG" else (1 - tp_pct)
 
-    # Get current price
-    ticker = ex.fetch_ticker(symbol)
+    # Get current price — 10s timeout, 1 retry
+    ticker = _ccxt_call(ex.fetch_ticker, symbol, label=f"fetch_ticker {ex_id}")
     price  = float(ticker["last"])
 
     # Set leverage — 110043 means already correct, safe to continue
     try:
-        ex.set_leverage(leverage, symbol)
-    except Exception as lev_e:
+        _ccxt_call(ex.set_leverage, leverage, symbol, label=f"set_leverage {ex_id}")
+    except RuntimeError as lev_e:
         err_str = str(lev_e)
         if "110043" in err_str or "leverage not modified" in err_str.lower():
             print(f"[INFO] Leverage already correct at {leverage}× on {symbol} — continuing with order")
@@ -4971,8 +5040,6 @@ def place_real_order(
     qty = round(notional / price, 6)
 
     # Minimum notional guard — $5 covers Bybit/OKX/Binance minimums for any coin.
-    # Coin-specific qty minimums vary (BTC=0.001, SOL=0.1, DOGE=1) so we use
-    # notional USD which is universal and exchange-agnostic.
     if notional < 5.0:
         raise ValueError(
             f"Position too small: ${notional:.2f} notional (need ≥ $5). "
@@ -4984,48 +5051,42 @@ def place_real_order(
     tp_price = round(price * tp_mult_v, 4)
 
     # ── Exchange-specific order params ────────────────────────────────────────
-    # Each exchange has a different way to attach SL/TP to the entry order.
     if ex_id == "bybit":
         params = {
             "stopLoss":    {"triggerPrice": sl_price, "type": "market"},
             "takeProfit":  {"triggerPrice": tp_price, "type": "limit"},
-            "positionIdx": 0,   # one-way mode required
+            "positionIdx": 0,
         }
     elif ex_id == "okx":
-        # OKX attaches SL/TP via algo orders — place entry first, then attach
         params = {
-            "tdMode":    "cross",      # cross-margin perpetual
+            "tdMode":      "cross",
             "slTriggerPx": str(sl_price),
-            "slOrdPx":     "-1",       # -1 = market price on trigger
+            "slOrdPx":     "-1",
             "tpTriggerPx": str(tp_price),
             "tpOrdPx":     "-1",
         }
     elif ex_id == "binance":
-        # Binance Futures: SL/TP placed as separate orders after entry
-        params = {
-            "reduceOnly": False,
-        }
+        params = {"reduceOnly": False}
     else:
         params = {}
 
-    order = ex.create_order(
-        symbol = symbol,
-        type   = "market",
-        side   = order_side,
-        amount = qty,
-        params = params,
+    order = _ccxt_call(
+        ex.create_order, symbol, "market", order_side, qty, params=params,
+        label=f"create_order {ex_id} {side}",
     )
 
     # Binance: attach SL/TP as separate stop-market orders
     if ex_id == "binance":
         close_side = "sell" if side == "LONG" else "buy"
         try:
-            ex.create_order(symbol, "STOP_MARKET", close_side, qty, sl_price,
-                            {"stopPrice": sl_price, "reduceOnly": True, "closePosition": True})
-            ex.create_order(symbol, "TAKE_PROFIT_MARKET", close_side, qty, tp_price,
-                            {"stopPrice": tp_price, "reduceOnly": True, "closePosition": True})
-        except Exception as e:
-            pass  # Log but don't fail — main order is placed
+            _ccxt_call(ex.create_order, symbol, "STOP_MARKET", close_side, qty, sl_price,
+                       {"stopPrice": sl_price, "reduceOnly": True, "closePosition": True},
+                       label=f"sl_order binance")
+            _ccxt_call(ex.create_order, symbol, "TAKE_PROFIT_MARKET", close_side, qty, tp_price,
+                       {"stopPrice": tp_price, "reduceOnly": True, "closePosition": True},
+                       label=f"tp_order binance")
+        except RuntimeError as e:
+            print(f"[WARN] Binance SL/TP attachment failed (entry already placed): {e}", flush=True)
 
     return {
         "order_id":  order.get("id"),
@@ -5050,18 +5111,16 @@ def close_real_order(email: str, symbol: str, side: str) -> dict:
     close_side = "sell" if side == "LONG" else "buy"
 
     # Fetch current position size
-    positions = ex.fetch_positions([symbol])
+    positions = _ccxt_call(ex.fetch_positions, [symbol], label="fetch_positions close")
     pos = next((p for p in positions if p["symbol"] == symbol and abs(float(p["contracts"] or 0)) > 0), None)
     if not pos:
         return {"ok": False, "note": "No open position found"}
 
     qty = abs(float(pos["contracts"]))
-    order = ex.create_order(
-        symbol   = symbol,
-        type     = "market",
-        side     = close_side,
-        amount   = qty,
-        params   = {"reduceOnly": True, "positionIdx": 0},
+    order = _ccxt_call(
+        ex.create_order, symbol, "market", close_side, qty,
+        params={"reduceOnly": True, "positionIdx": 0},
+        label="close_order",
     )
     return {"ok": True, "order_id": order.get("id"), "qty": qty}
 
@@ -5075,11 +5134,11 @@ def _cancel_all_real_orders(email: str, symbol: str) -> None:
         if not row:
             return
         ex = _make_ccxt_exchange(row)
-        open_orders = ex.fetch_open_orders(symbol)
+        open_orders = _ccxt_call(ex.fetch_open_orders, symbol, label="fetch_open_orders cancel")
         for o in open_orders:
             try:
-                ex.cancel_order(o["id"], symbol)
-            except Exception:
+                _ccxt_call(ex.cancel_order, o["id"], symbol, label="cancel_order", retries=0)
+            except RuntimeError:
                 pass
     except Exception:
         pass
@@ -5099,13 +5158,17 @@ def _move_real_sl_to_breakeven(email: str, symbol: str, entry_price: float) -> b
         ex = _make_ccxt_exchange(row)
         mkt = ex.market(symbol)
         bybit_sym = mkt["id"]   # "BTC/USDT:USDT" → "BTCUSDT"
-        ex.privatePostV5PositionTradingStop({
-            "category":    "linear",
-            "symbol":      bybit_sym,
-            "stopLoss":    str(round(entry_price, 4)),
-            "slTriggerBy": "MarkPrice",
-            "positionIdx": 0,
-        })
+        _ccxt_call(
+            ex.privatePostV5PositionTradingStop,
+            {
+                "category":    "linear",
+                "symbol":      bybit_sym,
+                "stopLoss":    str(round(entry_price, 4)),
+                "slTriggerBy": "MarkPrice",
+                "positionIdx": 0,
+            },
+            label="move_sl_breakeven", retries=1,
+        )
         return True
     except Exception:
         return False
@@ -5122,7 +5185,7 @@ def _check_bybit_order_filled(email: str, order_id: str, symbol: str) -> bool:
         if not row:
             return False
         ex = _make_ccxt_exchange(row)
-        order = ex.fetch_order(order_id, symbol)
+        order = _ccxt_call(ex.fetch_order, order_id, symbol, label="fetch_order T1_check", retries=0)
         return order.get("status") == "closed"
     except Exception:
         return False
@@ -5164,12 +5227,12 @@ def place_real_grade_b_order(
     t1_mult  = (1 + t1_tp_pct) if side == "LONG" else (1 - t1_tp_pct)
     t2_mult  = (1 + t2_tp_pct) if side == "LONG" else (1 - t2_tp_pct)
 
-    ticker = ex.fetch_ticker(symbol)
+    ticker = _ccxt_call(ex.fetch_ticker, symbol, label=f"fetch_ticker grade_b")
     price  = float(ticker["last"])
 
     try:
-        ex.set_leverage(leverage, symbol)
-    except Exception as lev_e:
+        _ccxt_call(ex.set_leverage, leverage, symbol, label=f"set_leverage grade_b")
+    except RuntimeError as lev_e:
         err_str = str(lev_e)
         if "110043" in err_str or "leverage not modified" in err_str.lower():
             print(f"[INFO] Leverage already correct at {leverage}× on {symbol} — continuing with order")
@@ -5188,22 +5251,25 @@ def place_real_grade_b_order(
     t2_qty = round(qty * 0.40, 6)
 
     # Entry: market order with position-level SL (no TP — handled by partial limit orders below)
-    entry_order = ex.create_order(symbol, "market", order_side, qty, params={
-        "stopLoss":    {"triggerPrice": sl_price, "type": "market"},
-        "positionIdx": 0,
-    })
+    entry_order = _ccxt_call(
+        ex.create_order, symbol, "market", order_side, qty,
+        params={"stopLoss": {"triggerPrice": sl_price, "type": "market"}, "positionIdx": 0},
+        label=f"grade_b entry {side}",
+    )
 
     # T1 TP: partial reduceOnly limit at 60% qty
-    t1_order = ex.create_order(symbol, "limit", close_side, t1_qty, t1_tp_price, params={
-        "reduceOnly": True,
-        "positionIdx": 0,
-    })
+    t1_order = _ccxt_call(
+        ex.create_order, symbol, "limit", close_side, t1_qty, t1_tp_price,
+        params={"reduceOnly": True, "positionIdx": 0},
+        label="grade_b T1_TP",
+    )
 
     # T2 TP: partial reduceOnly limit at 40% qty
-    t2_order = ex.create_order(symbol, "limit", close_side, t2_qty, t2_tp_price, params={
-        "reduceOnly": True,
-        "positionIdx": 0,
-    })
+    t2_order = _ccxt_call(
+        ex.create_order, symbol, "limit", close_side, t2_qty, t2_tp_price,
+        params={"reduceOnly": True, "positionIdx": 0},
+        label="grade_b T2_TP",
+    )
 
     return {
         "order_id":    entry_order.get("id"),
