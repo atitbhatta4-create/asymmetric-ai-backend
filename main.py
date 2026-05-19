@@ -276,31 +276,61 @@ async def strip_api_prefix(request: Request, call_next):
 # Keyed by JWT sub or IP. Excludes health/docs endpoints.
 _GLOBAL_RL_HITS: Dict[str, List[float]] = {}
 _GLOBAL_RL_LOCK = threading.Lock()
+
+# Never rate-limit these (infra / docs)
 _GLOBAL_RL_SKIP = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
+
+# High-frequency dashboard read endpoints — higher ceiling (600/min per user)
+_GLOBAL_RL_DASHBOARD = {
+    "/balance", "/exchange/balance", "/exchange/status",
+    "/auto/status", "/auto/history", "/auto/sessions", "/auto/signal",
+    "/portfolio/stats", "/market/tickers",
+}
+
+# Authenticated users: 300/min  |  Unauthenticated (IP): 60/min
+_RL_LIMIT_AUTH = 300
+_RL_LIMIT_IP   = 60
+_RL_LIMIT_DASH = 600  # dashboard polling endpoints
 
 @app.middleware("http")
 async def global_rate_limit(request: Request, call_next):
     path = request.scope.get("path", "")
+
+    # Always skip infra paths
     if path in _GLOBAL_RL_SKIP:
         return await call_next(request)
 
-    # Key: prefer JWT sub (user-level), fall back to IP
+    # Skip price/ticker endpoints — they hit the exchange cache, not our DB
+    if path.startswith("/price/") or path.startswith("/market/ticker/"):
+        return await call_next(request)
+
+    # Identify caller: prefer JWT sub, fall back to IP
     auth_header = request.headers.get("authorization", "")
     rl_key = None
+    is_authed = False
     if auth_header.startswith("Bearer "):
         try:
             import jose.jwt as _jwt
             payload = _jwt.get_unverified_claims(auth_header[7:])
             rl_key = f"user:{payload.get('sub', '')}"
+            is_authed = True
         except Exception:
             pass
     if not rl_key:
         rl_key = f"ip:{(request.client.host if request.client else 'unknown')}"
 
+    # Choose limit based on endpoint type and auth status
+    if path in _GLOBAL_RL_DASHBOARD and is_authed:
+        limit = _RL_LIMIT_DASH
+    elif is_authed:
+        limit = _RL_LIMIT_AUTH
+    else:
+        limit = _RL_LIMIT_IP
+
     now = time.time()
     with _GLOBAL_RL_LOCK:
         hits = [t for t in _GLOBAL_RL_HITS.get(rl_key, []) if now - t < 60]
-        if len(hits) >= 60:
+        if len(hits) >= limit:
             from fastapi.responses import JSONResponse
             return JSONResponse(
                 status_code=429,
