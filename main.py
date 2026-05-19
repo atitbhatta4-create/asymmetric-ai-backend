@@ -3882,6 +3882,7 @@ class AutoRunner:
         if equity_before > self.peak_equity:
             self.peak_equity = equity_before
             self.floor_equity = self.peak_equity * 0.85  # trail floor up with every new high
+            update_peak_ath(self.email, self.peak_equity, self.peak_equity)  # persist immediately so restart can't lose the high
         drawdown_pct = (self.peak_equity - equity_before) / self.peak_equity if self.peak_equity > 0 else 0.0
         dd_size_mult = 1.0
         if drawdown_pct >= 0.15:
@@ -4338,11 +4339,23 @@ class AutoRunner:
             time.sleep(min(chunk, secs))
             secs -= chunk
         if not self.stop_event.is_set():
-            # New day — reload counters from DB and resume
+            # New day — apply strictness step-down (same logic as _reset_if_new_day)
+            STEP_DOWN = {2.50: 1.50, 1.50: 1.25}
+            if self.adaptive_strictness <= 1.25:
+                self.adaptive_strictness = 1.0
+                self.consecutive_wins = 0
+                self.log("Midnight reset (sleep path) — strictness cleared to 1.0x. Fresh start.")
+            else:
+                self.adaptive_strictness = STEP_DOWN.get(
+                    round(self.adaptive_strictness, 2), 1.25
+                )
+                self.log(f"Midnight reset (sleep path) — strictness stepped down to {self.adaptive_strictness:.2f}x")
+            # Reload counters from DB and resume
             self.trades_today, self.bad_trades_today = self._load_today_stats()
             self.day_key = dubai_day_key()
             self._last_trade_bad = False
             self.last_trade_ts = time.time()
+            _save_runner_state(self)
             self.log("New Dubai day — daily limits reset. Resuming AI.")
 
     def _run_mid_candle_monitor(self):
