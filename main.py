@@ -1578,9 +1578,9 @@ def exchange_test(user=Depends(require_user)):
     ex_id = (row.get("exchange") or "bybit").lower()
     try:
         if ex_id == "bybit":
-            bal = _bybit_direct_balance(row["api_key"], row["api_secret"])
+            bal, err_msg = _bybit_direct_balance(row["api_key"], row["api_secret"])
             if bal is None:
-                raise ValueError("Could not fetch Bybit balance — check API key, secret, and permissions (Read+Write, Unified Trading).")
+                raise ValueError(f"Bybit balance fetch failed: {err_msg}")
             result = {"ok": True, "exchange": row["exchange"], "canTrade": True,
                       "accountType": "UNIFIED", "usdt_free": round(bal, 4),
                       "usdt_total": round(bal, 4), "note": "Live connection verified ✓"}
@@ -1615,7 +1615,13 @@ def exchange_balance(user=Depends(require_user)):
     row = get_exchange(email)
     if not row:
         raise HTTPException(status_code=400, detail="No exchange connected.")
+    ex_id = (row.get("exchange") or "bybit").lower()
     try:
+        if ex_id == "bybit":
+            bal, err = _bybit_direct_balance(row["api_key"], row["api_secret"])
+            if bal is not None:
+                return {"ok": True, "balances": [{"asset": "USDT", "free": round(bal, 4), "locked": 0.0}], "note": "Live balance from exchange ✓"}
+            raise ValueError(err)
         ex = _make_ccxt_exchange(row)
         balance = ex.fetch_balance({"accountType": "UNIFIED"})
         balances = []
@@ -1627,7 +1633,6 @@ def exchange_balance(user=Depends(require_user)):
                 balances.append({"asset": asset, "free": round(free, 6), "locked": round(total - free, 6)})
         return {"ok": True, "balances": balances, "note": "Live balance from exchange ✓"}
     except Exception as e:
-        # Fallback to virtual equity when exchange unreachable
         eq = get_equity(email)
         return {
             "ok": False,
@@ -1637,37 +1642,75 @@ def exchange_balance(user=Depends(require_user)):
         }
 
 
-def _bybit_direct_balance(api_key: str, api_secret: str) -> Optional[float]:
-    """Direct Bybit V5 signed request for USDT balance — avoids ccxt's coin-info endpoint."""
+BYBIT_HOSTS = ["https://api.bybit.com", "https://api.bytick.com"]
+
+def _bybit_signed_get(api_key: str, api_secret: str, path: str, query: str) -> tuple[Optional[dict], str]:
+    """Make a signed Bybit GET request, trying both hosts. Returns (parsed JSON or None, last_error)."""
     ts = str(int(time.time() * 1000))
     recv_window = "5000"
-    for account_type in ["UNIFIED", "CONTRACT", "SPOT"]:
+    sign_str = ts + api_key + recv_window + query
+    sig = hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY":     api_key,
+        "X-BAPI-TIMESTAMP":   ts,
+        "X-BAPI-SIGN":        sig,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "Content-Type":       "application/json",
+    }
+    last_error = "unknown"
+    for host in BYBIT_HOSTS:
         try:
-            query = f"accountType={account_type}"
-            sign_str = ts + api_key + recv_window + query
-            sig = hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
-            headers = {
-                "X-BAPI-API-KEY":     api_key,
-                "X-BAPI-TIMESTAMP":   ts,
-                "X-BAPI-SIGN":        sig,
-                "X-BAPI-RECV-WINDOW": recv_window,
-                "Content-Type":       "application/json",
-            }
-            resp = httpx.get(
-                f"https://api.bybit.com/v5/account/wallet-balance?{query}",
-                headers=headers, timeout=10,
-            )
-            data = resp.json()
-            if data.get("retCode") == 0:
-                for acc in data.get("result", {}).get("list", []):
-                    for coin in acc.get("coin", []):
-                        if coin.get("coin") == "USDT":
-                            val = float(coin.get("walletBalance") or coin.get("equity") or 0)
-                            if val >= 0:
-                                return val
-        except Exception:
-            continue
+            resp = httpx.get(f"{host}{path}?{query}", headers=headers, timeout=10)
+            print(f"[bybit] {host}{path} → HTTP {resp.status_code}")
+            if resp.status_code == 200:
+                return resp.json(), ""
+            last_error = f"HTTP {resp.status_code} from {host}: {resp.text[:200]}"
+            print(f"[bybit] non-200: {last_error}")
+        except Exception as e:
+            last_error = f"{type(e).__name__} from {host}: {e}"
+            print(f"[bybit] exception: {last_error}")
+    return None, last_error
     return None
+
+
+def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
+    """
+    Direct Bybit V5 signed request for USDT balance.
+    Checks Unified Trading wallet first, then Funding wallet.
+    Returns (balance_float, None) on success, (None, error_str) on failure.
+    """
+    try:
+        # 1. Try Unified Trading wallet (required for trading)
+        data, net_err = _bybit_signed_get(api_key, api_secret, "/v5/account/wallet-balance", "accountType=UNIFIED")
+        if data is None:
+            return (None, f"Could not reach Bybit API{' (' + net_err + ')' if net_err else ''}")
+        ret_code = data.get("retCode")
+        ret_msg  = data.get("retMsg", "")
+        print(f"[bybit-balance] UNIFIED retCode={ret_code} retMsg={ret_msg}")
+        if ret_code in (10003, 10004):
+            return (None, f"Invalid API key or secret (retCode={ret_code}: {ret_msg})")
+        if ret_code != 0:
+            return (None, f"Bybit API error retCode={ret_code}: {ret_msg}")
+        for acc in data.get("result", {}).get("list", []):
+            for coin in acc.get("coin", []):
+                if coin.get("coin") == "USDT":
+                    val = float(coin.get("walletBalance") or coin.get("equity") or 0)
+                    print(f"[bybit-balance] USDT in Unified Trading: {val}")
+                    return (val, None)
+
+        # 2. USDT not in Unified — check Funding wallet
+        print("[bybit-balance] No USDT in Unified, checking Funding wallet...")
+        fund_data, _ = _bybit_signed_get(api_key, api_secret, "/v5/asset/transfer/query-account-coins-balance", "accountType=FUND&coin=USDT")
+        if fund_data and fund_data.get("retCode") == 0:
+            for item in fund_data.get("result", {}).get("balance", []):
+                if item.get("coin") == "USDT":
+                    val = float(item.get("walletBalance") or item.get("transferBalance") or 0)
+                    print(f"[bybit-balance] USDT in Funding wallet: {val}")
+                    if val > 0:
+                        return (None, f"Your {val:.2f} USDT is in the Funding wallet — transfer it to Unified Trading in Bybit before the engine can trade.")
+        return (None, "No USDT found in Unified Trading or Funding wallet. Please deposit USDT to your Bybit account.")
+    except Exception as ex:
+        return (None, f"Exception: {ex}")
 
 
 def _okx_direct_balance(api_key: str, api_secret: str, passphrase: str) -> Optional[float]:
@@ -2193,17 +2236,18 @@ def risk_preview(payload: RiskPreviewIn, user=Depends(require_user)):
 def balance(user=Depends(require_user)):
     email = user["email"]
 
-    if REAL_TRADING:
-        real_bal = get_real_usdt_balance(email)
-        if real_bal is not None:
-            equity = real_bal
-            db_equity = get_equity(email)
-            if abs(db_equity - real_bal) > 0.01:
-                set_equity(email, real_bal)
-        else:
-            # Exchange not connected or unreachable — show 0, not fake $1000
-            equity = 0.0
+    real_bal = get_real_usdt_balance(email)
+    if real_bal is not None:
+        # Exchange connected — always show real balance on equity card
+        equity = real_bal
+        db_equity = get_equity(email)
+        if abs(db_equity - real_bal) > 0.01:
+            set_equity(email, real_bal)
         start_eq = equity
+    elif REAL_TRADING:
+        # Real trading mode but exchange unreachable — show 0, not fake balance
+        equity = 0.0
+        start_eq = 0.0
     else:
         equity = get_equity(email)
         start_eq = START_EQUITY
@@ -3838,6 +3882,7 @@ class AutoRunner:
         if equity_before > self.peak_equity:
             self.peak_equity = equity_before
             self.floor_equity = self.peak_equity * 0.85  # trail floor up with every new high
+            update_peak_ath(self.email, self.peak_equity, self.peak_equity)  # persist immediately so restart can't lose the high
         drawdown_pct = (self.peak_equity - equity_before) / self.peak_equity if self.peak_equity > 0 else 0.0
         dd_size_mult = 1.0
         if drawdown_pct >= 0.15:
@@ -4194,6 +4239,7 @@ class AutoRunner:
 
             still_open: List[Dict] = []
             t1_won = False
+            t1_entry_price: Optional[float] = None
 
             for pt in self.pending_trades:
                 # Promote deferred breakeven: T1 won last candle → T2 is now risk-free.
@@ -4230,6 +4276,15 @@ class AutoRunner:
                 for pt in still_open:
                     if pt.get("breakeven_after_t1") and not pt.get("breakeven"):
                         pt["breakeven_next"] = True
+                        if REAL_TRADING and t1_entry_price:
+                            try:
+                                ok = _move_real_sl_to_breakeven(self.email, self.symbol, t1_entry_price)
+                                if ok:
+                                    self.log(f"REAL T2 SL→BREAKEVEN @ {t1_entry_price:.4f}")
+                                else:
+                                    self.log("REAL T2 SL breakeven move failed — T2 continues with original SL")
+                            except Exception as _slm:
+                                self.log(f"REAL T2 SL move error: {_slm}")
 
             # Persist live state so a redeploy picks up the updated positions/strictness
             _save_runner_state(self)
@@ -4284,11 +4339,23 @@ class AutoRunner:
             time.sleep(min(chunk, secs))
             secs -= chunk
         if not self.stop_event.is_set():
-            # New day — reload counters from DB and resume
+            # New day — apply strictness step-down (same logic as _reset_if_new_day)
+            STEP_DOWN = {2.50: 1.50, 1.50: 1.25}
+            if self.adaptive_strictness <= 1.25:
+                self.adaptive_strictness = 1.0
+                self.consecutive_wins = 0
+                self.log("Midnight reset (sleep path) — strictness cleared to 1.0x. Fresh start.")
+            else:
+                self.adaptive_strictness = STEP_DOWN.get(
+                    round(self.adaptive_strictness, 2), 1.25
+                )
+                self.log(f"Midnight reset (sleep path) — strictness stepped down to {self.adaptive_strictness:.2f}x")
+            # Reload counters from DB and resume
             self.trades_today, self.bad_trades_today = self._load_today_stats()
             self.day_key = dubai_day_key()
             self._last_trade_bad = False
             self.last_trade_ts = time.time()
+            _save_runner_state(self)
             self.log("New Dubai day — daily limits reset. Resuming AI.")
 
     def _run_mid_candle_monitor(self):
@@ -4612,18 +4679,35 @@ class AutoRunner:
                     else:
                         equity_now = get_equity(self.email)
 
-                    real_order_id = None
+                    real_order_id  = None
+                    real_b_result  = None   # Grade B real only
                     if REAL_TRADING:
                         try:
-                            size_pct = float(c["size"]) * 1.0  # Grade A full size
+                            size_pct  = float(c["size"])
                             usdt_size = equity_now * size_pct
-                            result = place_real_order(
-                                email=self.email, symbol=self.symbol, side=desired_side,
-                                usdt_size=usdt_size, leverage=int(c["leverage"]),
-                                sl_pct=sl_pct_open, tp_pct=tp_pct_open,
-                            )
-                            real_order_id = result.get("order_id")
-                            self.log(f"REAL ORDER PLACED | id={real_order_id} | {desired_side} {self.symbol} size=${usdt_size:.2f} lev={c['leverage']}×")
+                            if grade == "B":
+                                # Real Grade B: entry + two partial reduceOnly TP limit orders
+                                real_b_result = place_real_grade_b_order(
+                                    email=self.email, symbol=self.symbol, side=desired_side,
+                                    usdt_size=usdt_size, leverage=int(c["leverage"]),
+                                    sl_pct=sl_pct_open,
+                                    t1_tp_pct=tp_pct_open * 0.80,
+                                    t2_tp_pct=tp_pct_open * 1.00,
+                                )
+                                self.log(
+                                    f"REAL GRADE B | entry={real_b_result['order_id']} "
+                                    f"T1_TP={real_b_result['t1_tp_id']} T2_TP={real_b_result['t2_tp_id']} "
+                                    f"SL={real_b_result['sl_price']:.4f} "
+                                    f"T1@{real_b_result['t1_tp_price']:.4f} T2@{real_b_result['t2_tp_price']:.4f}"
+                                )
+                            else:
+                                result = place_real_order(
+                                    email=self.email, symbol=self.symbol, side=desired_side,
+                                    usdt_size=usdt_size, leverage=int(c["leverage"]),
+                                    sl_pct=sl_pct_open, tp_pct=tp_pct_open,
+                                )
+                                real_order_id = result.get("order_id")
+                                self.log(f"REAL ORDER PLACED | id={real_order_id} | {desired_side} {self.symbol} size=${usdt_size:.2f} lev={c['leverage']}×")
                         except Exception as _re:
                             self.log(f"REAL ORDER FAILED — trade skipped: {_re}")
                             continue
@@ -4634,8 +4718,8 @@ class AutoRunner:
                         "mode": self.mode,
                         "signal": self.last_signal,
                         "open_ts": time.time(),
-                        "sl_pct_open": sl_pct_open,   # locked at entry — never recalculates
-                        "tp_pct_open": tp_pct_open,   # locked at entry — never recalculates
+                        "sl_pct_open": sl_pct_open,
+                        "tp_pct_open": tp_pct_open,
                         **({"order_id": real_order_id} if real_order_id else {}),
                     }
                     if grade == "B" and REAL_TRADING:
@@ -4886,12 +4970,13 @@ def place_real_order(
     notional = usdt_size * leverage
     qty = round(notional / price, 6)
 
-    # Minimum order size guard — reject before hitting exchange
-    min_qty = EXCHANGE_FEES.get(ex_id, EXCHANGE_FEES["bybit"]).get("min_qty", 0)
-    if min_qty and qty < min_qty:
+    # Minimum notional guard — $5 covers Bybit/OKX/Binance minimums for any coin.
+    # Coin-specific qty minimums vary (BTC=0.001, SOL=0.1, DOGE=1) so we use
+    # notional USD which is universal and exchange-agnostic.
+    if notional < 5.0:
         raise ValueError(
-            f"Position too small: {qty:.6f} {symbol} is below exchange minimum {min_qty}. "
-            f"Notional ${notional:.2f} insufficient — increase account size or use a higher-size mode."
+            f"Position too small: ${notional:.2f} notional (need ≥ $5). "
+            f"Increase account size or use a higher-leverage/size mode."
         )
 
     # SL / TP prices
@@ -5380,6 +5465,14 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         raise
     except Exception:
         pass  # DB error — allow start, runner will recount
+
+    # Sync real exchange balance into DB before creating runner.
+    # Without this, runner reads DB default ($1,000) for session_start_equity
+    # and floor_equity, even if the real account has a different balance.
+    if REAL_TRADING:
+        _pre_bal = get_real_usdt_balance(email, force=True)
+        if _pre_bal is not None:
+            set_equity(email, _pre_bal)
 
     with AUTO_LOCK:
         old = AUTO_RUNNERS.get(email)
