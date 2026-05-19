@@ -5075,16 +5075,18 @@ def place_real_order(
         label=f"create_order {ex_id} {side}",
     )
 
-    # Binance: attach SL/TP as separate stop-market orders
+    # Binance: SL/TP must be separate stop-market orders after entry.
+    # closePosition=True closes the full position — do NOT pass qty alongside it
+    # (Binance rejects orders that have both qty and closePosition=True).
     if ex_id == "binance":
         close_side = "sell" if side == "LONG" else "buy"
         try:
-            _ccxt_call(ex.create_order, symbol, "STOP_MARKET", close_side, qty, sl_price,
-                       {"stopPrice": sl_price, "reduceOnly": True, "closePosition": True},
-                       label=f"sl_order binance")
-            _ccxt_call(ex.create_order, symbol, "TAKE_PROFIT_MARKET", close_side, qty, tp_price,
-                       {"stopPrice": tp_price, "reduceOnly": True, "closePosition": True},
-                       label=f"tp_order binance")
+            _ccxt_call(ex.create_order, symbol, "STOP_MARKET", close_side, None, None,
+                       {"stopPrice": sl_price, "closePosition": True},
+                       label="sl_order binance")
+            _ccxt_call(ex.create_order, symbol, "TAKE_PROFIT_MARKET", close_side, None, None,
+                       {"stopPrice": tp_price, "closePosition": True},
+                       label="tp_order binance")
         except RuntimeError as e:
             print(f"[WARN] Binance SL/TP attachment failed (entry already placed): {e}", flush=True)
 
@@ -5221,17 +5223,18 @@ def place_real_grade_b_order(
         raise ValueError("No exchange connected")
 
     ex = _make_ccxt_exchange(row)
+    ex_id      = (row.get("exchange") or "bybit").lower()
     order_side = "buy"  if side == "LONG" else "sell"
     close_side = "sell" if side == "LONG" else "buy"
     sl_mult  = (1 - sl_pct)    if side == "LONG" else (1 + sl_pct)
     t1_mult  = (1 + t1_tp_pct) if side == "LONG" else (1 - t1_tp_pct)
     t2_mult  = (1 + t2_tp_pct) if side == "LONG" else (1 - t2_tp_pct)
 
-    ticker = _ccxt_call(ex.fetch_ticker, symbol, label=f"fetch_ticker grade_b")
+    ticker = _ccxt_call(ex.fetch_ticker, symbol, label=f"fetch_ticker grade_b {ex_id}")
     price  = float(ticker["last"])
 
     try:
-        _ccxt_call(ex.set_leverage, leverage, symbol, label=f"set_leverage grade_b")
+        _ccxt_call(ex.set_leverage, leverage, symbol, label=f"set_leverage grade_b {ex_id}")
     except RuntimeError as lev_e:
         err_str = str(lev_e)
         if "110043" in err_str or "leverage not modified" in err_str.lower():
@@ -5250,25 +5253,59 @@ def place_real_grade_b_order(
     t1_qty = round(qty * 0.60, 6)
     t2_qty = round(qty * 0.40, 6)
 
-    # Entry: market order with position-level SL (no TP — handled by partial limit orders below)
+    # ── Exchange-specific entry params ─────────────────────────────────────────
+    # Bybit: SL attached directly to entry order (atomic — position never unprotected)
+    # OKX:   SL attached via slTriggerPx on entry order (same atomic guarantee)
+    # Binance: SL must be a separate STOP_MARKET order placed after entry
+    if ex_id == "bybit":
+        entry_params = {
+            "stopLoss":    {"triggerPrice": sl_price, "type": "market"},
+            "positionIdx": 0,
+        }
+    elif ex_id == "okx":
+        entry_params = {
+            "tdMode":      "cross",
+            "slTriggerPx": str(sl_price),
+            "slOrdPx":     "-1",   # market price on trigger
+        }
+    else:  # binance and others
+        entry_params = {"reduceOnly": False}
+
+    # ── reduceOnly params per exchange ─────────────────────────────────────────
+    if ex_id == "bybit":
+        reduce_params = {"reduceOnly": True, "positionIdx": 0}
+    else:
+        reduce_params = {"reduceOnly": True}
+
+    # Entry: market order
     entry_order = _ccxt_call(
-        ex.create_order, symbol, "market", order_side, qty,
-        params={"stopLoss": {"triggerPrice": sl_price, "type": "market"}, "positionIdx": 0},
-        label=f"grade_b entry {side}",
+        ex.create_order, symbol, "market", order_side, qty, params=entry_params,
+        label=f"grade_b entry {side} {ex_id}",
     )
 
-    # T1 TP: partial reduceOnly limit at 60% qty
+    # Binance: SL must be separate since it can't attach to entry order
+    if ex_id == "binance":
+        try:
+            _ccxt_call(
+                ex.create_order, symbol, "STOP_MARKET", close_side, qty, sl_price,
+                {"stopPrice": sl_price, "closePosition": True},
+                label="grade_b SL binance", retries=1,
+            )
+        except RuntimeError as e:
+            print(f"[WARN] Grade B Binance SL attachment failed (entry placed): {e}", flush=True)
+
+    # T1 TP: partial reduceOnly limit at 60% qty — above entry for LONG, below for SHORT
     t1_order = _ccxt_call(
         ex.create_order, symbol, "limit", close_side, t1_qty, t1_tp_price,
-        params={"reduceOnly": True, "positionIdx": 0},
-        label="grade_b T1_TP",
+        params=reduce_params,
+        label=f"grade_b T1_TP {ex_id}",
     )
 
     # T2 TP: partial reduceOnly limit at 40% qty
     t2_order = _ccxt_call(
         ex.create_order, symbol, "limit", close_side, t2_qty, t2_tp_price,
-        params={"reduceOnly": True, "positionIdx": 0},
-        label="grade_b T2_TP",
+        params=reduce_params,
+        label=f"grade_b T2_TP {ex_id}",
     )
 
     return {
