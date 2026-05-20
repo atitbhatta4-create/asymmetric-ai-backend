@@ -20,9 +20,9 @@ from collections import deque
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
-from database import db, USING_PG, column_exists, serial_pk
+from database import db, db_conn, USING_PG, column_exists, serial_pk
 
 # =========================
 # App
@@ -341,11 +341,6 @@ async def global_rate_limit(request: Request, call_next):
 
     return await call_next(request)
 
-# =========================
-# DB LOCK (thread safety)
-# =========================
-DB_LOCK = threading.Lock()
-
 
 def now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -354,8 +349,7 @@ def now_utc_str() -> str:
 def init_db() -> None:
     _serial = serial_pk()
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
 
         cur.execute("""
@@ -496,10 +490,19 @@ def init_db() -> None:
         if not column_exists(conn, "ai_logs", "session_id"):
             cur.execute("ALTER TABLE ai_logs ADD COLUMN session_id INTEGER")
 
-        # Performance indexes for AI log queries
+        # Performance indexes
         cur.execute("CREATE INDEX IF NOT EXISTS ix_ai_sessions_email ON ai_sessions(email)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_ai_logs_session ON ai_logs(session_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_ai_logs_email ON ai_logs(email)")
+        # Composite: covers "WHERE email=? ORDER BY t DESC" — the most common log query
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_ai_logs_email_t ON ai_logs(email, t DESC)")
+        # Timestamp index: covers time-range log queries and ORDER BY t
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_ai_logs_t ON ai_logs(t DESC)")
+        # Trades indexes: no index existed — every trade history query was a full scan
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_trades_email ON trades(email)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_trades_email_time ON trades(email, time DESC)")
+        # Sessions: email lookup (token is already primary key)
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_sessions_email ON sessions(email)")
 
         # AI runner persistence — survives backend restarts / deploys.
         # Saved when user starts the AI, cleared when AI stops for any reason.
@@ -564,7 +567,6 @@ def init_db() -> None:
         _set_default("seat_capacity", "50")
 
         conn.commit()
-        conn.close()
 
 
 init_db()
@@ -586,6 +588,16 @@ START_EQUITY = float(os.environ.get("SIMULATED_EQUITY", "1000"))
 RiskMode = Literal["ULTRA_SAFE", "SAFE", "NORMAL", "MINI_ASYM", "AGGRESSIVE"]
 Side = Literal["LONG", "SHORT"]
 TF = Literal["15m", "1h", "4h", "1d"]
+
+# Input validation — shared symbol regex (e.g. BTCUSDT, ETHUSDT)
+import re as _re
+_SYMBOL_RE = _re.compile(r'^[A-Z]{1,10}USDT$')
+
+def _validate_symbol(v: str) -> str:
+    v = v.upper().strip()
+    if not _SYMBOL_RE.match(v):
+        raise ValueError(f"Invalid symbol '{v}' — must be like BTCUSDT (letters + USDT, max 14 chars)")
+    return v
 TF_MAP: Dict[str, str] = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
 TradeStyle = Literal["SCALP", "DAY_TRADE", "SWING"]
 
@@ -685,8 +697,7 @@ def mask_key(s: str) -> str:
 
 
 def ensure_user_state(email: str) -> None:
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT equity, session_id FROM user_state WHERE email = %s", (email,))
         row = cur.fetchone()
@@ -700,34 +711,28 @@ def ensure_user_state(email: str) -> None:
             # User was created before SIMULATED_EQUITY was configured; bump to current default
             cur.execute("UPDATE user_state SET equity = %s WHERE email = %s", (START_EQUITY, email))
             conn.commit()
-        conn.close()
 
 
 def get_equity(email: str) -> float:
     ensure_user_state(email)
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT equity FROM user_state WHERE email = %s", (email,))
         row = cur.fetchone()
-        conn.close()
     return float(row["equity"])
 
 
 def set_equity(email: str, equity: float) -> None:
     ensure_user_state(email)
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("UPDATE user_state SET equity = %s WHERE email = %s", (float(equity), email))
         conn.commit()
-        conn.close()
 
 
 def update_peak_ath(email: str, peak: float, equity_after: float) -> None:
     """Update peak_equity and all_time_high in user_state after each trade."""
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT peak_equity, all_time_high FROM user_state WHERE email = %s", (email,))
         row = cur.fetchone()
@@ -739,37 +744,30 @@ def update_peak_ath(email: str, peak: float, equity_after: float) -> None:
                 (new_peak, new_ath, email),
             )
             conn.commit()
-        conn.close()
 
 
 def get_session_id(email: str) -> int:
     ensure_user_state(email)
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT session_id FROM user_state WHERE email = %s", (email,))
         row = cur.fetchone()
-        conn.close()
     return int(row["session_id"] or 0)
 
 
 def set_session_id(email: str, sid: int) -> None:
     ensure_user_state(email)
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("UPDATE user_state SET session_id = %s WHERE email = %s", (int(sid), email))
         conn.commit()
-        conn.close()
 
 
 def get_exchange(email: str) -> Optional[dict]:
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM exchange_keys WHERE email = %s", (email,))
         row = cur.fetchone()
-        conn.close()
     if not row:
         return None
     # Decrypt keys before returning — callers always get plain text
@@ -800,12 +798,10 @@ def require_user(session: Optional[str] = Cookie(default=None)) -> Dict[str, str
         if now - ts < _SESSION_TTL:
             return {"email": email}
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT email FROM sessions WHERE token = %s", (session,))
         row = cur.fetchone()
-        conn.close()
     if not row:
         _SESSION_CACHE.pop(session, None)
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -836,18 +832,15 @@ def require_admin(user=Depends(require_user)) -> str:
 
 
 def admin_get_setting(key: str, default: str) -> str:
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT v FROM admin_settings WHERE k=%s", (key,))
         row = cur.fetchone()
-        conn.close()
     return (row["v"] if row else default)
 
 
 def admin_set_setting(key: str, value: str) -> None:
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             """
@@ -859,7 +852,6 @@ def admin_set_setting(key: str, value: str) -> None:
             (key, value, now_utc_str()),
         )
         conn.commit()
-        conn.close()
 
 
 def signup_is_enabled() -> bool:
@@ -876,18 +868,15 @@ def seat_capacity() -> int:
 
 
 def seats_used() -> int:
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) AS n FROM users")
         n = int(cur.fetchone()["n"])
-        conn.close()
     return n
 
 
 # Seed demo admin user if missing
-with DB_LOCK:
-    conn = db()
+with db_conn() as conn:
     cur = conn.cursor()
     cur.execute("SELECT email FROM users WHERE email = %s", (DEMO_EMAIL,))
     if not cur.fetchone():
@@ -896,7 +885,6 @@ with DB_LOCK:
             (DEMO_EMAIL, hash_pw(DEMO_PASS), now_utc_str()),
         )
         conn.commit()
-    conn.close()
 
 # =========================
 # BASIC INFO
@@ -926,8 +914,8 @@ def health():
 # AUTH MODELS
 # =========================
 class AuthIn(BaseModel):
-    email: str
-    password: str
+    email: str = Field(..., min_length=5, max_length=254)
+    password: str = Field(..., min_length=8, max_length=256)
 
 
 class SessionOut(BaseModel):
@@ -974,12 +962,10 @@ def signup(request: Request, payload: AuthIn):
     if seats_used() >= seat_capacity():
         raise HTTPException(status_code=403, detail="Seats are full. Signup is closed.")
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT email FROM users WHERE email = %s", (email,))
         if cur.fetchone():
-            conn.close()
             raise HTTPException(status_code=400, detail="User already exists")
 
         cur.execute(
@@ -987,7 +973,6 @@ def signup(request: Request, payload: AuthIn):
             (email, hash_pw(payload.password), now_utc_str()),
         )
         conn.commit()
-        conn.close()
 
     return {"ok": True}
 
@@ -997,12 +982,10 @@ def login(request: Request, payload: AuthIn, response: Response):
     _rate_limit(request, limit=15, window=900)  # 15 per 15 minutes per IP
     email = payload.email.strip().lower()
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT password_hash FROM users WHERE email = %s", (email,))
         row = cur.fetchone()
-        conn.close()
 
     if not row or not verify_pw(payload.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -1011,7 +994,7 @@ def login(request: Request, payload: AuthIn, response: Response):
     stored = row["password_hash"]
     if not (stored.startswith("$2b$") or stored.startswith("$2a$")):
         new_hash = hash_pw(payload.password)
-        with DB_LOCK:
+        with db_conn() as conn:
             conn2 = db()
             cur2 = conn2.cursor()
             cur2.execute("UPDATE users SET password_hash=%s WHERE email=%s", (new_hash, email))
@@ -1021,12 +1004,10 @@ def login(request: Request, payload: AuthIn, response: Response):
     token = secrets.token_urlsafe(32)
     now = int(time.time())
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("INSERT INTO sessions(token, email, created_at) VALUES(%s, %s, %s)", (token, email, now))
         conn.commit()
-        conn.close()
 
     set_session_cookie(response, token)
     ensure_user_state(email)
@@ -1041,12 +1022,10 @@ def login(request: Request, payload: AuthIn, response: Response):
 def logout(response: Response, session: Optional[str] = Cookie(default=None)):
     if session:
         _SESSION_CACHE.pop(session, None)   # evict from auth cache immediately
-        with DB_LOCK:
-            conn = db()
+        with db_conn() as conn:
             cur = conn.cursor()
             cur.execute("DELETE FROM sessions WHERE token = %s", (session,))
             conn.commit()
-            conn.close()
 
     clear_session_cookie(response)
     return {"ok": True}
@@ -1056,12 +1035,10 @@ def logout(response: Response, session: Optional[str] = Cookie(default=None)):
 def session_me(session: Optional[str] = Cookie(default=None)):
     if not session:
         return {"ok": False, "email": None}
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT email FROM sessions WHERE token = %s", (session,))
         row = cur.fetchone()
-        conn.close()
     return {"ok": bool(row), "email": row["email"] if row else None}
 
 
@@ -1090,22 +1067,18 @@ def change_password(payload: ChangePasswordIn, user=Depends(require_user)):
     if len(payload.new_password) < 6:
         raise HTTPException(status_code=400, detail="New password must be at least 6 characters.")
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT password_hash FROM users WHERE email = %s", (email,))
         row = cur.fetchone()
-        conn.close()
 
     if not row or not verify_pw(payload.current_password, row["password_hash"]):
         raise HTTPException(status_code=400, detail="Current password is incorrect.")
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("UPDATE users SET password_hash = %s WHERE email = %s", (hash_pw(payload.new_password), email))
         conn.commit()
-        conn.close()
 
     email_password_changed(email)
     return {"ok": True}
@@ -1131,18 +1104,15 @@ def forgot_password(request: Request, payload: ForgotPasswordIn):
         raise HTTPException(status_code=400, detail="Email required")
 
     # Check user exists — but don't reveal it in the response
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT email FROM users WHERE email = %s", (email,))
         exists = cur.fetchone() is not None
-        conn.close()
 
     if exists:
         code = str(secrets.randbelow(900000) + 100000)   # 100000-999999
         now_ts = int(time.time())
-        with DB_LOCK:
-            conn = db()
+        with db_conn() as conn:
             cur = conn.cursor()
             cur.execute("""
                 INSERT INTO otp_codes(email, code, created_at, used)
@@ -1151,7 +1121,6 @@ def forgot_password(request: Request, payload: ForgotPasswordIn):
                     created_at=EXCLUDED.created_at, used=0
             """, (email, code, now_ts))
             conn.commit()
-            conn.close()
         email_otp_reset(email, code)
 
     # Always return ok — prevents email enumeration
@@ -1171,14 +1140,12 @@ def reset_password(request: Request, payload: VerifyOtpIn):
 
     OTP_TTL = 15 * 60  # 15 minutes
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT code, created_at, used FROM otp_codes WHERE email = %s", (email,)
         )
         row = cur.fetchone()
-        conn.close()
 
     if not row:
         raise HTTPException(status_code=400, detail="No reset code found. Request a new one.")
@@ -1190,14 +1157,12 @@ def reset_password(request: Request, payload: VerifyOtpIn):
         raise HTTPException(status_code=400, detail="Incorrect code.")
 
     # Mark used + update password
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("UPDATE otp_codes SET used=1 WHERE email=%s", (email,))
         cur.execute("UPDATE users SET password_hash=%s WHERE email=%s",
                     (hash_pw(payload.new_password), email))
         conn.commit()
-        conn.close()
 
     email_password_changed(email)
     return {"ok": True, "detail": "Password reset successfully. You can now log in."}
@@ -1210,12 +1175,10 @@ import pyotp
 import base64
 
 def _get_totp_row(email: str) -> Optional[dict]:
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT secret, enabled FROM totp_secrets WHERE email=%s", (email,))
         row = cur.fetchone()
-        conn.close()
     return dict(row) if row else None
 
 
@@ -1239,8 +1202,7 @@ def totp_setup(user=Depends(require_user)):
         issuer_name="Asymmetric AI"
     )
     # Store secret but NOT enabled yet — only enabled after confirm
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO totp_secrets(email, secret, enabled, created_at)
@@ -1249,7 +1211,6 @@ def totp_setup(user=Depends(require_user)):
                 enabled=0, created_at=EXCLUDED.created_at
         """, (email, encrypt_key(secret), now_utc_str()))
         conn.commit()
-        conn.close()
     return {"ok": True, "uri": uri, "secret": secret}
 
 
@@ -1272,12 +1233,10 @@ def totp_confirm(payload: TotpCodeIn, user=Depends(require_user)):
     if not totp.verify(payload.code.strip(), valid_window=1):
         raise HTTPException(status_code=400, detail="Invalid code — check your authenticator app")
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("UPDATE totp_secrets SET enabled=1 WHERE email=%s", (email,))
         conn.commit()
-        conn.close()
 
     email_2fa_enabled(email)
     return {"ok": True, "detail": "2FA is now active on your account"}
@@ -1319,12 +1278,10 @@ def totp_disable(payload: TotpCodeIn, user=Depends(require_user)):
     if not totp.verify(payload.code.strip(), valid_window=1):
         raise HTTPException(status_code=400, detail="Invalid code — cannot disable 2FA")
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("UPDATE totp_secrets SET enabled=0 WHERE email=%s", (email,))
         conn.commit()
-        conn.close()
 
     return {"ok": True, "detail": "2FA disabled"}
 
@@ -1360,13 +1317,11 @@ def auth_forgot(payload: ForgotIn):
     if not email:
         raise HTTPException(status_code=400, detail="email required")
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT email FROM users WHERE email=%s", (email,))
         u = cur.fetchone()
         if not u:
-            conn.close()
             return {"ok": True}
 
         token = secrets.token_urlsafe(32)
@@ -1375,7 +1330,6 @@ def auth_forgot(payload: ForgotIn):
             (token, email, int(time.time())),
         )
         conn.commit()
-        conn.close()
 
     return {"ok": True, "reset_token": token}
 
@@ -1387,22 +1341,18 @@ def auth_reset(payload: ResetIn):
     if not token or len(new_pw) < 4:
         raise HTTPException(status_code=400, detail="token + new_password required (min 4 chars)")
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT email, used, created_at FROM password_resets WHERE token=%s", (token,))
         row = cur.fetchone()
         if not row:
-            conn.close()
             raise HTTPException(status_code=400, detail="Invalid token")
 
         if int(row["used"]) == 1:
-            conn.close()
             raise HTTPException(status_code=400, detail="Token already used")
 
         created_at = int(row["created_at"])
         if int(time.time()) - created_at > 1800:
-            conn.close()
             raise HTTPException(status_code=400, detail="Token expired")
 
         email = row["email"]
@@ -1410,7 +1360,6 @@ def auth_reset(payload: ResetIn):
         cur.execute("UPDATE password_resets SET used=1 WHERE token=%s", (token,))
         cur.execute("DELETE FROM sessions WHERE email=%s", (email,))
         conn.commit()
-        conn.close()
 
     return {"ok": True}
 
@@ -1434,8 +1383,7 @@ def admin_force_reset(payload: AdminForceResetIn):
     if not payload.new_password or len(payload.new_password) < 4:
         raise HTTPException(status_code=400, detail="new_password min 4 chars")
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT email FROM users WHERE email=%s", (email,))
         u = cur.fetchone()
@@ -1448,7 +1396,6 @@ def admin_force_reset(payload: AdminForceResetIn):
             cur.execute("UPDATE users SET password_hash=%s WHERE email=%s", (hash_pw(payload.new_password), email))
         cur.execute("DELETE FROM sessions WHERE email=%s", (email,))
         conn.commit()
-        conn.close()
 
     return {"ok": True}
 
@@ -1463,12 +1410,10 @@ class ProfileIn(BaseModel):
 @app.get("/profile")
 def get_profile(user=Depends(require_user)):
     email = user["email"]
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT display_name FROM users WHERE email = %s", (email,))
         row = cur.fetchone()
-        conn.close()
     name = (row["display_name"] if row and row["display_name"] else "").strip()
     if not name:
         name = email.split("@")[0]
@@ -1478,12 +1423,10 @@ def get_profile(user=Depends(require_user)):
 def update_profile(payload: ProfileIn, user=Depends(require_user)):
     email = user["email"]
     name = payload.display_name.strip()[:40]
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("UPDATE users SET display_name = %s WHERE email = %s", (name, email))
         conn.commit()
-        conn.close()
     return {"ok": True, "display_name": name}
 
 @app.get("/config")
@@ -1496,9 +1439,9 @@ def get_config():
 # =========================
 class ExchangeConnectIn(BaseModel):
     exchange: Literal["binance", "okx", "bybit"]
-    api_key: str
-    api_secret: str
-    passphrase: Optional[str] = None
+    api_key: str = Field(..., min_length=10, max_length=256)
+    api_secret: str = Field(..., min_length=10, max_length=256)
+    passphrase: Optional[str] = Field(default=None, max_length=256)
 
 
 @app.get("/exchange/status")
@@ -1530,8 +1473,7 @@ def exchange_connect(payload: ExchangeConnectIn, user=Depends(require_user)):
         raise HTTPException(status_code=400, detail="API key/secret required")
 
     created_at = now_utc_str()
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             """
@@ -1554,7 +1496,6 @@ def exchange_connect(payload: ExchangeConnectIn, user=Depends(require_user)):
             ),
         )
         conn.commit()
-        conn.close()
 
     # Clear caches so new keys are visible immediately
     _EX_STATUS_CACHE.pop(email, None)
@@ -1566,12 +1507,10 @@ def exchange_connect(payload: ExchangeConnectIn, user=Depends(require_user)):
 @app.post("/exchange/disconnect")
 def exchange_disconnect(user=Depends(require_user)):
     email = user["email"]
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM exchange_keys WHERE email = %s", (email,))
         conn.commit()
-        conn.close()
     _EX_STATUS_CACHE.pop(email, None)
     _EX_TEST_CACHE.pop(email, None)
     _REAL_BAL_CACHE.pop(email, None)
@@ -2295,20 +2234,30 @@ class TradeIn(BaseModel):
     symbol: str
     side: Side
     mode: RiskMode
-    size: float
-    sl: float
-    tp: float
-    leverage: float
+    size: float = Field(..., gt=0, le=1_000_000)
+    sl: float = Field(..., gt=0)
+    tp: float = Field(..., gt=0)
+    leverage: float = Field(..., ge=1, le=125)
+
+    @field_validator("symbol")
+    @classmethod
+    def _check_symbol(cls, v: str) -> str:
+        return _validate_symbol(v)
 
 
 class RiskPreviewIn(BaseModel):
     symbol: str
     side: Side
     mode: RiskMode
-    size: float
-    sl: float
-    tp: float
-    leverage: float
+    size: float = Field(..., gt=0, le=1_000_000)
+    sl: float = Field(..., gt=0)
+    tp: float = Field(..., gt=0)
+    leverage: float = Field(..., ge=1, le=125)
+
+    @field_validator("symbol")
+    @classmethod
+    def _check_symbol(cls, v: str) -> str:
+        return _validate_symbol(v)
 
 
 @app.post("/risk/preview")
@@ -2352,14 +2301,12 @@ def balance(user=Depends(require_user)):
         equity = get_equity(email)
         start_eq = START_EQUITY
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT time FROM trades WHERE email = %s ORDER BY id DESC LIMIT 1", (email,))
         last_row = cur.fetchone()
         cur.execute("SELECT peak_equity, all_time_high FROM user_state WHERE email = %s", (email,))
         state_row = cur.fetchone()
-        conn.close()
     peak = float(state_row["peak_equity"] or 0) if state_row else 0.0
     # Include live runner's peak — more up-to-date than DB value between saves
     with AUTO_LOCK:
@@ -2412,12 +2359,10 @@ def trades(
     q = f"SELECT * FROM trades WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT %s"
     params.append(int(limit))
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(q, tuple(params))
         rows = cur.fetchall()
-        conn.close()
 
     return {"trades": [dict(r) for r in rows]}
 
@@ -2428,12 +2373,10 @@ def portfolio_stats(user=Depends(require_user)):
     from datetime import timezone as _tz, timedelta as _td
 
     email = user["email"]
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM trades WHERE email = %s ORDER BY time ASC", (email,))
         rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
 
     if not rows:
         return {"empty": True}
@@ -2771,8 +2714,7 @@ async def _place_trade_internal(
         reason=reason_text,
     )
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             """
@@ -2791,7 +2733,6 @@ async def _place_trade_internal(
             ),
         )
         conn.commit()
-        conn.close()
 
     set_equity(email, equity_after)
     return {"ok": True, "trade": asdict(tr), "pnl_pct": float(tr.unreal_pnl_percent)}
@@ -2813,8 +2754,7 @@ def _save_runner_state(runner: "AutoRunner") -> None:
     import json as _json
     try:
         pending_json = _json.dumps(list(runner.pending_trades))
-        with DB_LOCK:
-            conn = db()
+        with db_conn() as conn:
             cur = conn.cursor()
             if USING_PG:
                 cur.execute("""
@@ -2887,7 +2827,6 @@ def _save_runner_state(runner: "AutoRunner") -> None:
                     orig_start_eq, runner.strictness_day_key,
                 ))
             conn.commit()
-            conn.close()
     except Exception as e:
         print(f"[runner-state] save failed for {runner.email}: {e}")
 
@@ -2895,12 +2834,10 @@ def _save_runner_state(runner: "AutoRunner") -> None:
 def _clear_runner_state(email: str) -> None:
     """Remove persisted runner state — called when AI stops for any reason."""
     try:
-        with DB_LOCK:
-            conn = db()
+        with db_conn() as conn:
             cur = conn.cursor()
             cur.execute("DELETE FROM ai_runner_state WHERE email = %s", (email,))
             conn.commit()
-            conn.close()
     except Exception as e:
         print(f"[runner-state] clear failed for {email}: {e}")
 
@@ -2908,12 +2845,10 @@ def _clear_runner_state(email: str) -> None:
 def _load_all_runner_states() -> list:
     """Return all saved runner configs (called once on startup)."""
     try:
-        with DB_LOCK:
-            conn = db()
+        with db_conn() as conn:
             cur = conn.cursor()
             cur.execute("SELECT * FROM ai_runner_state")
             rows = cur.fetchall()
-            conn.close()
             return [dict(r) for r in rows]
     except Exception as e:
         print(f"[runner-state] load failed: {e}")
@@ -3551,11 +3486,16 @@ class AutoStartIn(BaseModel):
     symbol: str
     trade_style: TradeStyle = "DAY_TRADE"
     mode: RiskMode = "MINI_ASYM"
-    max_trades_per_day: Optional[int] = None
-    stop_after_bad_trades: int = 2
-    duration_days: int = 0
+    max_trades_per_day: Optional[int] = Field(default=None, ge=1, le=50)
+    stop_after_bad_trades: int = Field(default=2, ge=1, le=20)
+    duration_days: int = Field(default=0, ge=0, le=365)
     trend_filter: bool = True
-    chop_min_sep_pct: float = 0.005
+    chop_min_sep_pct: float = Field(default=0.005, ge=0.001, le=0.05)
+
+    @field_validator("symbol")
+    @classmethod
+    def _check_symbol(cls, v: str) -> str:
+        return _validate_symbol(v)
 
 
 class _MidCandleSkip(Exception):
@@ -3611,7 +3551,7 @@ class AutoRunner:
         # This prevents floor from drifting down when equity dips between sessions.
         _saved_peak = 0.0
         try:
-            with DB_LOCK:
+            with db_conn() as conn:
                 _pc = db()
                 _pcur = _pc.cursor()
                 _pcur.execute("SELECT peak_equity FROM user_state WHERE email = %s", (email,))
@@ -3638,8 +3578,7 @@ class AutoRunner:
         exactly where the previous session left off."""
         import json as _json
         try:
-            with DB_LOCK:
-                conn = db()
+            with db_conn() as conn:
                 cur = conn.cursor()
                 cur.execute(
                     "SELECT adaptive_strictness, last_trade_ts, last_trade_bad, "
@@ -3653,7 +3592,6 @@ class AutoRunner:
                     (self.email,),
                 )
                 row = cur.fetchone()
-                conn.close()
             if not row:
                 return
             row = dict(row)
@@ -3702,8 +3640,7 @@ class AutoRunner:
             print(f"[runner-state] restore failed for {self.email}: {e}")
         # Restore log history and active session_id from DB so they survive redeploys
         try:
-            with DB_LOCK:
-                conn = db()
+            with db_conn() as conn:
                 cur = conn.cursor()
                 # Find the most recent open session (ended_at IS NULL)
                 cur.execute(
@@ -3725,7 +3662,6 @@ class AutoRunner:
                         (self.email,),
                     )
                 rows = cur.fetchall()
-                conn.close()
             for row in rows:
                 self.history.append({"t": row["t"], "msg": row["msg"]})
         except Exception as e:
@@ -3745,8 +3681,7 @@ class AutoRunner:
             utc_midnight_str = dubai_midnight.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             # Use current session_id so Reset Sandbox clears the daily lock in demo mode
             sid = get_session_id(self.email)
-            with DB_LOCK:
-                conn = db()
+            with db_conn() as conn:
                 cur = conn.cursor()
                 # Only count primary trades (T1 / Grade A) — T2 has size_mult=0.40
                 # so its stored size is always < 50% of base. Threshold: base_size * 0.45
@@ -3761,7 +3696,6 @@ class AutoRunner:
                     (self.email, utc_midnight_str, sid, primary_threshold),
                 )
                 row = cur.fetchone()
-                conn.close()
             trades = int((row or {}).get("cnt") or 0)
             bad = int((row or {}).get("bad") or 0)
             return trades, bad
@@ -3775,22 +3709,19 @@ class AutoRunner:
 
     def _persist_log(self, entry: Dict) -> None:
         try:
-            with DB_LOCK:
-                conn = db()
+            with db_conn() as conn:
                 cur = conn.cursor()
                 cur.execute(
                     "INSERT INTO ai_logs(email, session_id, t, msg) VALUES(%s, %s, %s, %s)",
                     (self.email, self.ai_session_id, entry["t"], entry["msg"]),
                 )
                 conn.commit()
-                conn.close()
         except Exception:
             pass
 
     def _open_ai_session(self) -> None:
         try:
-            with DB_LOCK:
-                conn = db()
+            with db_conn() as conn:
                 cur = conn.cursor()
                 if USING_PG:
                     # RETURNING id avoids SELECT lastval() which returns a dict row
@@ -3816,7 +3747,6 @@ class AutoRunner:
                     row = cur.fetchone()
                     self.ai_session_id = list(row.values())[0] if isinstance(row, dict) else row[0]
                 conn.commit()
-                conn.close()
         except Exception as e:
             print(f"[ai-session] open failed: {e}")
 
@@ -3824,15 +3754,13 @@ class AutoRunner:
         if not self.ai_session_id:
             return
         try:
-            with DB_LOCK:
-                conn = db()
+            with db_conn() as conn:
                 cur = conn.cursor()
                 cur.execute(
                     "UPDATE ai_sessions SET ended_at=%s, stop_reason=%s WHERE id=%s",
                     (now_dubai().strftime("%Y-%m-%d %H:%M:%S"), reason, self.ai_session_id),
                 )
                 conn.commit()
-                conn.close()
         except Exception as e:
             print(f"[ai-session] close failed: {e}")
 
@@ -4262,8 +4190,7 @@ class AutoRunner:
             equity_after=float(equity_after), reason=reason_text,
         )
 
-        with DB_LOCK:
-            conn = db()
+        with db_conn() as conn:
             cur = conn.cursor()
             cur.execute(
                 """INSERT INTO trades(
@@ -4278,7 +4205,6 @@ class AutoRunner:
                  float(tr.equity_after), tr.reason, int(sid), float(self.floor_equity)),
             )
             conn.commit()
-            conn.close()
 
         set_equity(self.email, equity_after)
         update_peak_ath(self.email, float(self.peak_equity), float(equity_after))
@@ -5478,15 +5404,13 @@ def reset_sandbox(user=Depends(require_user)):
     new_sid = sid + 1
     set_session_id(email, new_sid)
     set_equity(email, START_EQUITY)
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             "UPDATE user_state SET peak_equity=%s WHERE email=%s",
             (START_EQUITY, email),
         )
         conn.commit()
-        conn.close()
     set_ai_restart_lock(email, 0)
     return {"ok": True, "equity": START_EQUITY, "new_session_id": new_sid}
 
@@ -5525,8 +5449,7 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
                 "events": list(r.history)[: int(limit)],
             }
     # No runner in memory (after redeploy) — read latest open session from DB
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT id FROM ai_sessions WHERE email=%s AND ended_at IS NULL "
@@ -5547,7 +5470,6 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
                 (email, int(limit)),
             )
         rows = cur.fetchall()
-        conn.close()
     return {
         "ok": True,
         "session_id": session_id,
@@ -5584,8 +5506,7 @@ def auto_sessions(
     """Return AI sessions for this user, newest first, with classified logs.
     Supports optional symbol filter, keyword search, and log_type filter."""
     email = user["email"]
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         if symbol:
             cur.execute(
@@ -5621,7 +5542,6 @@ def auto_sessions(
                 events = [e for e in events if e["log_type"] == log_type.upper()]
             sess["events"] = events
             sess["total_events"] = len(events)
-        conn.close()
     return {"ok": True, "sessions": sessions}
 
 
@@ -5684,8 +5604,7 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         dubai_midnight = now_dubai().replace(hour=0, minute=0, second=0, microsecond=0)
         utc_midnight_str = dubai_midnight.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         sid = get_session_id(email)
-        with DB_LOCK:
-            conn = db()
+        with db_conn() as conn:
             cur = conn.cursor()
             cur.execute(
                 "SELECT SUM(CASE WHEN unreal_pnl_percent < 0 THEN 1 ELSE 0 END) as bad "
@@ -5693,7 +5612,6 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
                 (email, utc_midnight_str, sid),
             )
             row = cur.fetchone()
-            conn.close()
         bad_today = int((row or {}).get("bad") or 0)
         if bad_today >= effective_stop_after:
             raise HTTPException(
@@ -5786,8 +5704,7 @@ def auto_reset_strictness(user=Depends(require_user)):
             _save_runner_state(r)
     # Also patch DB directly so it survives restarts
     try:
-        with DB_LOCK:
-            conn = db()
+        with db_conn() as conn:
             cur = conn.cursor()
             if USING_PG:
                 cur.execute(
@@ -5800,7 +5717,6 @@ def auto_reset_strictness(user=Depends(require_user)):
                     (email,),
                 )
             conn.commit()
-            conn.close()
     except Exception as e:
         print(f"[reset-strictness] DB patch failed: {e}")
     return {"ok": True, "adaptive_strictness": 1.0, "message": "Strictness reset to 1.0x"}
@@ -5873,8 +5789,7 @@ def admin_users(
     limit: int = Query(default=100, ge=1, le=2000),
 ):
     qn = (q or "").strip().lower()
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
 
         if qn:
@@ -5954,7 +5869,6 @@ def admin_users(
                 "last_active": last_active,
                 "open_positions": open_positions,
             })
-        conn.close()
 
     return {"ok": True, "users": out}
 
@@ -5969,14 +5883,12 @@ def admin_user_details(
     if not email:
         raise HTTPException(status_code=400, detail="email required")
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
 
         cur.execute("SELECT email, created_at FROM users WHERE email=%s", (email,))
         u = cur.fetchone()
         if not u:
-            conn.close()
             raise HTTPException(status_code=404, detail="User not found")
 
         cur.execute("SELECT equity, session_id FROM user_state WHERE email=%s", (email,))
@@ -5992,7 +5904,6 @@ def admin_user_details(
 
         cur.execute("SELECT * FROM trades WHERE email=%s ORDER BY id DESC LIMIT %s", (email, int(trades_limit)))
         trows = [dict(r) for r in cur.fetchall()]
-        conn.close()
 
     with AUTO_LOCK:
         rr = AUTO_RUNNERS.get(email)
@@ -6019,15 +5930,13 @@ def admin_log_access(
     tab: str = "overview",
     admin=Depends(require_admin),
 ):
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO admin_access_log(admin_email, user_email, timestamp, tab_viewed) VALUES(%s,%s,%s,%s)",
             (admin, user_email, now_utc_str(), tab),
         )
         conn.commit()
-        conn.close()
     return {"ok": True}
 
 
@@ -6036,15 +5945,13 @@ def admin_access_log_list(
     admin=Depends(require_admin),
     limit: int = Query(default=200, ge=1, le=2000),
 ):
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             "SELECT admin_email, user_email, timestamp, tab_viewed FROM admin_access_log ORDER BY id DESC LIMIT %s",
             (int(limit),),
         )
         rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
     return {"ok": True, "log": rows}
 
 
@@ -6059,8 +5966,7 @@ def admin_user_log(
         rr = AUTO_RUNNERS.get(email)
         running = bool(rr and rr.is_running())
 
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         # Fetch last 20 sessions newest first
         cur.execute(
@@ -6077,7 +5983,6 @@ def admin_user_log(
                 (email, sess["id"], int(limit)),
             )
             sess["events"] = [{"t": r["t"], "msg": r["msg"]} for r in cur.fetchall()]
-        conn.close()
 
     return {"ok": True, "running": running, "sessions": sessions}
 
@@ -6088,12 +5993,10 @@ def admin_user_portfolio(email: str, admin=Depends(require_admin)):
     from datetime import timezone as _tz, timedelta as _td
 
     email = (email or "").strip().lower()
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT * FROM trades WHERE email = %s ORDER BY time ASC", (email,))
         rows = [dict(r) for r in cur.fetchall()]
-        conn.close()
 
     if not rows:
         return {"empty": True}
@@ -6161,12 +6064,10 @@ def admin_user_portfolio(email: str, admin=Depends(require_admin)):
 @app.get("/admin/user/{email}/notes")
 def admin_get_notes(email: str, admin=Depends(require_admin)):
     email = (email or "").strip().lower()
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT notes, updated_at, updated_by FROM admin_notes WHERE email=%s", (email,))
         row = cur.fetchone()
-        conn.close()
     if row:
         return {"ok": True, "notes": row["notes"], "updated_at": row["updated_at"], "updated_by": row["updated_by"]}
     return {"ok": True, "notes": "", "updated_at": None, "updated_by": None}
@@ -6178,8 +6079,7 @@ class AdminNotesIn(BaseModel):
 @app.post("/admin/user/{email}/notes")
 def admin_save_notes(email: str, payload: AdminNotesIn, admin=Depends(require_admin)):
     email = (email or "").strip().lower()
-    with DB_LOCK:
-        conn = db()
+    with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             """INSERT INTO admin_notes(email, notes, updated_at, updated_by)
@@ -6188,7 +6088,6 @@ def admin_save_notes(email: str, payload: AdminNotesIn, admin=Depends(require_ad
             (email, payload.notes, now_utc_str(), admin),
         )
         conn.commit()
-        conn.close()
     return {"ok": True}
 
 
