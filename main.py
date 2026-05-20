@@ -703,7 +703,8 @@ def ensure_user_state(email: str) -> None:
         row = cur.fetchone()
         if not row:
             cur.execute(
-                "INSERT INTO user_state(email, equity, session_id) VALUES(%s, %s, %s)",
+                "INSERT INTO user_state(email, equity, session_id) VALUES(%s, %s, %s)"
+                " ON CONFLICT (email) DO NOTHING",
                 (email, START_EQUITY, 0),
             )
             conn.commit()
@@ -3556,11 +3557,9 @@ class AutoRunner:
         _saved_peak = 0.0
         try:
             with db_conn() as conn:
-                _pc = db()
-                _pcur = _pc.cursor()
+                _pcur = conn.cursor()
                 _pcur.execute("SELECT peak_equity FROM user_state WHERE email = %s", (email,))
                 _prow = _pcur.fetchone()
-                _pc.close()
                 _saved_peak = float(_prow["peak_equity"] or 0) if _prow else 0.0
         except Exception:
             _saved_peak = 0.0
