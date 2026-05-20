@@ -5095,7 +5095,9 @@ def place_real_order(
     # availableToWithdraw, not total equity. Using walletBalance causes error 110007
     # when unrealized PnL or locked margin reduces the actual free amount.
     available = _get_available_usdt(ex, ex_id)
-    if available > 0 and usdt_size > available * 0.95:
+    if available < 2.0:
+        raise ValueError(f"SKIP_LOW_MARGIN: available USDT ${available:.2f} too low to open a position — waiting for funds to free up.")
+    if usdt_size > available * 0.95:
         usdt_size = round(available * 0.90, 4)  # cap at 90% of truly available
         print(f"[balance-cap] Capped usdt_size to ${usdt_size:.2f} (available: ${available:.2f})", flush=True)
 
@@ -5206,19 +5208,38 @@ def close_real_order(email: str, symbol: str, side: str) -> dict:
 def _get_available_usdt(ex, ex_id: str) -> float:
     """
     Return the USDT balance actually available for new orders.
-    This is availableToWithdraw (Bybit) / free (ccxt), NOT walletBalance.
-    walletBalance includes unrealized PnL — orders are sized against
-    available margin, not total equity. Using walletBalance causes 110007.
+    For Bybit UNIFIED: reads availableToWithdraw from raw API response.
+    For OKX/Binance: uses ccxt free field.
+    Using walletBalance instead causes Bybit error 110007 when unrealized
+    PnL or locked margin reduces the actual free amount.
     """
     try:
         params = {"accountType": "UNIFIED"} if ex_id == "bybit" else {}
         bal = _ccxt_call(ex.fetch_balance, params=params, label=f"fetch_available_balance {ex_id}", retries=0)
-        # ccxt maps availableToWithdraw → free for Bybit, availBal → free for OKX, etc.
+
+        if ex_id == "bybit":
+            # Read availableToWithdraw directly from Bybit raw response
+            try:
+                accounts = (bal.get("info") or {}).get("result", {}).get("list", [])
+                for acc in accounts:
+                    coins = acc.get("coin", [])
+                    for coin in coins:
+                        if coin.get("coin") == "USDT":
+                            atw = float(coin.get("availableToWithdraw") or coin.get("availableToBorrow") or 0)
+                            if atw > 0:
+                                print(f"[balance] Bybit availableToWithdraw: ${atw:.2f}", flush=True)
+                                return atw
+            except Exception:
+                pass  # fall through to ccxt free
+
+        # ccxt free field (OKX, Binance, and Bybit fallback)
         free = float((bal.get("USDT") or {}).get("free") or 0)
         if free <= 0:
             free = float((bal.get("free") or {}).get("USDT") or 0)
+        print(f"[balance] {ex_id} free USDT: ${free:.2f}", flush=True)
         return free
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] _get_available_usdt failed ({ex_id}): {e}", flush=True)
         return 0.0
 
 
@@ -5341,7 +5362,9 @@ def place_real_grade_b_order(
 
     # Cap size against available balance — NOT walletBalance (Bybit 110007 fix)
     available = _get_available_usdt(ex, ex_id)
-    if available > 0 and usdt_size > available * 0.95:
+    if available < 2.0:
+        raise ValueError(f"SKIP_LOW_MARGIN: available USDT ${available:.2f} too low to open Grade B position — waiting for funds to free up.")
+    if usdt_size > available * 0.95:
         usdt_size = round(available * 0.90, 4)
         print(f"[balance-cap] Grade B capped usdt_size to ${usdt_size:.2f} (available: ${available:.2f})", flush=True)
 
