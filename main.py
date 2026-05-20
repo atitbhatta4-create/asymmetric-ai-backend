@@ -914,7 +914,13 @@ def health():
 # AUTH MODELS
 # =========================
 class AuthIn(BaseModel):
+    """Used for both login and signup — no password min_length so existing users can always log in."""
     email: str = Field(..., min_length=5, max_length=254)
+    password: str = Field(..., max_length=256)
+
+
+class SignupIn(AuthIn):
+    """Signup only — enforces minimum password length for new accounts."""
     password: str = Field(..., min_length=8, max_length=256)
 
 
@@ -951,7 +957,7 @@ def clear_session_cookie(response: Response) -> None:
 # AUTH ENDPOINTS
 # =========================
 @app.post("/auth/signup")
-def signup(request: Request, payload: AuthIn):
+def signup(request: Request, payload: SignupIn):
     _rate_limit(request, limit=3, window=3600)  # 3 per hour per IP
     email = payload.email.strip().lower()
     if not email or not payload.password:
@@ -994,12 +1000,10 @@ def login(request: Request, payload: AuthIn, response: Response):
     stored = row["password_hash"]
     if not (stored.startswith("$2b$") or stored.startswith("$2a$")):
         new_hash = hash_pw(payload.password)
-        with db_conn() as conn:
-            conn2 = db()
+        with db_conn() as conn2:
             cur2 = conn2.cursor()
             cur2.execute("UPDATE users SET password_hash=%s WHERE email=%s", (new_hash, email))
             conn2.commit()
-            conn2.close()
 
     token = secrets.token_urlsafe(32)
     now = int(time.time())
