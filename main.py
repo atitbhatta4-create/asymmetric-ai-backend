@@ -3103,6 +3103,92 @@ def _rsi_divergence(closes: List[float], rsi_vals: List[float], side: str, n: in
 
     return divergence, (0.28 if divergence else 0.0)
 
+def _classify_regime(
+    highs: List[float], lows: List[float], closes: List[float],
+    adx: Optional[float], atr_pct: float,
+) -> Dict:
+    """
+    Phase 4 — Market regime classifier.
+
+    Compares current ATR to its own 50-candle baseline so the engine knows
+    whether it is in a calm trend, a choppy range, or a volatility spike.
+
+    Returns:
+        regime   : "TRENDING" | "MARGINAL" | "CHOPPY" | "VOLATILE"
+        block    : True  = hard block (do not trade)
+        min_score_penalty : added to min_score for MARGINAL (raises the bar)
+        spike_ratio : current ATR / 50-candle ATR baseline
+        reason   : human-readable explanation
+    """
+    # 50-candle ATR as the volatility baseline for this symbol
+    atr_slow = _atr(highs, lows, closes, 50)
+    price    = closes[-1] if closes else 1.0
+    atr_slow_pct = (atr_slow / price) if (atr_slow and price) else 0.0
+
+    spike_ratio = round(atr_pct / atr_slow_pct, 2) if atr_slow_pct > 0 else 1.0
+    adx_val     = round(adx or 0.0, 1)
+
+    # ── VOLATILE — ATR spiked 2.5× above its own 50-candle baseline ─────────
+    # News event, liquidation cascade, or major wick. SL distances are based on
+    # normal ATR — in a spike the market can move 3-4× SL in one candle.
+    if spike_ratio >= 2.5:
+        return {
+            "regime": "VOLATILE",
+            "block":  True,
+            "min_score_penalty": 0.0,
+            "spike_ratio": spike_ratio,
+            "adx": adx_val,
+            "reason": (
+                f"ATR {spike_ratio:.1f}× above baseline — news/liquidation spike. "
+                f"SL distance is unreliable in these conditions. Waiting for volatility to normalize."
+            ),
+        }
+
+    # ── CHOPPY — low ADX + quiet ATR = price ranging between same two levels ─
+    # False breakouts dominate ranging markets. EMA21 pullback entries fail
+    # because price re-crosses EMA21 multiple times with no follow-through.
+    if adx is not None and adx < 18 and spike_ratio <= 0.90:
+        return {
+            "regime": "CHOPPY",
+            "block":  True,
+            "min_score_penalty": 0.0,
+            "spike_ratio": spike_ratio,
+            "adx": adx_val,
+            "reason": (
+                f"ADX {adx_val} < 18 and ATR {spike_ratio:.2f}× baseline — "
+                f"market is ranging with no trend. False signals dominate. Waiting for trend to develop."
+            ),
+        }
+
+    # ── MARGINAL — weak trend or mildly elevated volatility ─────────────────
+    # Still tradeable but requires a stronger signal than normal.
+    # Raise min_score by 0.07 so only the clearest setups fire.
+    if (adx is not None and adx < 22) or spike_ratio >= 1.80:
+        label = (
+            f"ADX {adx_val} — weak trend"
+            if (adx is not None and adx < 22)
+            else f"ATR {spike_ratio:.1f}× baseline — elevated volatility"
+        )
+        return {
+            "regime": "MARGINAL",
+            "block":  False,
+            "min_score_penalty": 0.07,
+            "spike_ratio": spike_ratio,
+            "adx": adx_val,
+            "reason": f"{label}. Requiring stronger signal before entry.",
+        }
+
+    # ── TRENDING — clear directional move with normal volatility ────────────
+    return {
+        "regime": "TRENDING",
+        "block":  False,
+        "min_score_penalty": 0.0,
+        "spike_ratio": spike_ratio,
+        "adx": adx_val,
+        "reason": "",
+    }
+
+
 # Per-mode signal thresholds + minimum quality score to trade
 MODE_SIGNAL_PARAMS: Dict[str, Dict] = {
     "ULTRA_SAFE": dict(adx_min=28, atr_min=0.003, atr_max=0.020, rsi_min=42, rsi_max=58, pullback_max=0.012, vol_factor=1.40, mom_n=3, min_score=0.75),
@@ -3157,6 +3243,19 @@ def _compute_signal_layers(
 
     price      = closes[-1]
     atr_pct    = (atr / price) if atr else 0.0
+
+    # ── Phase 4: Regime classification (before any layer scoring) ────────────
+    regime_class = _classify_regime(highs, lows, closes, adx, atr_pct)
+    if regime_class["block"]:
+        return {
+            "ok": False,
+            "blocked": f"REGIME_{regime_class['regime']}: {regime_class['reason']}",
+            "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+            "side": None, "adaptive_strictness": adaptive_strictness,
+            "market_regime": regime_class["regime"],
+            "regime_detail": regime_class,
+        }
+
     # Use volumes[-2] = last COMPLETED candle (OKX returns the in-progress candle
     # as volumes[-1], which has only partial volume — e.g. 1 minute into a 15m
     # candle shows 0.07x, making the volume filter block valid setups).
@@ -3201,6 +3300,9 @@ def _compute_signal_layers(
         p["pullback_max"] = p["pullback_max"] / max(0.5, s)
         p["vol_factor"]   = p["vol_factor"] * s
         p["min_score"]    = min(0.90, p["min_score"] + (s - 1) * 0.12)
+
+    # Apply MARGINAL regime penalty — raises min_score so only strong signals fire
+    p["min_score"] = min(0.92, p["min_score"] + regime_class["min_score_penalty"])
 
     # ── Higher TF trend direction ─────────────────────────────────────────
     # Primary: 4h EMA21 vs EMA50 crossover sets macro bias.
@@ -3402,10 +3504,18 @@ def _compute_signal_layers(
     }
 
     breakdown = {
-        "regime":    breakdown_regime,
-        "direction": breakdown_direction,
-        "entry":     breakdown_entry,
-        "momentum":  breakdown_momentum,
+        "regime":       breakdown_regime,
+        "direction":    breakdown_direction,
+        "entry":        breakdown_entry,
+        "momentum":     breakdown_momentum,
+        "market_regime": {
+            "regime":      regime_class["regime"],
+            "spike_ratio": regime_class["spike_ratio"],
+            "adx":         regime_class["adx"],
+            "ok":          not regime_class["block"],
+            "reason":      regime_class["reason"],
+            "score":       1.0 if regime_class["regime"] == "TRENDING" else (0.7 if regime_class["regime"] == "MARGINAL" else 0.0),
+        },
     }
 
     # ── Final weighted score ──────────────────────────────────────────────
@@ -3441,6 +3551,7 @@ def _compute_signal_layers(
             "signal": sig, "side": desired_side,
             "score": total_score, "min_score": min_score, "grade": "C",
             "breakdown": breakdown, "atr_pct": atr_pct,
+            "market_regime": regime_class["regime"],
             "htf_bear_debug": _htf_bear_debug,
             "htf_bear_triggered": _htf_bear_triggered,
             "htf_bear_slope_pct": _htf_bear_slope_pct,
@@ -3451,6 +3562,7 @@ def _compute_signal_layers(
         "signal": sig, "side": desired_side,
         "score": total_score, "min_score": min_score, "grade": grade,
         "breakdown": breakdown, "atr_pct": atr_pct,
+        "market_regime": regime_class["regime"],
         "htf_bear_debug": _htf_bear_debug,
         "htf_bear_triggered": _htf_bear_triggered,
         "htf_bear_slope_pct": _htf_bear_slope_pct,
@@ -3485,6 +3597,7 @@ class AutoState:
     signal_score: float
     trade_style: str
     market_grade: str
+    market_regime: str
 
 
 class AutoStartIn(BaseModel):
@@ -3548,6 +3661,7 @@ class AutoRunner:
         self.last_score: float = 0.0
         self.last_atr_pct: float = 0.01   # fallback 1% ATR until first signal
         self.market_grade: str = "-"
+        self.market_regime: str = "-"     # Phase 4: TRENDING / MARGINAL / CHOPPY / VOLATILE
         self._last_trade_bad: bool = False
         self._last_holding_log_ts: float = 0.0   # throttle repeated holding logs
         self.session_start_equity: float = get_equity(email)
@@ -3844,6 +3958,7 @@ class AutoRunner:
             signal_score=self.last_score,
             trade_style=self.trade_style,
             market_grade=self.market_grade,
+            market_regime=self.market_regime,
         )
 
     def _fetch_price_sync(self, symbol: str) -> float:
@@ -4365,6 +4480,8 @@ class AutoRunner:
         self.last_breakdown = res.get("breakdown", {})
         self.last_score = res.get("score", 0.0)
         self.market_grade = res.get("grade", "-")
+        if res.get("market_regime"):
+            self.market_regime = res["market_regime"]
         if res.get("atr_pct"):
             self.last_atr_pct = res["atr_pct"]
         slope_pct = res.get("htf_bear_slope_pct")
@@ -4791,7 +4908,11 @@ class AutoRunner:
                     self.last_side = res["side"]
                 if not res.get("ok"):
                     self.blocked_reason = res.get("blocked") or "BLOCKED"
-                    self.log(f"Blocked: {self.blocked_reason[:100]}")
+                    regime = res.get("market_regime", "")
+                    if regime in ("CHOPPY", "VOLATILE"):
+                        self.log(f"REGIME_{regime}: {self.blocked_reason[len(f'REGIME_{regime}: '):120]}")
+                    else:
+                        self.log(f"Blocked: {self.blocked_reason[:100]}")
                     continue
 
                 self.blocked_reason = None
