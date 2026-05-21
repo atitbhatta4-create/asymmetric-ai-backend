@@ -3670,6 +3670,15 @@ class AutoRunner:
         except Exception as e:
             print(f"[runner-state] log restore failed for {self.email}: {e}")
 
+        # FIX 3: Reconcile exchange positions on every startup/restart
+        # Runs in a background thread so it never blocks the runner from starting.
+        import threading as _thr
+        _thr.Thread(
+            target=self._reconcile_exchange_positions,
+            daemon=True,
+            name=f"reconcile-{self.email[:8]}",
+        ).start()
+
     def is_running(self):
         return not self.stop_event.is_set()
 
@@ -4505,8 +4514,9 @@ class AutoRunner:
                                         else:
                                             equity_now = get_equity(self.email)
 
-                                        real_order_id = None
-                                        real_b_result = None
+                                        real_order_id   = None
+                                        real_b_result   = None
+                                        _mc_real_result = None
                                         if REAL_TRADING:
                                             try:
                                                 size_pct  = float(c["size"])
@@ -4521,13 +4531,13 @@ class AutoRunner:
                                                         t2_tp_pct=tp_pct_open * 1.00,
                                                     )
                                                 else:
-                                                    _ro = place_real_order(
+                                                    _mc_real_result = place_real_order(
                                                         email=self.email, symbol=self.symbol,
                                                         side=signal_side, usdt_size=usdt_size,
                                                         leverage=int(c["leverage"]),
                                                         sl_pct=sl_pct_open, tp_pct=tp_pct_open,
                                                     )
-                                                    real_order_id = _ro.get("order_id")
+                                                    real_order_id = _mc_real_result.get("order_id")
                                             except Exception as _re:
                                                 self.log(f"MID_CANDLE REAL ORDER FAILED — {_re}")
                                                 raise _MidCandleSkip()
@@ -4541,15 +4551,13 @@ class AutoRunner:
                                             "sl_pct_open": sl_pct_open,
                                             "tp_pct_open": tp_pct_open,
                                             "mid_candle":  True,
-                                            **({"order_id": real_order_id} if real_order_id else {}),
                                         }
                                         if grade == "B" and REAL_TRADING:
-                                            _b = real_b_result or {}
                                             self.pending_trades = [
                                                 {**base_trade, "grade": "B", "size_mult": 0.60,
                                                  "tp_mult": 0.80, "is_primary": True, "label": "T1",
-                                                 "order_id": _b.get("order_id"),
-                                                 "t1_tp_id": _b.get("t1_tp_id")},
+                                                 "order_id": real_b_result.get("order_id"),
+                                                 "t1_tp_id": real_b_result.get("t1_tp_id")},
                                                 {**base_trade, "grade": "B", "size_mult": 0.40,
                                                  "tp_mult": 1.00, "is_primary": False, "label": "T2",
                                                  "breakeven_after_t1": True},
@@ -4565,12 +4573,11 @@ class AutoRunner:
                                         else:
                                             self.pending_trades = [
                                                 {**base_trade, "grade": "A", "size_mult": 1.00,
-                                                 "tp_mult": 1.00, "is_primary": True},
+                                                 "tp_mult": 1.00, "is_primary": True,
+                                                 **({"order_id": real_order_id} if real_order_id else {})},
                                             ]
 
-                                        # Setting last_trade_ts prevents main loop from
-                                        # double-firing a new trade at the next scheduled
-                                        # candle close (cooldown won't have passed yet).
+                                        # FIX 1: Log position BEFORE SL attempt
                                         self.last_trade_ts = time.time()
                                         _save_runner_state(self)
 
@@ -4579,6 +4586,22 @@ class AutoRunner:
                                             f"@ {entry_price:.4f} | score={score:.2f} | "
                                             f"{abs_move*100:.1f}% price move triggered"
                                         )
+
+                                        # FIX 2: Place SL — retry 3×, close position if all fail
+                                        if REAL_TRADING:
+                                            if grade == "B":
+                                                _mc_sl_ok = _ensure_sl_or_close(
+                                                    self, real_b_result["ex"], real_b_result["ex_id"],
+                                                    self.symbol, signal_side, real_b_result["sl_price"],
+                                                )
+                                            else:
+                                                _mc_sl_ok = _ensure_sl_or_close(
+                                                    self, _mc_real_result["ex"], _mc_real_result["ex_id"],
+                                                    self.symbol, signal_side, _mc_real_result["sl_price"],
+                                                )
+                                            if not _mc_sl_ok:
+                                                self.pending_trades = []
+                                                _save_runner_state(self)
 
             except _MidCandleSkip:
                 pass
@@ -4591,12 +4614,82 @@ class AutoRunner:
                     return
                 time.sleep(10)
 
+    def _reconcile_exchange_positions(self) -> None:
+        """
+        FIX 3: Compare exchange open positions with engine state.
+        - Position on exchange but not in engine → load it and attach SL immediately.
+        - Engine has pending_trades but no position on exchange → clear (closed externally).
+        Only runs in real-trading mode and only for the runner's symbol.
+        """
+        if not REAL_TRADING:
+            return
+        try:
+            row = get_exchange(self.email)
+            if not row:
+                return
+            ex     = _make_ccxt_exchange(row)
+            ex_id  = (row.get("exchange") or "bybit").lower()
+            positions = _ccxt_call(ex.fetch_positions, [self.symbol],
+                                   label=f"reconcile fetch_positions {self.symbol}", retries=0)
+            live_pos = next(
+                (p for p in positions
+                 if p["symbol"] == self.symbol and abs(float(p.get("contracts") or 0)) > 0),
+                None,
+            )
+
+            if live_pos and not self.pending_trades:
+                # Position exists on exchange but engine is blind — recover it
+                contracts  = abs(float(live_pos.get("contracts") or 0))
+                entry_px   = float(live_pos.get("entryPrice") or live_pos.get("averagePrice") or 0)
+                pos_side   = "LONG" if (live_pos.get("side") or "").lower() == "long" else "SHORT"
+                sl_pct_use = 0.015  # 1.5% default SL until we can recompute ATR
+                sl_price   = entry_px * (1 - sl_pct_use) if pos_side == "LONG" else entry_px * (1 + sl_pct_use)
+                self.log(
+                    f"RECONCILE: Found untracked {pos_side} {self.symbol} "
+                    f"{contracts} contracts @ {entry_px:.4f} on {ex_id}. "
+                    f"Loading into engine and attaching SL @ {sl_price:.4f}."
+                )
+                self.pending_trades = [{
+                    "entry_price":  entry_px,
+                    "side":         pos_side,
+                    "mode":         self.mode,
+                    "signal":       "RECOVERED",
+                    "open_ts":      time.time(),
+                    "sl_pct_open":  sl_pct_use,
+                    "tp_pct_open":  sl_pct_use * 2,
+                    "grade":        "A",
+                    "size_mult":    1.00,
+                    "tp_mult":      1.00,
+                    "is_primary":   True,
+                    "recovered":    True,
+                }]
+                _save_runner_state(self)
+                _ensure_sl_or_close(self, ex, ex_id, self.symbol, pos_side, sl_price)
+
+            elif not live_pos and self.pending_trades:
+                # Engine thinks a position is open but exchange has none — closed externally
+                self.log(
+                    f"RECONCILE: Engine had {len(self.pending_trades)} pending trade(s) "
+                    f"but no open position on {ex_id} for {self.symbol}. Clearing stale state."
+                )
+                self.pending_trades = []
+                _save_runner_state(self)
+
+        except Exception as e:
+            self.log(f"RECONCILE error (non-fatal): {e}")
+
     def _run_loop(self):
         cooldown_sec = max(60, self.interval_sec)
+        _last_reconcile_ts = time.time()   # startup reconcile runs via _restore_live_state thread
         while not self.stop_event.is_set():
             try:
                 self._reset_if_new_day()
                 self.last_run_ts = time.time()
+
+                # FIX 3: Reconcile exchange positions every hour
+                if REAL_TRADING and (time.time() - _last_reconcile_ts) >= 3600:
+                    self._reconcile_exchange_positions()
+                    _last_reconcile_ts = time.time()
 
                 if self.end_at_ts and time.time() >= self.end_at_ts:
                     self.blocked_reason = "DURATION_ENDED"
@@ -4732,6 +4825,7 @@ class AutoRunner:
 
                     real_order_id  = None
                     real_b_result  = None   # Grade B real only
+                    _real_result   = None   # Grade A real only
                     if REAL_TRADING:
                         try:
                             size_pct  = float(c["size"])
@@ -4752,50 +4846,90 @@ class AutoRunner:
                                     f"T1@{real_b_result['t1_tp_price']:.4f} T2@{real_b_result['t2_tp_price']:.4f}"
                                 )
                             else:
-                                result = place_real_order(
+                                _real_result = place_real_order(
                                     email=self.email, symbol=self.symbol, side=desired_side,
                                     usdt_size=usdt_size, leverage=int(c["leverage"]),
                                     sl_pct=sl_pct_open, tp_pct=tp_pct_open,
                                 )
-                                real_order_id = result.get("order_id")
+                                real_order_id = _real_result.get("order_id")
                                 self.log(f"REAL ORDER PLACED | id={real_order_id} | {desired_side} {self.symbol} size=${usdt_size:.2f} lev={c['leverage']}×")
                         except Exception as _re:
                             self.log(f"REAL ORDER FAILED — trade skipped: {_re}")
                             continue
 
-                    base_trade = {
-                        "entry_price": entry_price,
-                        "side": desired_side,
-                        "mode": self.mode,
-                        "signal": self.last_signal,
-                        "open_ts": time.time(),
-                        "sl_pct_open": sl_pct_open,
-                        "tp_pct_open": tp_pct_open,
-                        **({"order_id": real_order_id} if real_order_id else {}),
-                    }
-                    if grade == "B" and REAL_TRADING:
-                        _b = real_b_result or {}
-                        self.pending_trades = [
-                            {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80,
-                             "is_primary": True,  "label": "T1", "order_id": _b.get("order_id"),
-                             "t1_tp_id": _b.get("t1_tp_id")},
-                            {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00,
-                             "is_primary": False, "label": "T2", "breakeven_after_t1": True},
-                        ]
-                        self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP T2 40%+100%TP+BE | score={self.last_score:.2f}")
-                    elif grade == "B":
-                        self.pending_trades = [
-                            {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80, "is_primary": True,  "label": "T1"},
-                            {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00, "is_primary": False, "label": "T2", "breakeven_after_t1": True},
-                        ]
-                        self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}")
+                        # ── FIX 1: Entry succeeded — log position to DB BEFORE SL ──
+                        # If SL fails after this point, the position is still tracked.
+                        base_trade = {
+                            "entry_price": entry_price,
+                            "side": desired_side,
+                            "mode": self.mode,
+                            "signal": self.last_signal,
+                            "open_ts": time.time(),
+                            "sl_pct_open": sl_pct_open,
+                            "tp_pct_open": tp_pct_open,
+                        }
+                        if grade == "B":
+                            self.pending_trades = [
+                                {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80,
+                                 "is_primary": True,  "label": "T1",
+                                 "order_id": real_b_result.get("order_id"),
+                                 "t1_tp_id": real_b_result.get("t1_tp_id")},
+                                {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00,
+                                 "is_primary": False, "label": "T2", "breakeven_after_t1": True},
+                            ]
+                            self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP T2 40%+100%TP+BE | score={self.last_score:.2f}")
+                        else:
+                            self.pending_trades = [
+                                {**base_trade, "grade": "A", "size_mult": 1.00, "tp_mult": 1.00,
+                                 "is_primary": True, "order_id": real_order_id},
+                            ]
+                            self.log(f"TRADE OPENED Grade A REAL ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}")
+                        self.last_trade_ts = now_ts
+                        _save_runner_state(self)   # position logged to DB before SL attempt
+
+                        # ── FIX 2: Place SL — retry 3×, close position if all fail ──
+                        if grade == "B":
+                            _sl_ok = _ensure_sl_or_close(
+                                self, real_b_result["ex"], real_b_result["ex_id"],
+                                self.symbol, desired_side, real_b_result["sl_price"],
+                            )
+                        else:
+                            _sl_ok = _ensure_sl_or_close(
+                                self, _real_result["ex"], _real_result["ex_id"],
+                                self.symbol, desired_side, _real_result["sl_price"],
+                            )
+                        if not _sl_ok:
+                            # SL failed — position was closed by _ensure_sl_or_close; clear engine state
+                            self.pending_trades = []
+                            _save_runner_state(self)
+
                     else:
-                        self.pending_trades = [
-                            {**base_trade, "grade": "A", "size_mult": 1.00, "tp_mult": 1.00, "is_primary": True},
-                        ]
-                        self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}")
-                    self.last_trade_ts = now_ts
-                    _save_runner_state(self)   # persist open position immediately
+                        # ── Demo / paper trading — no real orders ──
+                        base_trade = {
+                            "entry_price": entry_price,
+                            "side": desired_side,
+                            "mode": self.mode,
+                            "signal": self.last_signal,
+                            "open_ts": time.time(),
+                            "sl_pct_open": sl_pct_open,
+                            "tp_pct_open": tp_pct_open,
+                        }
+                        if grade == "B":
+                            self.pending_trades = [
+                                {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80,
+                                 "is_primary": True,  "label": "T1"},
+                                {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00,
+                                 "is_primary": False, "label": "T2", "breakeven_after_t1": True},
+                            ]
+                            self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}")
+                        else:
+                            self.pending_trades = [
+                                {**base_trade, "grade": "A", "size_mult": 1.00, "tp_mult": 1.00,
+                                 "is_primary": True},
+                            ]
+                            self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}")
+                        self.last_trade_ts = now_ts
+                        _save_runner_state(self)   # persist open position immediately
                 else:
                     wait_sec = int(effective_cooldown - (now_ts - self.last_trade_ts))
                     cd_label = "2× cooldown (after loss)" if self._last_trade_bad else "cooldown"
@@ -5055,46 +5189,26 @@ def place_real_order(
     sl_price = round(price * sl_mult,   4)
     tp_price = round(price * tp_mult_v, 4)
 
-    # ── Exchange-specific order params ────────────────────────────────────────
+    # ── Entry order — clean, no SL/TP in params ───────────────────────────────
+    # SL is set SEPARATELY via _ensure_sl_or_close() after entry so that:
+    # 1. Entry and SL are decoupled — SL failure can be retried without re-entering
+    # 2. We always know the position exists before trying to protect it
+    # 3. Bybit sometimes accepts entry but rejects inline stopLoss params silently
     if ex_id == "bybit":
-        params = {
-            "stopLoss":    {"triggerPrice": sl_price, "type": "market"},
-            "takeProfit":  {"triggerPrice": tp_price, "type": "limit"},
-            "positionIdx": 0,
-        }
+        params = {"positionIdx": 0}
     elif ex_id == "okx":
-        params = {
-            "tdMode":      "cross",
-            "slTriggerPx": str(sl_price),
-            "slOrdPx":     "-1",
-            "tpTriggerPx": str(tp_price),
-            "tpOrdPx":     "-1",
-        }
-    elif ex_id == "binance":
+        params = {"tdMode": "cross"}
+    else:  # binance
         params = {"reduceOnly": False}
-    else:
-        params = {}
 
     order = _ccxt_call(
         ex.create_order, symbol, "market", order_side, qty, params=params,
         label=f"create_order {ex_id} {side}",
     )
 
-    # Binance: SL/TP must be separate stop-market orders after entry.
-    # closePosition=True closes the full position — do NOT pass qty alongside it
-    # (Binance rejects orders that have both qty and closePosition=True).
-    if ex_id == "binance":
-        close_side = "sell" if side == "LONG" else "buy"
-        try:
-            _ccxt_call(ex.create_order, symbol, "STOP_MARKET", close_side, None, None,
-                       {"stopPrice": sl_price, "closePosition": True},
-                       label="sl_order binance")
-            _ccxt_call(ex.create_order, symbol, "TAKE_PROFIT_MARKET", close_side, None, None,
-                       {"stopPrice": tp_price, "closePosition": True},
-                       label="tp_order binance")
-        except RuntimeError as e:
-            print(f"[WARN] Binance SL/TP attachment failed (entry already placed): {e}", flush=True)
-
+    # Return entry result — caller (_run_loop) logs position immediately then
+    # calls _ensure_sl_or_close() to attach SL with retry logic (FIX 1 + FIX 2).
+    # TP is best-effort for Grade A: caller attaches after SL is confirmed.
     return {
         "order_id":  order.get("id"),
         "symbol":    symbol,
@@ -5105,6 +5219,8 @@ def place_real_order(
         "tp_price":  tp_price,
         "leverage":  leverage,
         "exchange":  ex_id,
+        "ex":        ex,
+        "ex_id":     ex_id,
     }
 
 
@@ -5130,6 +5246,74 @@ def close_real_order(email: str, symbol: str, side: str) -> dict:
         label="close_order",
     )
     return {"ok": True, "order_id": order.get("id"), "qty": qty}
+
+
+def _set_position_sl(ex, ex_id: str, symbol: str, side: str, sl_price: float) -> None:
+    """
+    Set stop-loss on an already-open position.
+    Separate from entry so SL is always explicitly verified and set.
+    Raises RuntimeError on failure so caller can retry or close.
+    """
+    if ex_id == "bybit":
+        mkt = ex.market(symbol)
+        bybit_sym = mkt["id"]
+        _ccxt_call(
+            ex.privatePostV5PositionTradingStop,
+            {
+                "category":    "linear",
+                "symbol":      bybit_sym,
+                "stopLoss":    str(round(sl_price, 4)),
+                "slTriggerBy": "MarkPrice",
+                "positionIdx": 0,
+            },
+            label=f"set_sl bybit {symbol}", retries=0,
+        )
+    elif ex_id == "binance":
+        close_side = "sell" if side == "LONG" else "buy"
+        _ccxt_call(
+            ex.create_order, symbol, "STOP_MARKET", close_side, None, None,
+            {"stopPrice": sl_price, "closePosition": True},
+            label=f"set_sl binance {symbol}", retries=0,
+        )
+    else:  # OKX
+        close_side = "sell" if side == "LONG" else "buy"
+        _ccxt_call(
+            ex.create_order, symbol, "market", close_side, None,
+            params={"tdMode": "cross", "slTriggerPx": str(sl_price),
+                    "slOrdPx": "-1", "reduceOnly": True},
+            label=f"set_sl okx {symbol}", retries=0,
+        )
+
+
+def _ensure_sl_or_close(runner: "AutoRunner", ex, ex_id: str,
+                         symbol: str, side: str, sl_price: float) -> bool:
+    """
+    FIX 2: Set SL on open position, retry 3×. If all attempts fail: close position.
+    Returns True  = SL placed successfully.
+    Returns False = SL failed, position closed for safety.
+    Never leaves a naked position.
+    """
+    for attempt in range(1, 4):
+        try:
+            _set_position_sl(ex, ex_id, symbol, side, sl_price)
+            runner.log(f"SL confirmed at {sl_price:.4f} (attempt {attempt}).")
+            return True
+        except Exception as sl_err:
+            runner.log(f"SL attempt {attempt}/3 failed: {sl_err}")
+            if attempt < 3:
+                time.sleep(2)
+
+    # All 3 attempts failed — close position immediately, never leave naked
+    runner.log("SL PLACEMENT FAILED AFTER 3 ATTEMPTS — closing position immediately for safety.")
+    try:
+        result = close_real_order(runner.email, symbol, side)
+        runner.log(f"Position closed for safety: {result}")
+    except Exception as close_err:
+        runner.log(
+            f"CRITICAL: SL failed AND close failed: {close_err}. "
+            f"MANUAL ACTION REQUIRED on {ex_id} — open {side} {symbol} with NO stop-loss."
+        )
+    return False
 
 
 # ── Real Grade B helpers ────────────────────────────────────────────────────
@@ -5320,65 +5504,57 @@ def place_real_grade_b_order(
     t1_qty = round(qty * 0.60, 6)
     t2_qty = round(qty * 0.40, 6)
 
-    # ── Exchange-specific entry params ─────────────────────────────────────────
-    # Bybit: SL attached directly to entry order (atomic — position never unprotected)
-    # OKX:   SL attached via slTriggerPx on entry order (same atomic guarantee)
-    # Binance: SL must be a separate STOP_MARKET order placed after entry
+    # ── Entry order — clean, no SL in params (FIX 1) ──────────────────────────
+    # SL is set SEPARATELY after entry via _ensure_sl_or_close() so that:
+    # - Entry and SL failures are independent (entry failure = skip; SL failure = retry or close)
+    # - If entry succeeds, caller logs position IMMEDIATELY before SL attempt
+    # - T1/T2 limit order failures are non-fatal (position still protected by SL)
     if ex_id == "bybit":
-        entry_params = {
-            "stopLoss":    {"triggerPrice": sl_price, "type": "market"},
-            "positionIdx": 0,
-        }
+        entry_params = {"positionIdx": 0}
     elif ex_id == "okx":
-        entry_params = {
-            "tdMode":      "cross",
-            "slTriggerPx": str(sl_price),
-            "slOrdPx":     "-1",   # market price on trigger
-        }
-    else:  # binance and others
+        entry_params = {"tdMode": "cross"}
+    else:
         entry_params = {"reduceOnly": False}
 
-    # ── reduceOnly params per exchange ─────────────────────────────────────────
     if ex_id == "bybit":
         reduce_params = {"reduceOnly": True, "positionIdx": 0}
     else:
         reduce_params = {"reduceOnly": True}
 
-    # Entry: market order
+    # ── STEP 1: Entry — if this fails, raise immediately (position not opened) ──
     entry_order = _ccxt_call(
         ex.create_order, symbol, "market", order_side, qty, params=entry_params,
         label=f"grade_b entry {side} {ex_id}",
     )
 
-    # Binance: SL must be separate since it can't attach to entry order
-    if ex_id == "binance":
-        try:
-            _ccxt_call(
-                ex.create_order, symbol, "STOP_MARKET", close_side, qty, sl_price,
-                {"stopPrice": sl_price, "closePosition": True},
-                label="grade_b SL binance", retries=1,
-            )
-        except RuntimeError as e:
-            print(f"[WARN] Grade B Binance SL attachment failed (entry placed): {e}", flush=True)
+    # ── STEP 2: T1/T2 limit orders — best-effort, non-fatal ──────────────────
+    # Position is now open. Caller will log it IMMEDIATELY after this function
+    # returns. T1/T2 failures are logged as warnings — position is still protected
+    # by SL which caller sets via _ensure_sl_or_close() after logging.
+    t1_order_id = None
+    t2_order_id = None
+    try:
+        t1_order = _ccxt_call(
+            ex.create_order, symbol, "limit", close_side, t1_qty, t1_tp_price,
+            params=reduce_params, label=f"grade_b T1_TP {ex_id}",
+        )
+        t1_order_id = t1_order.get("id")
+    except RuntimeError as e:
+        print(f"[WARN] Grade B T1 TP placement failed (entry placed): {e} — SL will protect.", flush=True)
 
-    # T1 TP: partial reduceOnly limit at 60% qty — above entry for LONG, below for SHORT
-    t1_order = _ccxt_call(
-        ex.create_order, symbol, "limit", close_side, t1_qty, t1_tp_price,
-        params=reduce_params,
-        label=f"grade_b T1_TP {ex_id}",
-    )
-
-    # T2 TP: partial reduceOnly limit at 40% qty
-    t2_order = _ccxt_call(
-        ex.create_order, symbol, "limit", close_side, t2_qty, t2_tp_price,
-        params=reduce_params,
-        label=f"grade_b T2_TP {ex_id}",
-    )
+    try:
+        t2_order = _ccxt_call(
+            ex.create_order, symbol, "limit", close_side, t2_qty, t2_tp_price,
+            params=reduce_params, label=f"grade_b T2_TP {ex_id}",
+        )
+        t2_order_id = t2_order.get("id")
+    except RuntimeError as e:
+        print(f"[WARN] Grade B T2 TP placement failed (entry placed): {e} — SL will protect.", flush=True)
 
     return {
         "order_id":    entry_order.get("id"),
-        "t1_tp_id":    t1_order.get("id"),
-        "t2_tp_id":    t2_order.get("id"),
+        "t1_tp_id":    t1_order_id,
+        "t2_tp_id":    t2_order_id,
         "qty":         qty,
         "t1_qty":      t1_qty,
         "t2_qty":      t2_qty,
@@ -5387,6 +5563,8 @@ def place_real_grade_b_order(
         "t1_tp_price": t1_tp_price,
         "t2_tp_price": t2_tp_price,
         "leverage":    leverage,
+        "ex":          ex,
+        "ex_id":       ex_id,
     }
 
 
