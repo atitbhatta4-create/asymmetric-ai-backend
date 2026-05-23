@@ -4763,11 +4763,14 @@ class AutoRunner:
             ex_id  = (row.get("exchange") or "bybit").lower()
             positions = _ccxt_call(ex.fetch_positions, [self.symbol],
                                    label=f"reconcile fetch_positions {self.symbol}", retries=0)
-            live_pos = next(
-                (p for p in positions
-                 if p["symbol"] == self.symbol and abs(float(p.get("contracts") or 0)) > 0),
-                None,
-            )
+            # ccxt returns positions with unified symbol (e.g. "NEAR/USDT:USDT") but
+            # self.symbol is the native exchange symbol (e.g. "NEARUSDT"). Match both.
+            _sym_uc = self.symbol.upper()
+            def _pos_match(p: dict) -> bool:
+                unified = (p.get("symbol") or "").upper()
+                native  = ((p.get("info") or {}).get("symbol") or "").upper()
+                return (unified == _sym_uc or native == _sym_uc) and abs(float(p.get("contracts") or 0)) > 0
+            live_pos = next((p for p in positions if _pos_match(p)), None)
 
             if live_pos and not self.pending_trades:
                 # Position exists on exchange but engine is blind — recover it
@@ -5369,9 +5372,16 @@ def close_real_order(email: str, symbol: str, side: str) -> dict:
     ex = _make_ccxt_exchange(row)
     close_side = "sell" if side == "LONG" else "buy"
 
-    # Fetch current position size
+    # Fetch current position size — match unified OR native exchange symbol
     positions = _ccxt_call(ex.fetch_positions, [symbol], label="fetch_positions close")
-    pos = next((p for p in positions if p["symbol"] == symbol and abs(float(p["contracts"] or 0)) > 0), None)
+    _sym_uc = symbol.upper()
+    pos = next(
+        (p for p in positions
+         if ((p.get("symbol") or "").upper() == _sym_uc or
+             ((p.get("info") or {}).get("symbol") or "").upper() == _sym_uc)
+         and abs(float(p.get("contracts") or 0)) > 0),
+        None,
+    )
     if not pos:
         return {"ok": False, "note": "No open position found"}
 
