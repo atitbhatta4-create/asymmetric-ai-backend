@@ -3790,6 +3790,8 @@ class AutoRunner:
         self.market_regime: str = "-"     # Phase 4: TRENDING / MARGINAL / CHOPPY / VOLATILE
         self._last_trade_bad: bool = False
         self._last_holding_log_ts: float = 0.0   # throttle repeated holding logs
+        self._last_drawdown_log_ts: float = 0.0  # throttle repeated drawdown tier logs
+        self._last_dd_tier: int = 0              # 0=none 1=65% 2=40% 3=25% 4=stop
         self.session_start_equity: float = get_equity(email)
         # Peak must be the highest equity ever seen — read from user_state which survives
         # AI stop/restart (ai_runner_state is deleted on stop, user_state is permanent).
@@ -4213,21 +4215,40 @@ class AutoRunner:
             update_peak_ath(self.email, self.peak_equity, self.peak_equity)  # persist immediately so restart can't lose the high
         drawdown_pct = (self.peak_equity - equity_before) / self.peak_equity if self.peak_equity > 0 else 0.0
         dd_size_mult = 1.0
+
+        # Determine which drawdown tier we are in (0 = no drawdown).
+        # Used for throttled logging — only log when tier changes or every 30 min.
+        _dd_now = time.time()
+        _dd_log_interval = 1800  # 30 minutes between repeated drawdown reminders
+
         if drawdown_pct >= 0.15:
-            # -15%+ from peak: stop trading, protect what's left
+            # -15%+ from peak: stop trading, protect what's left — always log this
             self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak — STOPPING to protect capital.")
             self.blocked_reason = "MAX_DRAWDOWN"
             self.stop_event.set()
             return equity_before
         elif drawdown_pct >= 0.10:
             dd_size_mult = 0.25   # -10%: quarter size (recovery mode)
-            self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at 25%")
+            _dd_tier = 3
         elif drawdown_pct >= 0.07:
             dd_size_mult = 0.40   # -7%: 40% size
-            self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at 40%")
+            _dd_tier = 2
         elif drawdown_pct >= 0.04:
             dd_size_mult = 0.65   # -4%: 65% size
-            self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at 65%")
+            _dd_tier = 1
+        else:
+            _dd_tier = 0
+
+        # Log only when: tier just changed (e.g. worsened from 40% → 25% size),
+        # OR it has been 30+ minutes since the last drawdown log.
+        # This prevents the log from filling with one identical line every 15 seconds.
+        _tier_changed = (_dd_tier != self._last_dd_tier)
+        _dd_due = (_dd_now - self._last_drawdown_log_ts) >= _dd_log_interval
+        if _dd_tier > 0 and (_tier_changed or _dd_due):
+            _labels = {1: "65%", 2: "40%", 3: "25%"}
+            self.log(f"Drawdown {drawdown_pct*100:.1f}% from peak → size at {_labels[_dd_tier]}")
+            self._last_drawdown_log_ts = _dd_now
+        self._last_dd_tier = _dd_tier
 
         # Apply all size multipliers
         effective_size = c["size"] * size_mult * vol_size_mult * dd_size_mult
