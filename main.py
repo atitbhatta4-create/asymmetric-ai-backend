@@ -5442,35 +5442,57 @@ def _ensure_sl_or_close(runner: "AutoRunner", ex, ex_id: str,
 def _get_available_usdt(ex, ex_id: str) -> float:
     """
     Return the USDT balance actually available for new orders.
-    For Bybit UNIFIED: reads availableToWithdraw from raw API response.
+    For Bybit UNIFIED: reads availableBalance (the correct field for new orders).
+      - availableBalance = walletBalance - orderIM - positionIM (what you can trade with)
+      - availableToWithdraw is WRONG — it is 0 when below Bybit's withdrawal minimum,
+        even when the full balance is free to trade.
     For OKX/Binance: uses ccxt free field.
-    Using walletBalance instead causes Bybit error 110007 when unrealized
-    PnL or locked margin reduces the actual free amount.
     """
     try:
         params = {"accountType": "UNIFIED"} if ex_id == "bybit" else {}
         bal = _ccxt_call(ex.fetch_balance, params=params, label=f"fetch_available_balance {ex_id}", retries=0)
 
         if ex_id == "bybit":
-            # Read availableToWithdraw directly from Bybit raw response
             try:
                 accounts = (bal.get("info") or {}).get("result", {}).get("list", [])
                 for acc in accounts:
                     coins = acc.get("coin", [])
                     for coin in coins:
                         if coin.get("coin") == "USDT":
-                            atw = float(coin.get("availableToWithdraw") or coin.get("availableToBorrow") or 0)
-                            if atw > 0:
-                                print(f"[balance] Bybit availableToWithdraw: ${atw:.2f}", flush=True)
-                                return atw
-            except Exception:
-                pass  # fall through to ccxt free
+                            # Log all fields so we can diagnose any future issue
+                            wallet_bal  = float(coin.get("walletBalance")       or 0)
+                            avail_bal   = float(coin.get("availableBalance")     or 0)
+                            avail_wtdrw = float(coin.get("availableToWithdraw")  or 0)
+                            order_im    = float(coin.get("totalOrderIM")         or 0)
+                            pos_im      = float(coin.get("totalPositionIM")      or 0)
+                            print(
+                                f"[balance-debug] Bybit USDT | walletBalance=${wallet_bal:.4f} "
+                                f"availableBalance=${avail_bal:.4f} "
+                                f"availableToWithdraw=${avail_wtdrw:.4f} "
+                                f"orderIM=${order_im:.4f} posIM=${pos_im:.4f} "
+                                f"→ using for margin check: ${avail_bal:.4f}",
+                                flush=True,
+                            )
+                            # Use availableBalance — the correct field for new order margin
+                            if avail_bal > 0:
+                                return avail_bal
+                            # If availableBalance is also 0, fall back to walletBalance
+                            # (handles edge case where Bybit returns 0 due to rounding/timing)
+                            if wallet_bal > 0:
+                                print(
+                                    f"[balance-debug] availableBalance=0 but walletBalance=${wallet_bal:.4f} "
+                                    f"— using walletBalance as fallback",
+                                    flush=True,
+                                )
+                                return wallet_bal
+            except Exception as _be:
+                print(f"[balance-debug] Bybit raw parse failed: {_be}", flush=True)
 
         # ccxt free field (OKX, Binance, and Bybit fallback)
         free = float((bal.get("USDT") or {}).get("free") or 0)
         if free <= 0:
             free = float((bal.get("free") or {}).get("USDT") or 0)
-        print(f"[balance] {ex_id} free USDT: ${free:.2f}", flush=True)
+        print(f"[balance-debug] {ex_id} ccxt free USDT: ${free:.4f}", flush=True)
         return free
     except Exception as e:
         print(f"[WARN] _get_available_usdt failed ({ex_id}): {e}", flush=True)
