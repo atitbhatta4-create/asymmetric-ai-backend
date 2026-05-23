@@ -300,8 +300,8 @@ async def global_rate_limit(request: Request, call_next):
     if path in _GLOBAL_RL_SKIP:
         return await call_next(request)
 
-    # Skip price/ticker endpoints — they hit the exchange cache, not our DB
-    if path.startswith("/price/") or path.startswith("/market/ticker/"):
+    # Skip price/ticker/symbols endpoints — they hit the exchange cache, not our DB
+    if path.startswith("/price/") or path.startswith("/market/ticker/") or path == "/market/symbols":
         return await call_next(request)
 
     # Identify caller: prefer JWT sub, fall back to IP
@@ -2043,8 +2043,10 @@ async def get_price(symbol: str, exchange: Optional[str] = Query(default=None)):
 
 
 @app.get("/market/ticker/{symbol}")
-async def market_ticker(symbol: str):
-    """24h stats for a symbol: price, change%, high, low, volume in USDT."""
+async def market_ticker(symbol: str, exchange: Optional[str] = Query(default=None)):
+    """24h stats for a symbol: price, change%, high, low, volume in USDT.
+    exchange param is accepted for labelling — data always sourced from OKX because
+    Binance and Bybit geo-block Render US servers."""
     inst = to_okx_inst(symbol.upper().strip())
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(
@@ -2065,6 +2067,7 @@ async def market_ticker(symbol: str):
         "high24h": high, "low24h": low,
         "change24h": round(chg, 3),
         "volume24h": round(vol, 2),
+        "exchange": (exchange or "okx").lower(),
     }
 
 
@@ -2135,6 +2138,94 @@ async def market_trades(symbol: str, limit: int = Query(default=20, ge=5, le=50)
         for t in rows
     ]
     return {"symbol": symbol.upper().strip(), "trades": trades}
+
+
+# ── Symbol list cache (5-min TTL) ─────────────────────────────────────────────
+_symbols_cache: Dict[str, Any] = {}  # key = exchange, value = {"ts": float, "symbols": list}
+_SYMBOLS_TTL = 300  # 5 minutes
+
+async def _fetch_symbols_for_exchange(exchange: str) -> List[str]:
+    """Return USDT perpetual symbols for the given exchange.
+    Tries the native exchange public API first; falls back to OKX if geo-blocked."""
+    ex = exchange.lower()
+    now = time.time()
+    cached = _symbols_cache.get(ex)
+    if cached and (now - cached["ts"]) < _SYMBOLS_TTL:
+        return cached["symbols"]
+
+    symbols: List[str] = []
+
+    async with httpx.AsyncClient(timeout=12) as client:
+        if ex == "binance":
+            try:
+                r = await client.get(
+                    "https://fapi.binance.com/fapi/v1/exchangeInfo",
+                    headers={"accept": "application/json"},
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    symbols = sorted([
+                        s["symbol"] for s in (data.get("symbols") or [])
+                        if s.get("quoteAsset") == "USDT"
+                        and s.get("status") == "TRADING"
+                        and s.get("contractType") == "PERPETUAL"
+                    ])
+            except Exception:
+                pass
+
+        elif ex == "bybit":
+            try:
+                r = await client.get(
+                    f"{BYBIT_BASE}/v5/market/instruments-info",
+                    params={"category": "linear", "limit": 1000},
+                    headers={"accept": "application/json"},
+                )
+                if r.status_code == 200:
+                    items = ((r.json() or {}).get("result") or {}).get("list") or []
+                    symbols = sorted([
+                        i["symbol"] for i in items
+                        if i.get("quoteCoin") == "USDT"
+                        and i.get("status") == "Trading"
+                        and i.get("symbol", "").endswith("USDT")
+                    ])
+            except Exception:
+                pass
+
+        if not symbols:
+            # Fallback: OKX USDT swap instruments (accessible from Render)
+            try:
+                r = await client.get(
+                    f"{OKX_BASE}/api/v5/public/instruments",
+                    params={"instType": "SWAP"},
+                    headers={"accept": "application/json"},
+                )
+                if r.status_code == 200:
+                    items = (r.json() or {}).get("data") or []
+                    # Convert OKX format "BTC-USDT-SWAP" → "BTCUSDT"
+                    symbols = sorted([
+                        i["instId"].replace("-USDT-SWAP", "USDT")
+                        for i in items
+                        if i.get("instId", "").endswith("-USDT-SWAP")
+                        and i.get("state") == "live"
+                    ])
+            except Exception:
+                pass
+
+    _symbols_cache[ex] = {"ts": now, "symbols": symbols}
+    return symbols
+
+
+@app.get("/market/symbols")
+async def market_symbols(exchange: str = Query(default="okx")):
+    """Return all tradeable USDT perpetual symbols for the given exchange.
+    Used by the frontend market search to show the correct coin list.
+    Falls back to OKX symbol list if the exchange's API is geo-blocked."""
+    syms = await _fetch_symbols_for_exchange(exchange.lower())
+    return {
+        "exchange": exchange.lower(),
+        "count": len(syms),
+        "symbols": syms,
+    }
 
 
 @app.get("/klines/{symbol}")
