@@ -2140,15 +2140,29 @@ async def market_trades(symbol: str, limit: int = Query(default=20, ge=5, le=50)
     return {"symbol": symbol.upper().strip(), "trades": trades}
 
 
-# ── Symbol list cache (5-min TTL) ─────────────────────────────────────────────
-_symbols_cache: Dict[str, Any] = {}  # key = exchange, value = {"ts": float, "symbols": list}
-_SYMBOLS_TTL = 300  # 5 minutes
+# ── Symbol list cache ─────────────────────────────────────────────────────────
+# Stores the full USDT perpetual coin list per exchange so the market search
+# dropdown shows the correct coins for the user's connected exchange.
+# Refreshed every 5 minutes — symbol lists rarely change more often than that.
+_symbols_cache: Dict[str, Any] = {}  # key = exchange name, value = {"ts": float, "symbols": list}
+_SYMBOLS_TTL = 300  # 5 minutes in seconds
 
 async def _fetch_symbols_for_exchange(exchange: str) -> List[str]:
-    """Return USDT perpetual symbols for the given exchange.
-    Tries the native exchange public API first; falls back to OKX if geo-blocked."""
+    """
+    Return all active USDT perpetual trading pairs for the given exchange.
+
+    Why OKX is the fallback:
+        Render deploys on US servers. Binance and Bybit geo-block US IPs on
+        some endpoints. OKX does not. So we always try the native exchange API
+        first, and silently fall back to OKX's list if it fails.
+        Coins are ~95% the same across all three exchanges.
+
+    Returns a sorted list of symbols in plain format e.g. ["BTCUSDT", "ETHUSDT"]
+    """
     ex = exchange.lower()
     now = time.time()
+
+    # Return cached list if it's still fresh (within 5 minutes)
     cached = _symbols_cache.get(ex)
     if cached and (now - cached["ts"]) < _SYMBOLS_TTL:
         return cached["symbols"]
@@ -2156,6 +2170,10 @@ async def _fetch_symbols_for_exchange(exchange: str) -> List[str]:
     symbols: List[str] = []
 
     async with httpx.AsyncClient(timeout=12) as client:
+
+        # ── Binance Futures ────────────────────────────────────────────────────
+        # exchangeInfo returns every pair with its type and status.
+        # We filter to: USDT-quoted + PERPETUAL contract + currently TRADING.
         if ex == "binance":
             try:
                 r = await client.get(
@@ -2166,13 +2184,15 @@ async def _fetch_symbols_for_exchange(exchange: str) -> List[str]:
                     data = r.json()
                     symbols = sorted([
                         s["symbol"] for s in (data.get("symbols") or [])
-                        if s.get("quoteAsset") == "USDT"
-                        and s.get("status") == "TRADING"
-                        and s.get("contractType") == "PERPETUAL"
+                        if s.get("quoteAsset") == "USDT"        # USDT pairs only
+                        and s.get("status") == "TRADING"        # actively trading
+                        and s.get("contractType") == "PERPETUAL" # perps only, not delivery
                     ])
             except Exception:
-                pass
+                pass  # geo-block or timeout — fall through to OKX fallback below
 
+        # ── Bybit Linear Perpetuals ────────────────────────────────────────────
+        # category=linear covers USDT-margined perps (not inverse BTC-margined).
         elif ex == "bybit":
             try:
                 r = await client.get(
@@ -2184,15 +2204,18 @@ async def _fetch_symbols_for_exchange(exchange: str) -> List[str]:
                     items = ((r.json() or {}).get("result") or {}).get("list") or []
                     symbols = sorted([
                         i["symbol"] for i in items
-                        if i.get("quoteCoin") == "USDT"
-                        and i.get("status") == "Trading"
-                        and i.get("symbol", "").endswith("USDT")
+                        if i.get("quoteCoin") == "USDT"         # USDT pairs only
+                        and i.get("status") == "Trading"        # actively trading
+                        and i.get("symbol", "").endswith("USDT") # double-check suffix
                     ])
             except Exception:
-                pass
+                pass  # fall through to OKX fallback below
 
+        # ── OKX fallback (or primary if exchange == "okx") ────────────────────
+        # instType=SWAP covers perpetual contracts on OKX.
+        # OKX uses "BTC-USDT-SWAP" format — we convert to plain "BTCUSDT" so all
+        # three exchanges return symbols in the same format to the frontend.
         if not symbols:
-            # Fallback: OKX USDT swap instruments (accessible from Render)
             try:
                 r = await client.get(
                     f"{OKX_BASE}/api/v5/public/instruments",
@@ -2201,9 +2224,8 @@ async def _fetch_symbols_for_exchange(exchange: str) -> List[str]:
                 )
                 if r.status_code == 200:
                     items = (r.json() or {}).get("data") or []
-                    # Convert OKX format "BTC-USDT-SWAP" → "BTCUSDT"
                     symbols = sorted([
-                        i["instId"].replace("-USDT-SWAP", "USDT")
+                        i["instId"].replace("-USDT-SWAP", "USDT")  # "BTC-USDT-SWAP" → "BTCUSDT"
                         for i in items
                         if i.get("instId", "").endswith("-USDT-SWAP")
                         and i.get("state") == "live"
@@ -2211,15 +2233,28 @@ async def _fetch_symbols_for_exchange(exchange: str) -> List[str]:
             except Exception:
                 pass
 
+    # Store the result in cache with the current timestamp
     _symbols_cache[ex] = {"ts": now, "symbols": symbols}
     return symbols
 
 
 @app.get("/market/symbols")
 async def market_symbols(exchange: str = Query(default="okx")):
-    """Return all tradeable USDT perpetual symbols for the given exchange.
-    Used by the frontend market search to show the correct coin list.
-    Falls back to OKX symbol list if the exchange's API is geo-blocked."""
+    """
+    Return all tradeable USDT perpetual symbols for the given exchange.
+
+    The frontend market search calls this endpoint on page load to populate
+    the coin search dropdown. Without this, the search would only show a
+    hardcoded list instead of the actual coins available on the user's exchange.
+
+    Usage:
+        GET /market/symbols?exchange=binance   → Binance USDT perp list
+        GET /market/symbols?exchange=bybit     → Bybit USDT linear list
+        GET /market/symbols?exchange=okx       → OKX USDT swap list (default)
+
+    Response:
+        { "exchange": "binance", "count": 320, "symbols": ["BTCUSDT", ...] }
+    """
     syms = await _fetch_symbols_for_exchange(exchange.lower())
     return {
         "exchange": exchange.lower(),
@@ -3779,7 +3814,14 @@ class AutoRunner:
         self.trades_today, self.bad_trades_today = self._load_today_stats()
         # Restore live state (strictness, open positions, drawdown level) from last session
         self._restore_live_state()
-        # Startup audit log — always visible so floor bugs can be traced
+        # Startup audit log — printed to the AI log every time the engine starts.
+        # Shows the exact peak and floor values the bot is using so any floor bug
+        # is immediately visible without digging through DB records.
+        # Format: "STARTUP: DB peak=$X | current equity=$Y | final peak=$Z | floor=$W"
+        #   DB peak       = what user_state.peak_equity had before this session
+        #   current equity = live wallet balance right now
+        #   final peak     = the value actually used (max of DB peak + ai_runner_state peak)
+        #   floor          = 85% of final peak — bot will stop if equity drops below this
         try:
             _cur_eq = get_equity(email)
             self.log(
@@ -3843,11 +3885,17 @@ class AutoRunner:
                 self.floor_equity = self.peak_equity * 0.85
             if row.get("floor_equity") and float(row["floor_equity"]) > 0:
                 self.floor_equity = max(self.floor_equity, float(row["floor_equity"]))
-            # HARD FLOOR FIX: Persist the corrected peak back to user_state NOW.
-            # __init__ calls update_peak_ath() BEFORE _restore_live_state() runs, so the
-            # higher peak from ai_runner_state was never written to user_state. When
-            # ai_runner_state is deleted on stop, that peak was lost. Writing it here ensures
-            # user_state always holds the true all-time peak — even if ai_runner_state is wiped.
+            # ── Hard floor persistence fix ─────────────────────────────────────
+            # Problem: __init__ calls update_peak_ath() BEFORE calling _restore_live_state().
+            # That means the early write saves the pre-restore peak (possibly lower than the
+            # true peak stored in ai_runner_state from the previous session).
+            # When the engine stops, _clear_runner_state() deletes ai_runner_state entirely.
+            # Next restart: user_state.peak_equity has the wrong (lower) peak → floor = 85%
+            # of current equity instead of 85% of the real all-time peak.
+            #
+            # Fix: call update_peak_ath() HERE, after we have already elevated self.peak_equity
+            # from ai_runner_state. This writes the correct peak to user_state so it survives
+            # even after ai_runner_state is deleted on stop.
             update_peak_ath(self.email, self.peak_equity, self.peak_equity)
             # Restore original session start equity — keeps P&L% and risk calcs relative
             # to the real session start, not the redeploy time
@@ -4854,13 +4902,20 @@ class AutoRunner:
             ex_id  = (row.get("exchange") or "bybit").lower()
             positions = _ccxt_call(ex.fetch_positions, [self.symbol],
                                    label=f"reconcile fetch_positions {self.symbol}", retries=0)
-            # ccxt returns positions with unified symbol (e.g. "NEAR/USDT:USDT") but
-            # self.symbol is the native exchange symbol (e.g. "NEARUSDT"). Match both.
+
+            # Symbol format mismatch guard:
+            # ccxt normalises position symbols to its unified format (e.g. "NEAR/USDT:USDT")
+            # but self.symbol is stored in the native exchange format (e.g. "NEARUSDT").
+            # A plain == compare always fails → reconcile incorrectly sees "no position"
+            # and wipes the engine state on every restart. We check BOTH fields:
+            #   p["symbol"]          → ccxt unified format  ("NEAR/USDT:USDT")
+            #   p["info"]["symbol"]  → native exchange format ("NEARUSDT")
             _sym_uc = self.symbol.upper()
             def _pos_match(p: dict) -> bool:
                 unified = (p.get("symbol") or "").upper()
                 native  = ((p.get("info") or {}).get("symbol") or "").upper()
-                return (unified == _sym_uc or native == _sym_uc) and abs(float(p.get("contracts") or 0)) > 0
+                has_size = abs(float(p.get("contracts") or 0)) > 0
+                return has_size and (unified == _sym_uc or native == _sym_uc)
             live_pos = next((p for p in positions if _pos_match(p)), None)
 
             if live_pos and not self.pending_trades:
@@ -5463,7 +5518,11 @@ def close_real_order(email: str, symbol: str, side: str) -> dict:
     ex = _make_ccxt_exchange(row)
     close_side = "sell" if side == "LONG" else "buy"
 
-    # Fetch current position size — match unified OR native exchange symbol
+    # Fetch the live position so we know the exact contract size to close.
+    # Must match on BOTH ccxt unified symbol ("NEAR/USDT:USDT") AND native exchange
+    # symbol ("NEARUSDT") — same issue as in _reconcile_exchange_positions.
+    # A plain == compare against the native symbol always fails and makes the
+    # close think there is no position, leaving it open on the exchange.
     positions = _ccxt_call(ex.fetch_positions, [symbol], label="fetch_positions close")
     _sym_uc = symbol.upper()
     pos = next(
