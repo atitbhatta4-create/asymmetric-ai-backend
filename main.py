@@ -3688,6 +3688,15 @@ class AutoRunner:
         self.trades_today, self.bad_trades_today = self._load_today_stats()
         # Restore live state (strictness, open positions, drawdown level) from last session
         self._restore_live_state()
+        # Startup audit log — always visible so floor bugs can be traced
+        try:
+            _cur_eq = get_equity(email)
+            self.log(
+                f"STARTUP: DB peak=${_saved_peak:.2f} | current equity=${_cur_eq:.2f} | "
+                f"final peak=${self.peak_equity:.2f} | floor=${self.floor_equity:.2f}"
+            )
+        except Exception:
+            pass
 
     def _restore_live_state(self) -> None:
         """Load adaptive_strictness, pending_trades, peak/floor equity, and
@@ -3743,6 +3752,12 @@ class AutoRunner:
                 self.floor_equity = self.peak_equity * 0.85
             if row.get("floor_equity") and float(row["floor_equity"]) > 0:
                 self.floor_equity = max(self.floor_equity, float(row["floor_equity"]))
+            # HARD FLOOR FIX: Persist the corrected peak back to user_state NOW.
+            # __init__ calls update_peak_ath() BEFORE _restore_live_state() runs, so the
+            # higher peak from ai_runner_state was never written to user_state. When
+            # ai_runner_state is deleted on stop, that peak was lost. Writing it here ensures
+            # user_state always holds the true all-time peak — even if ai_runner_state is wiped.
+            update_peak_ath(self.email, self.peak_equity, self.peak_equity)
             # Restore original session start equity — keeps P&L% and risk calcs relative
             # to the real session start, not the redeploy time
             if row.get("session_start_equity") and float(row["session_start_equity"]) > 0:
