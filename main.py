@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import secrets
 import time
@@ -539,6 +540,14 @@ def init_db() -> None:
             cur.execute("ALTER TABLE user_state ADD COLUMN peak_equity REAL DEFAULT 0")
         if not column_exists(conn, "user_state", "all_time_high"):
             cur.execute("ALTER TABLE user_state ADD COLUMN all_time_high REAL DEFAULT 0")
+        # Floor reset tracking — records initial starting capital and reset history for Situation 1/2/3 logic
+        if not column_exists(conn, "user_state", "starting_capital"):
+            cur.execute("ALTER TABLE user_state ADD COLUMN starting_capital REAL DEFAULT 0")
+        if not column_exists(conn, "user_state", "floor_reset_count"):
+            cur.execute("ALTER TABLE user_state ADD COLUMN floor_reset_count INTEGER DEFAULT 0")
+        if not column_exists(conn, "user_state", "floor_reset_at"):
+            # JSON array of Unix timestamps — used to enforce 7-day cooldown after 3 resets in 30 days
+            cur.execute("ALTER TABLE user_state ADD COLUMN floor_reset_at TEXT DEFAULT '[]'")
         # Live runner state — persists adaptive_strictness, open positions, etc. across redeploys
         for col, coltype, defval in [
             ("adaptive_strictness",  "REAL",    "1.0"),
@@ -3742,6 +3751,14 @@ class AutoStartIn(BaseModel):
         return _validate_symbol(v)
 
 
+class FloorResetIn(BaseModel):
+    # confirm=False → dry-run (returns situation/status without applying any changes)
+    # confirm=True  → apply the reset
+    confirm: bool = False
+    # Must be exactly "CONFIRM" (case-insensitive) for Situation 2 when confirm=True
+    typed_confirm: str = ""
+
+
 class _MidCandleSkip(Exception):
     """Raised inside _run_mid_candle_monitor to break out of nested blocks cleanly."""
 
@@ -6362,6 +6379,26 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         if _pre_bal is not None:
             set_equity(email, _pre_bal)
 
+    # Record starting_capital on the very first AI start — never overwritten after initial set.
+    # This anchors the Situation 1/2/3 logic in the floor-reset endpoint:
+    #   Situation 1 = equity >= starting_capital (profitable overall — easy reset)
+    #   Situation 2 = equity in [50%, 100%) of starting_capital (losses — must type CONFIRM)
+    #   Situation 3 = equity < 50% of starting_capital (heavy loss — contact support)
+    try:
+        with db_conn() as conn:
+            _sc_cur = conn.cursor()
+            _sc_cur.execute("SELECT starting_capital FROM user_state WHERE email=%s", (email,))
+            _sc_row = _sc_cur.fetchone()
+            if _sc_row and float(_sc_row.get("starting_capital") or 0) == 0:
+                _sc_equity = get_equity(email)
+                _sc_cur.execute(
+                    "UPDATE user_state SET starting_capital=%s WHERE email=%s",
+                    (_sc_equity, email),
+                )
+                conn.commit()
+    except Exception as _sce:
+        print(f"[auto-start] starting_capital set failed: {_sce}")
+
     with AUTO_LOCK:
         old = AUTO_RUNNERS.get(email)
         if old:
@@ -6449,6 +6486,206 @@ def auto_reset_strictness(user=Depends(require_user)):
     except Exception as e:
         print(f"[reset-strictness] DB patch failed: {e}")
     return {"ok": True, "adaptive_strictness": 1.0, "message": "Strictness reset to 1.0x"}
+
+
+@app.post("/auto/reset-floor")
+def auto_reset_floor(payload: FloorResetIn, user=Depends(require_user)):
+    """
+    Hard-floor reset endpoint.
+
+    Call with confirm=False first to get a dry-run status (situation, cooldown, current equity).
+    Call with confirm=True to actually apply the reset.
+
+    Situation 1 — equity >= starting_capital: one-click reset, no extra confirmation.
+    Situation 2 — equity in [50%, 100%) of starting_capital: must type 'CONFIRM'.
+    Situation 3 — equity < 50% of starting_capital: blocked entirely, contact support.
+
+    Cooldown: 3 or more resets within the last 30 days → 7-day cooldown from the most recent reset.
+    After reset: peak resets to current equity, floor = 85% of that, engine is NOT auto-restarted
+    (user clicks Start again with their preferred settings).
+    """
+    email = user["email"]
+    now_ts = time.time()
+    now_str = now_dubai().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── Read current user_state from DB ─────────────────────────────────────
+    with db_conn() as conn:
+        _rc = conn.cursor()
+        _rc.execute(
+            "SELECT peak_equity, all_time_high, starting_capital, "
+            "floor_reset_count, floor_reset_at FROM user_state WHERE email=%s",
+            (email,),
+        )
+        _row = _rc.fetchone()
+
+    if not _row:
+        raise HTTPException(status_code=400, detail="No user state found. Start the AI first.")
+
+    # Live balance — real exchange for real accounts, DB value for demo
+    current_equity = get_equity(email)
+    starting_capital = float(_row.get("starting_capital") or 0)
+    current_ath = float(_row.get("all_time_high") or 0)
+
+    # Parse the JSON list of prior reset timestamps
+    try:
+        reset_timestamps: List[float] = json.loads(_row.get("floor_reset_at") or "[]")
+    except Exception:
+        reset_timestamps = []
+
+    # Keep only resets from the last 30 days for cooldown calculation
+    thirty_days_ago = now_ts - (30 * 24 * 3600)
+    recent_resets = [t for t in reset_timestamps if t > thirty_days_ago]
+
+    # ── Cooldown check — 3+ resets in 30 days triggers a 7-day lock ────────
+    cooldown_remaining_sec = 0
+    if len(recent_resets) >= 3:
+        most_recent = max(recent_resets)
+        cooldown_until = most_recent + (7 * 24 * 3600)
+        if now_ts < cooldown_until:
+            cooldown_remaining_sec = int(cooldown_until - now_ts)
+
+    # ── Determine situation ──────────────────────────────────────────────────
+    # starting_capital = 0 means the AI was never started (no record), treat as Situation 1.
+    if starting_capital <= 0:
+        situation = 1
+    elif current_equity >= starting_capital:
+        # Equity is at or above what the user started with — profitable overall
+        situation = 1
+    elif current_equity >= starting_capital * 0.50:
+        # Lost money but more than half remains — recoverable with caution
+        situation = 2
+    else:
+        # Lost more than half of starting capital — blocked, manual review needed
+        situation = 3
+
+    # Build dry-run response — always return this info so frontend can show the dialog
+    status = {
+        "ok": True,
+        "situation": situation,
+        "current_equity": round(current_equity, 2),
+        "starting_capital": round(starting_capital, 2),
+        "new_peak_if_reset": round(current_equity, 2),
+        "new_floor_if_reset": round(current_equity * 0.85, 2),
+        "resets_in_30d": len(recent_resets),
+        "cooldown_remaining_sec": cooldown_remaining_sec,
+        "reset_applied": False,
+        "message": "",
+    }
+
+    # ── Dry-run: return status without applying ──────────────────────────────
+    if not payload.confirm:
+        if situation == 1:
+            status["message"] = (
+                f"Situation 1 — your equity (${current_equity:.2f}) is at or above your "
+                f"starting capital (${starting_capital:.2f}). "
+                f"One-click reset available."
+            )
+        elif situation == 2:
+            status["message"] = (
+                f"Situation 2 — your equity (${current_equity:.2f}) is below your starting "
+                f"capital (${starting_capital:.2f}). You must type 'CONFIRM' to proceed."
+            )
+        else:
+            status["message"] = (
+                f"Situation 3 — your equity (${current_equity:.2f}) is below 50% of your "
+                f"starting capital (${starting_capital:.2f}). Reset is blocked. "
+                f"Please contact support."
+            )
+        return status
+
+    # ── Validation before applying ───────────────────────────────────────────
+    if cooldown_remaining_sec > 0:
+        h = cooldown_remaining_sec // 3600
+        m = (cooldown_remaining_sec % 3600) // 60
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Reset cooldown — you have reset the floor 3 times in 30 days. "
+                f"Cooldown expires in {h}h {m}m. "
+                f"This protects your account from repeatedly overriding risk protection."
+            ),
+        )
+
+    if situation == 3:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Floor reset blocked — your equity (${current_equity:.2f}) is below 50% of "
+                f"your starting capital (${starting_capital:.2f}). "
+                f"Please contact support to review your account."
+            ),
+        )
+
+    if situation == 2 and payload.typed_confirm.strip().upper() != "CONFIRM":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Your equity (${current_equity:.2f}) is below your starting capital "
+                f"(${starting_capital:.2f}). Please type 'CONFIRM' to accept this loss "
+                f"and reset the safety floor."
+            ),
+        )
+
+    # ── Apply the reset ──────────────────────────────────────────────────────
+    new_peak = current_equity
+    new_floor = round(current_equity * 0.85, 2)
+    # all_time_high never goes down — only update if new_peak exceeds it
+    new_ath = max(current_ath, new_peak)
+    updated_resets = recent_resets + [now_ts]  # add this reset to history
+
+    with db_conn() as conn:
+        _ac = conn.cursor()
+        _ac.execute(
+            "UPDATE user_state SET "
+            "peak_equity=%s, all_time_high=%s, "
+            "floor_reset_count=%s, floor_reset_at=%s "
+            "WHERE email=%s",
+            (
+                new_peak, new_ath,
+                len(updated_resets),
+                json.dumps(updated_resets),
+                email,
+            ),
+        )
+        # Log the reset permanently in ai_logs so it appears in the user's AI log history
+        sid = get_session_id(email)
+        _ac.execute(
+            "INSERT INTO ai_logs(email, session_id, t, msg) VALUES(%s, %s, %s, %s)",
+            (
+                email, sid, now_str,
+                (
+                    f"FLOOR RESET (Situation {situation}) — "
+                    f"new peak=${new_peak:.2f}, new floor=${new_floor:.2f}, "
+                    f"starting_capital=${starting_capital:.2f}, "
+                    f"resets_in_30d={len(updated_resets)}"
+                ),
+            ),
+        )
+        conn.commit()
+
+    # ── Update live runner in memory if somehow still present ────────────────
+    # Normally the runner has already removed itself when HARD_FLOOR hit,
+    # but we patch in-memory state defensively in case of any race condition.
+    with AUTO_LOCK:
+        _r = AUTO_RUNNERS.get(email)
+    if _r:
+        _r.peak_equity = new_peak
+        _r.floor_equity = new_floor
+        _r.blocked_reason = None
+        _r.log(
+            f"FLOOR RESET applied by user — new peak=${new_peak:.2f}, "
+            f"new floor=${new_floor:.2f} (Situation {situation})"
+        )
+        _save_runner_state(_r)
+
+    status["reset_applied"] = True
+    status["resets_in_30d"] = len(updated_resets)
+    status["message"] = (
+        f"Floor reset applied (Situation {situation}). "
+        f"New peak: ${new_peak:.2f}, new floor: ${new_floor:.2f}. "
+        f"Click Start to resume trading with the new floor."
+    )
+    return status
 
 
 # =========================
