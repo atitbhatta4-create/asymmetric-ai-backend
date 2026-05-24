@@ -548,6 +548,11 @@ def init_db() -> None:
         if not column_exists(conn, "user_state", "floor_reset_at"):
             # JSON array of Unix timestamps — used to enforce 7-day cooldown after 3 resets in 30 days
             cur.execute("ALTER TABLE user_state ADD COLUMN floor_reset_at TEXT DEFAULT '[]'")
+        # Persistent floor — separate from peak so it survives ai_runner_state deletion.
+        # Updated via max() only — never decreases except on explicit reset (reset_sandbox / reset-floor).
+        # Fixes: floor dropping after redeploy when ai_runner_state (and its floor_equity column) is cleared.
+        if not column_exists(conn, "user_state", "floor_equity"):
+            cur.execute("ALTER TABLE user_state ADD COLUMN floor_equity REAL DEFAULT 0")
         # Live runner state — persists adaptive_strictness, open positions, etc. across redeploys
         for col, coltype, defval in [
             ("adaptive_strictness",  "REAL",    "1.0"),
@@ -741,17 +746,26 @@ def set_equity(email: str, equity: float) -> None:
 
 
 def update_peak_ath(email: str, peak: float, equity_after: float) -> None:
-    """Update peak_equity and all_time_high in user_state after each trade."""
+    """Update peak_equity, all_time_high, and floor_equity in user_state after each trade.
+    All three columns only ever increase — never decrease — so the floor survives runner
+    restarts, redeploys, and ai_runner_state deletions without dropping."""
     with db_conn() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT peak_equity, all_time_high FROM user_state WHERE email = %s", (email,))
+        cur.execute(
+            "SELECT peak_equity, all_time_high, floor_equity FROM user_state WHERE email = %s",
+            (email,),
+        )
         row = cur.fetchone()
         if row:
             new_peak = max(float(row["peak_equity"] or 0), peak)
             new_ath = max(float(row["all_time_high"] or 0), equity_after)
+            # Floor is 85% of the running peak — but only ever moves UP.
+            # Stored here so it persists even after ai_runner_state is deleted on stop.
+            new_floor = max(float(row["floor_equity"] or 0), round(new_peak * 0.85, 2))
             cur.execute(
-                "UPDATE user_state SET peak_equity=%s, all_time_high=%s WHERE email=%s",
-                (new_peak, new_ath, email),
+                "UPDATE user_state SET peak_equity=%s, all_time_high=%s, floor_equity=%s "
+                "WHERE email=%s",
+                (new_peak, new_ath, new_floor, email),
             )
             conn.commit()
 
@@ -2445,17 +2459,27 @@ def balance(user=Depends(require_user)):
         cur = conn.cursor()
         cur.execute("SELECT time FROM trades WHERE email = %s ORDER BY id DESC LIMIT 1", (email,))
         last_row = cur.fetchone()
-        cur.execute("SELECT peak_equity, all_time_high FROM user_state WHERE email = %s", (email,))
+        cur.execute(
+            "SELECT peak_equity, all_time_high, floor_equity FROM user_state WHERE email = %s",
+            (email,),
+        )
         state_row = cur.fetchone()
     peak = float(state_row["peak_equity"] or 0) if state_row else 0.0
-    # Include live runner's peak — more up-to-date than DB value between saves
+    # floor_equity is the persistent, historically-max floor stored in user_state.
+    # It only ever increases (via max in update_peak_ath) and survives runner restarts.
+    stored_floor = float(state_row["floor_equity"] or 0) if state_row else 0.0
+    # Include live runner's peak and floor — more up-to-date than DB between saves
     with AUTO_LOCK:
         _r = AUTO_RUNNERS.get(email)
     if _r and _r.is_running():
         peak = max(peak, _r.peak_equity)
+        stored_floor = max(stored_floor, _r.floor_equity)
     if peak < equity:
         peak = equity
-    hard_floor = round(peak * 0.85, 2)
+    # Hard floor = max of: (current peak × 0.85) and the historically stored floor.
+    # Using max() means the floor can NEVER go lower than its best historical value,
+    # even if peak_equity had a transient undercount or was reset by a bug.
+    hard_floor = round(max(peak * 0.85, stored_floor), 2)
     locked_profit = round(hard_floor - start_eq, 2)
     distance_to_floor = round(equity - hard_floor, 2)
     distance_pct = round(distance_to_floor / hard_floor * 100, 2) if hard_floor > 0 else 0.0
@@ -2875,6 +2899,10 @@ async def _place_trade_internal(
         conn.commit()
 
     set_equity(email, equity_after)
+    # Trail peak and floor — ensures manual trades raise the floor the same way AI trades do.
+    # Missing this call was a bug: a profitable manual trade would raise equity but not peak_equity,
+    # so the floor shown in balance stayed at the old (lower) value.
+    update_peak_ath(email, max(equity_before, equity_after), equity_after)
     return {"ok": True, "trade": asdict(tr), "pnl_pct": float(tr.unreal_pnl_percent)}
 
 
@@ -6150,11 +6178,15 @@ def reset_sandbox(user=Depends(require_user)):
     new_sid = sid + 1
     set_session_id(email, new_sid)
     set_equity(email, START_EQUITY)
+    # Full demo reset — peak and floor both go back to the starting equity baseline.
+    # floor_equity column must also be reset, otherwise the stored floor from a
+    # previous profitable session would persist and confuse the new session's risk display.
+    _reset_floor = round(float(START_EQUITY) * 0.85, 2)
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE user_state SET peak_equity=%s WHERE email=%s",
-            (START_EQUITY, email),
+            "UPDATE user_state SET peak_equity=%s, floor_equity=%s WHERE email=%s",
+            (START_EQUITY, _reset_floor, email),
         )
         conn.commit()
     set_ai_restart_lock(email, 0)
@@ -6635,13 +6667,15 @@ def auto_reset_floor(payload: FloorResetIn, user=Depends(require_user)):
 
     with db_conn() as conn:
         _ac = conn.cursor()
+        # Write peak AND floor_equity — floor_equity is the persistent floor that survives
+        # runner restarts. We explicitly set it here (not max) because this is an intentional reset.
         _ac.execute(
             "UPDATE user_state SET "
-            "peak_equity=%s, all_time_high=%s, "
+            "peak_equity=%s, all_time_high=%s, floor_equity=%s, "
             "floor_reset_count=%s, floor_reset_at=%s "
             "WHERE email=%s",
             (
-                new_peak, new_ath,
+                new_peak, new_ath, new_floor,
                 len(updated_resets),
                 json.dumps(updated_resets),
                 email,
