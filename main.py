@@ -3787,6 +3787,17 @@ class FloorResetIn(BaseModel):
     typed_confirm: str = ""
 
 
+class CorrectTradeIn(BaseModel):
+    # symbol that was traded (e.g. "NEAR/USDT:USDT")
+    symbol: str
+    # total real P&L from the exchange for all legs combined (positive = profit)
+    real_pnl: float
+    # how many recent trade records to correct — 2 for Grade B (T1+T2), 1 for Grade A
+    num_trades: int = 2
+    # correct outcome label written to reason text
+    new_outcome: str = "TP_HIT"
+
+
 class _MidCandleSkip(Exception):
     """Raised inside _run_mid_candle_monitor to break out of nested blocks cleanly."""
 
@@ -4557,7 +4568,29 @@ class AutoRunner:
             real_bal_after = get_real_usdt_balance(self.email, force=True)
             if real_bal_after is not None:
                 equity_after = real_bal_after
-                self.log(f"Post-trade balance synced: ${real_bal_after:.2f} USDT")
+                real_pnl = real_bal_after - equity_before
+                self.log(f"Post-trade balance synced: ${real_bal_after:.2f} USDT (real P&L: ${real_pnl:+.2f})")
+                # Real balance change is authoritative — overrides paper simulation.
+                # Paper sim diverges when Bybit fills at a different price than the
+                # simulated candle close (wick fill, force-close via _ensure_sl_or_close,
+                # slippage, or partial fills). We always trust what Bybit paid us.
+                if size_dollar > 0:
+                    pnl_value = real_pnl
+                    pnl_pct_leveraged = real_pnl / size_dollar
+                _old_outcome = outcome
+                if real_pnl > 0 and outcome in ("SL_HIT", "TRAIL_STOP"):
+                    outcome = "TP_HIT"
+                elif real_pnl < -(equity_before * 0.005) and outcome == "TP_HIT":
+                    outcome = "SL_HIT"
+                if outcome != _old_outcome:
+                    self.log(
+                        f"Outcome auto-corrected {_old_outcome} → {outcome} "
+                        f"(real balance change ${real_pnl:+.4f} vs paper sim)"
+                    )
+                    reason_text += (
+                        f"\n\n[REAL CORRECTION] Paper sim: {_old_outcome} → Actual: {outcome}"
+                        f" | Real P&L: ${real_pnl:+.4f}"
+                    )
 
         sid = get_session_id(self.email)
         tr = Trade(
@@ -6552,6 +6585,131 @@ def auto_reset_strictness(user=Depends(require_user)):
     except Exception as e:
         print(f"[reset-strictness] DB patch failed: {e}")
     return {"ok": True, "adaptive_strictness": 1.0, "message": "Strictness reset to 1.0x"}
+
+
+@app.post("/auto/correct-real-trade")
+def auto_correct_real_trade(payload: CorrectTradeIn, user=Depends(require_user)):
+    """
+    Correct trade records when paper simulation diverges from real Bybit P&L.
+
+    Use this when a trade is recorded as SL_HIT / loss but the exchange shows a profit
+    (or vice versa). Finds the N most recent trades for the symbol in the current session,
+    splits real_pnl proportionally by position size, and patches DB + live runner state.
+
+    Also resets bad_trades_today=0 and adaptive_strictness=1.0 when real_pnl > 0.
+
+    Body:
+      symbol      — trading symbol, e.g. "NEAR/USDT:USDT"
+      real_pnl    — total real P&L from exchange for all legs combined ($, positive = profit)
+      num_trades  — 2 for Grade B (T1+T2), 1 for Grade A (default 2)
+      new_outcome — "TP_HIT" or "SL_HIT" (default "TP_HIT")
+    """
+    email = user["email"]
+    symbol = payload.symbol.strip()
+    real_pnl = payload.real_pnl
+    num_trades = max(1, min(payload.num_trades, 5))
+    new_outcome = payload.new_outcome.upper()
+    if new_outcome not in ("TP_HIT", "SL_HIT", "TRAIL_STOP"):
+        raise HTTPException(status_code=400, detail="new_outcome must be TP_HIT, SL_HIT, or TRAIL_STOP")
+
+    # ── Find the N most recent trade records for this symbol in current session ──
+    sid = get_session_id(email)
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, size, unreal_pnl_value, unreal_pnl_percent, reason "
+            "FROM trades WHERE email=%s AND symbol=%s AND session_id=%s "
+            "ORDER BY id DESC LIMIT %s",
+            (email, symbol, int(sid), num_trades),
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No recent trades found for {symbol} in current session (session_id={sid})."
+        )
+
+    # ── Split real_pnl proportionally by size across all legs ─────────────────
+    total_size = sum(float(r["size"]) for r in rows)
+    corrections = []
+    for r in rows:
+        frac = float(r["size"]) / total_size if total_size > 0 else 1.0 / len(rows)
+        leg_pnl = round(real_pnl * frac, 4)
+        # For percent: pnl / (size * equity_before) — we don't have equity_before stored
+        # so use the existing percent field's magnitude scaled to the new pnl sign/size
+        # as an approximation; the dollar value is what the frontend displays.
+        old_pct = float(r["unreal_pnl_percent"])
+        new_pct = round(leg_pnl / float(r["size"]) * 100, 4) if float(r["size"]) > 0 else old_pct
+        corrections.append({"id": r["id"], "leg_pnl": leg_pnl, "new_pct": new_pct,
+                             "old_pnl": float(r["unreal_pnl_value"]), "reason": r["reason"]})
+
+    # ── Apply DB corrections ──────────────────────────────────────────────────
+    now_str = now_dubai().strftime("%Y-%m-%d %H:%M:%S")
+    with db_conn() as conn:
+        cur = conn.cursor()
+        for c_item in corrections:
+            correction_note = (
+                f"\n\n[MANUAL CORRECTION {now_str}] "
+                f"Paper: {c_item['old_pnl']:+.4f} → Real: {c_item['leg_pnl']:+.4f} | "
+                f"Outcome corrected to {new_outcome}"
+            )
+            new_reason = (c_item["reason"] or "") + correction_note
+            cur.execute(
+                "UPDATE trades SET unreal_pnl_value=%s, unreal_pnl_percent=%s, reason=%s "
+                "WHERE id=%s",
+                (c_item["leg_pnl"], c_item["new_pct"], new_reason, c_item["id"]),
+            )
+        conn.commit()
+
+    # ── Update live runner state if AI is running ──────────────────────────────
+    runner_updated = False
+    with AUTO_LOCK:
+        r = AUTO_RUNNERS.get(email)
+        if r:
+            if real_pnl > 0:
+                # Trade was actually a WIN — undo the bad-trade penalty
+                r.bad_trades_today = 0
+                r.adaptive_strictness = 1.0
+                r.consecutive_wins = 0
+                r._last_trade_bad = False
+            r.log(
+                f"[MANUAL CORRECTION] {symbol} trade P&L corrected: "
+                f"${real_pnl:+.4f} total ({len(corrections)} leg(s)). "
+                f"bad_trades=0, strictness=1.0"
+            )
+            _save_runner_state(r)
+            runner_updated = True
+
+    # ── Also patch DB strictness/bad_trades in case runner is stopped ─────────
+    if real_pnl > 0:
+        try:
+            with db_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "UPDATE ai_runner_state SET adaptive_strictness=1.0, "
+                    "consecutive_wins=0, last_trade_bad=0 WHERE email=%s",
+                    (email,),
+                )
+                conn.commit()
+        except Exception as _sde:
+            print(f"[correct-trade] DB strictness patch failed: {_sde}")
+
+    # ── Update peak equity if current balance is a new high ───────────────────
+    current_equity = get_equity(email)
+    update_peak_ath(email, current_equity, current_equity)
+
+    return {
+        "ok": True,
+        "trades_corrected": len(corrections),
+        "symbol": symbol,
+        "real_pnl_total": real_pnl,
+        "legs": [{"trade_id": c["id"], "pnl": c["leg_pnl"], "pnl_pct": c["new_pct"]} for c in corrections],
+        "bad_trades_reset": real_pnl > 0,
+        "strictness_reset": real_pnl > 0,
+        "runner_updated": runner_updated,
+        "peak_equity_updated": True,
+    }
 
 
 @app.post("/auto/reset-floor")
