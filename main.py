@@ -4513,10 +4513,36 @@ class AutoRunner:
         if REAL_TRADING:
             _is_b_t1 = (pt.get("grade") == "B" and pt.get("label") == "T1")
             if _is_b_t1:
-                # For real Grade B T1, only confirm TP if Bybit shows the T1 TP limit order
-                # as filled. Trail-stop, SL, or any other close must NOT trigger breakeven.
+                # For real Grade B T1, confirm TP via Bybit order check.
+                # Bug 3 fix: detection priority —
+                #   Step 1: Check if T1_TP limit order was filled on Bybit (primary).
+                #   Step 2: If order check fails (no id, network error, markets issue),
+                #           fall back to intrabar_tp from paper sim as secondary signal.
+                #           intrabar_tp = candle high touched T1_TP price level.
+                #   Never assume SL_HIT when T1_TP order ID is missing — check both paths.
                 _t1_tp_id = pt.get("t1_tp_id")
-                _t1_filled = bool(_t1_tp_id) and _check_bybit_order_filled(self.email, _t1_tp_id, self.symbol)
+                _t1_filled = False
+                if _t1_tp_id:
+                    _t1_filled = _check_bybit_order_filled(self.email, _t1_tp_id, self.symbol)
+                    if not _t1_filled:
+                        # Primary check failed — use paper sim intrabar_tp as fallback
+                        # (candle high reached the TP price level = TP likely triggered on exchange)
+                        if intrabar_tp:
+                            _t1_filled = True
+                            self.log(
+                                "T1 TP: Bybit order check inconclusive — intrabar_tp confirms "
+                                "candle touched TP level, treating as TP_HIT"
+                            )
+                else:
+                    # No T1_TP order id stored (placement failed earlier) —
+                    # use intrabar_tp as the only available signal
+                    if intrabar_tp:
+                        _t1_filled = True
+                        self.log(
+                            "T1 TP: no order id stored — intrabar_tp indicates TP level was touched, "
+                            "treating as TP_HIT"
+                        )
+
                 if _t1_filled:
                     self.log(f"REAL T1 HIT TP | {side} {self.symbol} — T2 still running, SL→breakeven next candle")
                     # Cancel the T1 stop order — T1 is closed at TP so its stop is redundant.
@@ -4534,7 +4560,10 @@ class AutoRunner:
                         except Exception as _cte:
                             self.log(f"T1 SL cancel note (non-fatal, T2 SL still protects): {_cte}")
                 else:
-                    self.log(f"REAL T1 CLOSED ({outcome}) — Bybit T1 TP not filled | verifying T2 SL...")
+                    # Bug 6 fix: T1 confirmed NOT at TP — only now run T2 SL verification.
+                    # This path was incorrectly reached when _check_bybit_order_filled returned
+                    # False due to markets not loaded, causing T2 to be force-closed.
+                    self.log(f"REAL T1 CLOSED ({outcome}) — not TP_HIT | verifying T2 SL...")
                     # T1 exited at SL (not TP). The T1 stop order was consumed by Bybit.
                     # T2's separate stop should still be active — verify and re-place if missing.
                     _t2_pt_for_sl = next((p for p in self.pending_trades if p.get("label") == "T2"), None)
@@ -4549,6 +4578,13 @@ class AutoRunner:
                             if _t2v_row:
                                 _t2v_ex    = _make_ccxt_exchange(_t2v_row)
                                 _t2v_ex_id = (_t2v_row.get("exchange") or "bybit").lower()
+                                # Bug 5 fix: pre-load markets on the new exchange instance
+                                # before _verify_and_restore_t2_sl calls ex.market(symbol)
+                                if not _t2v_ex.markets:
+                                    try:
+                                        _t2v_ex.load_markets()
+                                    except Exception as _lm:
+                                        self.log(f"T2 verify: market load note: {_lm}")
                                 _verify_and_restore_t2_sl(
                                     self, _t2v_ex, _t2v_ex_id, self.symbol,
                                     _t2_side, _t2_sl_id, _t2_sl_px,
@@ -5361,6 +5397,63 @@ class AutoRunner:
                                     if not _sl_ok:
                                         self.pending_trades = []
                                         _save_runner_state(self)
+                                    else:
+                                        # Bug 2 fix: position-level SL (tradingStop) can cancel
+                                        # existing reduce-only limit orders on some Bybit configs.
+                                        # Re-verify T1_TP and T2_TP are still active after fallback SL.
+                                        _t1_tp_id_chk = real_b_result.get("t1_tp_id")
+                                        _t2_tp_id_chk = real_b_result.get("t2_tp_id")
+                                        if _t1_tp_id_chk or _t2_tp_id_chk:
+                                            try:
+                                                _chk_open = _ccxt_call(
+                                                    _b_ex.fetch_open_orders, self.symbol,
+                                                    label="verify_tp_after_fallback_sl", retries=0,
+                                                )
+                                                _open_ids = {(o.get("id") or "") for o in _chk_open}
+                                                _open_ids |= {(o.get("info") or {}).get("orderId", "") for o in _chk_open}
+                                                _missing = []
+                                                if _t1_tp_id_chk and _t1_tp_id_chk not in _open_ids:
+                                                    _missing.append(("T1_TP", _t1_tp_id_chk))
+                                                if _t2_tp_id_chk and _t2_tp_id_chk not in _open_ids:
+                                                    _missing.append(("T2_TP", _t2_tp_id_chk))
+                                                if _missing:
+                                                    self.log(
+                                                        f"Bug 2 guard: fallback SL cancelled TP orders "
+                                                        f"{[m[0] for m in _missing]} — re-placing them"
+                                                    )
+                                                    _close_side_repl = "sell" if desired_side == "LONG" else "buy"
+                                                    _rp_params = {"reduceOnly": True, "positionIdx": 0}
+                                                    for _tp_label, _old_tp_id in _missing:
+                                                        _tp_price_repl = (
+                                                            real_b_result["t1_tp_price"] if _tp_label == "T1_TP"
+                                                            else real_b_result["t2_tp_price"]
+                                                        )
+                                                        _tp_qty_repl = (
+                                                            real_b_result["t1_qty"] if _tp_label == "T1_TP"
+                                                            else real_b_result["t2_qty"]
+                                                        )
+                                                        try:
+                                                            _new_tp = _ccxt_call(
+                                                                _b_ex.create_order,
+                                                                self.symbol, "limit",
+                                                                _close_side_repl, _tp_qty_repl,
+                                                                _tp_price_repl,
+                                                                params=_rp_params,
+                                                                label=f"replace_{_tp_label}",
+                                                            )
+                                                            _new_id = _new_tp.get("id")
+                                                            self.log(f"{_tp_label} re-placed: order={_new_id} @ {_tp_price_repl:.4f}")
+                                                            if _tp_label == "T1_TP" and self.pending_trades:
+                                                                self.pending_trades[0]["t1_tp_id"] = _new_id
+                                                            elif _tp_label == "T2_TP" and len(self.pending_trades) > 1:
+                                                                self.pending_trades[1]["t2_tp_id"] = _new_id
+                                                        except Exception as _rpe:
+                                                            self.log(f"WARN: {_tp_label} re-place failed: {_rpe}")
+                                                    _save_runner_state(self)
+                                                else:
+                                                    self.log("TP orders verified active after fallback SL placement ✓")
+                                            except Exception as _tpv_err:
+                                                self.log(f"TP verify after fallback SL: non-fatal error: {_tpv_err}")
                             else:
                                 # OKX/Binance: position-level SL (no qty-specific conditional stops)
                                 _sl_ok = _ensure_sl_or_close(self, _b_ex, _b_ex_id, self.symbol, desired_side, _b_sl)
@@ -5738,6 +5831,10 @@ def _set_position_sl(ex, ex_id: str, symbol: str, side: str, sl_price: float) ->
     Separate from entry so SL is always explicitly verified and set.
     Raises RuntimeError on failure so caller can retry or close.
     """
+    # Bug 5 fix: each caller may pass a fresh exchange instance with markets = None.
+    # ex.market(symbol) raises "bybit markets not loaded" without this.
+    if not ex.markets:
+        ex.load_markets()
     if ex_id == "bybit":
         mkt = ex.market(symbol)
         bybit_sym = mkt["id"]
@@ -5841,8 +5938,32 @@ def _place_grade_b_stop_order(
     trigger_dir = "2" if side == "LONG" else "1"
 
     try:
+        # Bug 5 fix: load markets if this is a fresh exchange instance
+        if not ex.markets:
+            ex.load_markets()
+
         mkt = ex.market(symbol)
         bybit_sym = mkt["id"]   # e.g. "NEAR/USDT:USDT" → "NEARUSDT"
+
+        # Bug 4 fix: round qty to the coin's step size and enforce minimum.
+        # Bybit returns retCode 10001 "Qty invalid" when qty has too many decimals
+        # or is below the minimum order size (e.g. NEAR min=1, BTC min=0.001).
+        import math as _math
+        _prec  = mkt.get("precision") or {}
+        _lims  = mkt.get("limits") or {}
+        qty_step = float(_prec.get("amount") or 0)
+        min_qty  = float((_lims.get("amount") or {}).get("min") or 0)
+        if qty_step > 0:
+            # Floor to nearest step (never round up — avoids over-closing)
+            qty = _math.floor(qty / qty_step) * qty_step
+            qty = round(qty, 8)
+        if min_qty > 0 and qty < min_qty:
+            runner.log(
+                f"Grade B {label}: qty {qty:.6f} below Bybit minimum {min_qty} "
+                f"for {symbol} — fallback to position SL"
+            )
+            return None
+
         result = _ccxt_call(
             ex.privatePostV5OrderCreate,
             {
@@ -5850,7 +5971,7 @@ def _place_grade_b_stop_order(
                 "symbol":           bybit_sym,
                 "side":             close_side_str,
                 "orderType":        "Market",          # market fill when triggered
-                "qty":              str(round(qty, 6)), # T1=60% qty, T2=40% qty
+                "qty":              str(qty),
                 "triggerPrice":     str(round(sl_price, 4)),
                 "triggerDirection": trigger_dir,
                 "triggerBy":        "MarkPrice",       # same trigger type as position SL
@@ -5862,7 +5983,7 @@ def _place_grade_b_stop_order(
         # Bybit raw response: {"retCode": 0, "result": {"orderId": "xxx"}}
         order_id = (result.get("result") or {}).get("orderId")
         if order_id:
-            runner.log(f"Grade B {label} stop placed: order={order_id} @ {sl_price:.4f} qty={qty:.6f}")
+            runner.log(f"Grade B {label} stop placed: order={order_id} @ {sl_price:.4f} qty={qty}")
         else:
             runner.log(f"Grade B {label} stop — unexpected response (no orderId): {result}")
         return order_id or None
@@ -6031,17 +6152,29 @@ def _move_real_sl_to_breakeven(email: str, symbol: str, entry_price: float) -> b
 
 def _check_bybit_order_filled(email: str, order_id: str, symbol: str) -> bool:
     """
-    Return True only if the Bybit order is confirmed fully filled (ccxt status == 'closed').
+    Return True if the Bybit order is confirmed fully filled.
     Returns False on any error or if order is still open / canceled / unknown.
     Used to verify T1 TP hit on real Grade B trades before moving T2 SL to breakeven.
+
+    Bug 3 fix: previous version created a fresh exchange with no markets loaded.
+    ccxt Bybit's fetch_order requires markets to resolve the symbol category (linear/spot),
+    so it silently failed and returned False even when T1_TP was actually filled.
+    Fix: load markets before fetch_order, and accept both "closed" and "filled" statuses.
     """
     try:
         row = get_exchange(email)
         if not row:
             return False
         ex = _make_ccxt_exchange(row)
-        order = _ccxt_call(ex.fetch_order, order_id, symbol, label="fetch_order T1_check", retries=0)
-        return order.get("status") == "closed"
+        # Load markets if this is a fresh exchange instance — required for symbol resolution
+        if not ex.markets:
+            try:
+                ex.load_markets()
+            except Exception:
+                pass  # non-fatal: fetch_order may still work without full market map
+        order = _ccxt_call(ex.fetch_order, order_id, symbol, label="fetch_order T1_check", retries=1)
+        # ccxt normalises Bybit "Filled" → "closed"; accept both defensively
+        return order.get("status") in ("closed", "filled")
     except Exception:
         return False
 
