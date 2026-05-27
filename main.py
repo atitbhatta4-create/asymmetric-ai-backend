@@ -2446,24 +2446,31 @@ def balance(user=Depends(require_user)):
         db_equity = get_equity(email)
         if abs(db_equity - real_bal) > 0.01:
             set_equity(email, real_bal)
-        start_eq = equity
     elif REAL_TRADING:
         # Real trading mode but exchange unreachable — show 0, not fake balance
         equity = 0.0
-        start_eq = 0.0
     else:
         equity = get_equity(email)
-        start_eq = START_EQUITY
 
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT time FROM trades WHERE email = %s ORDER BY id DESC LIMIT 1", (email,))
         last_row = cur.fetchone()
         cur.execute(
-            "SELECT peak_equity, all_time_high, floor_equity FROM user_state WHERE email = %s",
+            "SELECT peak_equity, all_time_high, floor_equity, starting_capital FROM user_state WHERE email = %s",
             (email,),
         )
         state_row = cur.fetchone()
+
+    # start_eq is the balance when trading began — used for locked_profit and floor % display.
+    # Using current equity as start_eq was wrong: it made locked_profit always 0 or negative.
+    _sc = float(state_row["starting_capital"] or 0) if state_row else 0.0
+    if real_bal is not None:
+        start_eq = _sc if _sc > 0 else equity
+    elif REAL_TRADING:
+        start_eq = 0.0
+    else:
+        start_eq = START_EQUITY
     peak = float(state_row["peak_equity"] or 0) if state_row else 0.0
     # floor_equity is the persistent, historically-max floor stored in user_state.
     # It only ever increases (via max in update_peak_ath) and survives runner restarts.
