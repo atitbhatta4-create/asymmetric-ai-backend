@@ -4250,7 +4250,20 @@ class AutoRunner:
         vol_size_mult = 1.0
         if vol_ratio_atr > 1.5:
             vol_size_mult = max(0.4, 1.0 / vol_ratio_atr)  # scale down, floor at 40%
-            self.log(f"High volatility (ATR {atr*100:.2f}% = {vol_ratio_atr:.1f}× normal {atr_normal*100:.2f}%) → size reduced to {vol_size_mult*100:.0f}%")
+            # Throttle: log only when vol tier changes or every 30 minutes.
+            # Without this, the log fires every 30s (twice per cycle for T1+T2),
+            # flooding the session history with hundreds of identical lines.
+            _vol_tier_now = round(vol_size_mult * 10)
+            _vol_now_ts   = time.time()
+            _vol_tier_last = getattr(self, "_last_vol_tier", -1)
+            _vol_log_last  = getattr(self, "_last_vol_log_ts", 0.0)
+            if _vol_tier_now != _vol_tier_last or (_vol_now_ts - _vol_log_last) >= 1800:
+                self.log(
+                    f"High volatility (ATR {atr*100:.2f}% = {vol_ratio_atr:.1f}× normal "
+                    f"{atr_normal*100:.2f}%) → size reduced to {vol_size_mult*100:.0f}%"
+                )
+                self._last_vol_log_ts = _vol_now_ts
+                self._last_vol_tier   = _vol_tier_now
 
         # ── Hard equity floor — never trade if account below 85% of session start ──
         if equity_before < self.floor_equity:
@@ -4267,8 +4280,11 @@ class AutoRunner:
         # At -15% from peak: full stop. Hard floor (85% of session start) is a second wall.
         if equity_before > self.peak_equity:
             self.peak_equity = equity_before
-            self.floor_equity = self.peak_equity * 0.85  # trail floor up with every new high
-            update_peak_ath(self.email, self.peak_equity, self.peak_equity)  # persist immediately so restart can't lose the high
+            self.floor_equity = round(self.peak_equity * 0.85, 2)  # trail floor up with every new high
+            # Persist immediately — called on every candle evaluation (holding or closing)
+            # so the DB always has the latest peak/floor even between trade closes.
+            # This ensures the balance endpoint shows the correct floor when runner is stopped.
+            update_peak_ath(self.email, self.peak_equity, self.peak_equity)
         drawdown_pct = (self.peak_equity - equity_before) / self.peak_equity if self.peak_equity > 0 else 0.0
         dd_size_mult = 1.0
 
@@ -4623,9 +4639,20 @@ class AutoRunner:
                         f"Outcome auto-corrected {_old_outcome} → {outcome} "
                         f"(real balance change ${real_pnl:+.4f} vs paper sim)"
                     )
+                # Always append real P&L to reason_text when it differs from paper sim
+                # by more than $0.05 — the trade card was built with paper values so
+                # users would see wrong numbers without this correction note.
+                _paper_pnl = size_dollar * (final_move * c["leverage"]) - fee_cost if size_dollar > 0 else 0.0
+                if abs(real_pnl - _paper_pnl) > 0.05:
+                    _outcome_label_real = (
+                        "TP_HIT" if outcome == "TP_HIT"
+                        else "SL_HIT" if outcome == "SL_HIT"
+                        else outcome
+                    )
                     reason_text += (
-                        f"\n\n[REAL CORRECTION] Paper sim: {_old_outcome} → Actual: {outcome}"
-                        f" | Real P&L: ${real_pnl:+.4f}"
+                        f"\n\n[REAL P&L] Paper sim: ${_paper_pnl:+.2f} → "
+                        f"Actual Bybit: ${real_pnl:+.2f} | Outcome: {_outcome_label_real}"
+                        f"\n  Balance: ${equity_before:.2f} → ${real_bal_after:.2f}"
                     )
 
         sid = get_session_id(self.email)
@@ -5869,11 +5896,43 @@ def _set_position_sl(ex, ex_id: str, symbol: str, side: str, sl_price: float) ->
 def _ensure_sl_or_close(runner: "AutoRunner", ex, ex_id: str,
                          symbol: str, side: str, sl_price: float) -> bool:
     """
-    FIX 2: Set SL on open position, retry 3×. If all attempts fail: close position.
+    Set SL on open position, retry 3×. If all attempts fail: close position.
     Returns True  = SL placed successfully.
     Returns False = SL failed, position closed for safety.
     Never leaves a naked position.
+
+    Bug 3 pre-check: if price has already moved past the SL level, Bybit will
+    reject the tradingStop with retCode 10001 on every retry (wastes 6+ seconds
+    and generates confusing log spam). Detect this case immediately and close
+    instead of retrying — the position needs to close, not be stopped.
     """
+    # Pre-check: if mark price already past SL, skip retries and close immediately.
+    # For LONG: SL must be below mark price (can't set SL above current price).
+    # For SHORT: SL must be above mark price.
+    try:
+        _ticker  = _ccxt_call(ex.fetch_ticker, symbol, label=f"sl_precheck {symbol}", retries=0)
+        _mark    = float(_ticker.get("last") or _ticker.get("mark") or 0)
+        _sl_past = _mark > 0 and (
+            (side == "LONG"  and sl_price >= _mark) or
+            (side == "SHORT" and sl_price <= _mark)
+        )
+        if _sl_past:
+            runner.log(
+                f"SL {sl_price:.4f} already past mark price {_mark:.4f} for {side} "
+                f"— price moved through SL while order was being placed. Closing immediately."
+            )
+            try:
+                result = close_real_order(runner.email, symbol, side)
+                runner.log(f"Position closed for safety: {result}")
+            except Exception as _ce:
+                runner.log(
+                    f"CRITICAL: price past SL AND close failed: {_ce}. "
+                    f"MANUAL ACTION REQUIRED on {ex_id} — open {side} {symbol}."
+                )
+            return False
+    except Exception as _pce:
+        runner.log(f"SL pre-check note (non-fatal, will try setting SL): {_pce}")
+
     for attempt in range(1, 4):
         try:
             _set_position_sl(ex, ex_id, symbol, side, sl_price)
