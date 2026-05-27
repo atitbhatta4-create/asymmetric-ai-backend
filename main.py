@@ -2461,6 +2461,26 @@ def balance(user=Depends(require_user)):
             (email,),
         )
         state_row = cur.fetchone()
+        # If peak_equity was never written (column newly added, runner not yet started),
+        # recover the best historical peak from trade equity_after values.
+        # This prevents "floor = equity × 0.85" on fresh deploys before runner starts.
+        _db_peak = float(state_row["peak_equity"] or 0) if state_row else 0.0
+        if _db_peak == 0:
+            cur.execute(
+                "SELECT MAX(equity_after) AS max_eq FROM trades WHERE email = %s",
+                (email,),
+            )
+            _tp = cur.fetchone()
+            _trade_peak = float((_tp or {}).get("max_eq") or 0)
+            if _trade_peak > 0:
+                _db_peak = _trade_peak
+                # Persist so next call is instant
+                _new_floor = round(_db_peak * 0.85, 2)
+                cur.execute(
+                    "UPDATE user_state SET peak_equity=%s, floor_equity=%s WHERE email=%s",
+                    (_db_peak, _new_floor, email),
+                )
+                conn.commit()
 
     # start_eq is the balance when trading began — used for locked_profit and floor % display.
     # Using current equity as start_eq was wrong: it made locked_profit always 0 or negative.
@@ -2471,7 +2491,7 @@ def balance(user=Depends(require_user)):
         start_eq = 0.0
     else:
         start_eq = START_EQUITY
-    peak = float(state_row["peak_equity"] or 0) if state_row else 0.0
+    peak = _db_peak
     # floor_equity is the persistent, historically-max floor stored in user_state.
     # It only ever increases (via max in update_peak_ath) and survives runner restarts.
     stored_floor = float(state_row["floor_equity"] or 0) if state_row else 0.0
