@@ -499,9 +499,21 @@ def init_db() -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS ix_ai_logs_email_t ON ai_logs(email, t DESC)")
         # Timestamp index: covers time-range log queries and ORDER BY t
         cur.execute("CREATE INDEX IF NOT EXISTS ix_ai_logs_t ON ai_logs(t DESC)")
+        # Composite: covers "WHERE email=? AND session_id=? ORDER BY t DESC/ASC" — every
+        # log viewer call filters by both email and session. Without this the DB scans all
+        # rows for the email then re-filters by session.
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_ai_logs_email_session_t ON ai_logs(email, session_id, t DESC)")
         # Trades indexes: no index existed — every trade history query was a full scan
         cur.execute("CREATE INDEX IF NOT EXISTS ix_trades_email ON trades(email)")
         cur.execute("CREATE INDEX IF NOT EXISTS ix_trades_email_time ON trades(email, time DESC)")
+        # Composite: covers "WHERE email=? AND session_id=? AND time>=?" — daily stats,
+        # bad-trade counts, and session P&L summaries all filter on both columns.
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_trades_email_session ON trades(email, session_id, time DESC)")
+        # Symbol-level lookup: "WHERE email=? AND symbol=? AND session_id=?" used in
+        # correct-trade endpoint and per-symbol performance queries.
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_trades_email_symbol_session ON trades(email, symbol, session_id)")
+        # Win-rate query: "WHERE email=? AND unreal_pnl_value >= 0" — avoids full email scan
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_trades_email_pnl ON trades(email, unreal_pnl_value)")
         # Sessions: email lookup (token is already primary key)
         cur.execute("CREATE INDEX IF NOT EXISTS ix_sessions_email ON sessions(email)")
 
@@ -1433,7 +1445,7 @@ def admin_force_reset(payload: AdminForceResetIn):
 # =========================
 
 class ProfileIn(BaseModel):
-    display_name: str
+    display_name: str = Field(..., max_length=40)
 
 @app.get("/profile")
 def get_profile(user=Depends(require_user)):
@@ -2058,11 +2070,29 @@ def _route_klines(symbol: str, tf: str, exchange: str, limit: int) -> List[Dict[
     return _fetch_klines_sync(symbol, tf, limit=limit)
 
 
+_EXCHANGE_ALLOWLIST = {"bybit", "okx", "binance"}
+
+def _validate_exchange_param(ex: Optional[str]) -> str:
+    """Normalise and allowlist-check the ?exchange= query param."""
+    v = (ex or "okx").lower().strip()
+    if v not in _EXCHANGE_ALLOWLIST:
+        raise HTTPException(status_code=400, detail=f"Unknown exchange '{v}'. Use: bybit, okx, binance")
+    return v
+
+def _validate_path_symbol(symbol: str) -> str:
+    """Validate and normalise a symbol coming in as a URL path segment."""
+    sym = symbol.upper().strip()
+    if not _SYMBOL_RE.match(sym):
+        raise HTTPException(status_code=400, detail=f"Invalid symbol '{sym}' — use format like BTCUSDT")
+    return sym
+
+
 @app.get("/price/{symbol}")
 async def get_price(symbol: str, exchange: Optional[str] = Query(default=None)):
-    sym = symbol.upper().strip()
-    price = await _route_price(sym, exchange or "okx")
-    return {"symbol": sym, "price": price, "exchange": (exchange or "okx").lower()}
+    sym = _validate_path_symbol(symbol)
+    ex  = _validate_exchange_param(exchange)
+    price = await _route_price(sym, ex)
+    return {"symbol": sym, "price": price, "exchange": ex}
 
 
 @app.get("/market/ticker/{symbol}")
@@ -2070,6 +2100,7 @@ async def market_ticker(symbol: str, exchange: Optional[str] = Query(default=Non
     """24h stats for a symbol: price, change%, high, low, volume in USDT.
     exchange param is accepted for labelling — data always sourced from OKX because
     Binance and Bybit geo-block Render US servers."""
+    _validate_path_symbol(symbol)
     inst = to_okx_inst(symbol.upper().strip())
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(
@@ -2095,9 +2126,9 @@ async def market_ticker(symbol: str, exchange: Optional[str] = Query(default=Non
 
 
 @app.get("/market/tickers")
-async def market_tickers(symbols: str = Query(...)):
-    """Batch 24h stats. Pass ?symbols=BTCUSDT,ETHUSDT,..."""
-    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+async def market_tickers(symbols: str = Query(..., max_length=500)):
+    """Batch 24h stats. Pass ?symbols=BTCUSDT,ETHUSDT,... (max 20 symbols)"""
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()][:20]
     async with httpx.AsyncClient(timeout=12) as client:
         results = await asyncio.gather(*[
             client.get(
@@ -3815,14 +3846,14 @@ class FloorResetIn(BaseModel):
 
 
 class CorrectTradeIn(BaseModel):
-    # symbol that was traded (e.g. "NEAR/USDT:USDT")
-    symbol: str
+    # symbol that was traded (e.g. "NEAR/USDT:USDT" or "NEARUSDT")
+    symbol: str = Field(..., min_length=3, max_length=30)
     # total real P&L from the exchange for all legs combined (positive = profit)
-    real_pnl: float
+    real_pnl: float = Field(..., ge=-100_000, le=100_000)
     # how many recent trade records to correct — 2 for Grade B (T1+T2), 1 for Grade A
-    num_trades: int = 2
+    num_trades: int = Field(default=2, ge=1, le=10)
     # correct outcome label written to reason text
-    new_outcome: str = "TP_HIT"
+    new_outcome: Literal["TP_HIT", "SL_HIT", "TRAIL_STOP", "NATURAL_CLOSE"] = "TP_HIT"
 
 
 class _MidCandleSkip(Exception):
@@ -6530,8 +6561,8 @@ def auto_sessions(
     limit: int = Query(default=20, ge=1, le=100),
     log_limit: int = Query(default=500, ge=1, le=2000),
     symbol: Optional[str] = Query(default=None),
-    search: Optional[str] = Query(default=None),
-    log_type: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None, max_length=200),
+    log_type: Optional[str] = Query(default=None, max_length=30),
 ):
     """Return AI sessions for this user, newest first, with classified logs.
     Supports optional symbol filter, keyword search, and log_type filter."""
@@ -6568,8 +6599,12 @@ def auto_sessions(
                 {"t": r["t"], "msg": r["msg"], "log_type": _classify_log_type(r["msg"])}
                 for r in cur.fetchall()
             ]
+            _VALID_LOG_TYPES = {"ALL", "TRADE", "SIGNAL", "RISK", "RESET", "SYSTEM", "ERROR"}
             if log_type and log_type.upper() != "ALL":
-                events = [e for e in events if e["log_type"] == log_type.upper()]
+                lt = log_type.upper()
+                if lt not in _VALID_LOG_TYPES:
+                    lt = "SYSTEM"
+                events = [e for e in events if e["log_type"] == lt]
             sess["events"] = events
             sess["total_events"] = len(events)
     return {"ok": True, "sessions": sessions}
@@ -7196,7 +7231,7 @@ def admin_reset_user(email: str, admin=Depends(require_admin)):
 @app.get("/admin/users")
 def admin_users(
     admin=Depends(require_admin),
-    q: Optional[str] = Query(default=None),
+    q: Optional[str] = Query(default=None, max_length=200),
     limit: int = Query(default=100, ge=1, le=2000),
 ):
     qn = (q or "").strip().lower()
