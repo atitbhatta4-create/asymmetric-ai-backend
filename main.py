@@ -4378,6 +4378,15 @@ class AutoRunner:
             )
             self.blocked_reason = "HARD_FLOOR"
             self.stop_event.set()
+            try:
+                with db_conn() as _hf2:
+                    _hf2.cursor().execute(
+                        "UPDATE user_state SET last_stop_reason=%s WHERE email=%s",
+                        ("HARD_FLOOR", self.email),
+                    )
+                    _hf2.commit()
+            except Exception:
+                pass
             return equity_before
 
         # ── Drawdown protection (4-tier, from peak equity) ────────────────
