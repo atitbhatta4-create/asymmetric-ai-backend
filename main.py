@@ -3426,6 +3426,7 @@ def _compute_signal_layers(
     adaptive_strictness: float = 1.0,
     higher_klines: Optional[List[Dict]] = None,
     trade_style: str = "DAY_TRADE",
+    mtf_klines: Optional[List[Dict]] = None,
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -3761,7 +3762,42 @@ def _compute_signal_layers(
     # then fell to the else-branch in _run_loop and fired as accidental Grade A.
     grade = "A" if total_score >= 0.78 else "B"
 
-    failed = [k for k, v in breakdown.items() if not v.get("ok")]
+    # ── 15m Multi-Timeframe Momentum Confirmation ─────────────────────────
+    # DAY_TRADE and SWING: check 15m chart as a 3rd confirmation layer after
+    # the 4h (regime/direction) and 1h (entry) both pass.
+    # SCALP already uses 15m as its primary TF — no extra 15m layer needed.
+    # Confirms  → score +0.03 bonus, full size.
+    # Not confirmed → size reduced 15%, trade still fires (soft filter only).
+    mtf_confirmed = True
+    mtf_size_mult = 1.0
+    if mtf_klines and len(mtf_klines) >= 20 and trade_style in ("DAY_TRADE", "SWING"):
+        _mtf_closes  = [k["close"]  for k in mtf_klines]
+        _mtf_volumes = [k["volume"] for k in mtf_klines]
+        _mtf_ema21   = _ema(_mtf_closes, min(21, len(_mtf_closes) - 1))
+        _mtf_rsi     = _rsi(_mtf_closes, min(14, len(_mtf_closes) - 1))
+        _mtf_price   = _mtf_closes[-1]
+        _last3 = mtf_klines[-3:] if len(mtf_klines) >= 3 else mtf_klines
+        _bull3 = sum(1 for c in _last3 if c["close"] > c["open"])
+        _bear3 = sum(1 for c in _last3 if c["close"] < c["open"])
+        _vol_up = len(_mtf_volumes) >= 3 and _mtf_volumes[-2] > _mtf_volumes[-3]
+        if desired_side == "LONG":
+            _mtf_ok = _bull3 >= 2 and _mtf_rsi > 40 and _vol_up and _mtf_price > _mtf_ema21
+        else:
+            _mtf_ok = _bear3 >= 2 and _mtf_rsi < 60 and _vol_up and _mtf_price < _mtf_ema21
+        if _mtf_ok:
+            total_score = round(min(1.0, total_score + 0.03), 3)
+            mtf_confirmed = True
+        else:
+            mtf_size_mult = 0.85
+            mtf_confirmed = False
+    breakdown["mtf_15m"] = {
+        "ok": mtf_confirmed,
+        "confirmed": mtf_confirmed,
+        "size_mult": mtf_size_mult,
+        "reason": "" if mtf_confirmed else "15m not confirmed — size reduced 15% for lower conviction",
+    }
+
+    failed = [k for k, v in breakdown.items() if not v.get("ok") and k != "mtf_15m"]
     if failed or total_score < min_score:
         reasons = " | ".join(breakdown[k]["reason"] for k in failed if breakdown[k].get("reason"))
         if total_score < min_score and not failed:
@@ -3776,6 +3812,8 @@ def _compute_signal_layers(
             "htf_bear_debug": _htf_bear_debug,
             "htf_bear_triggered": _htf_bear_triggered,
             "htf_bear_slope_pct": _htf_bear_slope_pct,
+            "mtf_confirmed": mtf_confirmed,
+            "mtf_size_mult": mtf_size_mult,
         }
 
     return {
@@ -3787,6 +3825,8 @@ def _compute_signal_layers(
         "htf_bear_debug": _htf_bear_debug,
         "htf_bear_triggered": _htf_bear_triggered,
         "htf_bear_slope_pct": _htf_bear_slope_pct,
+        "mtf_confirmed": mtf_confirmed,
+        "mtf_size_mult": mtf_size_mult,
     }
 
 
@@ -3906,6 +3946,9 @@ class AutoRunner:
         self._last_holding_log_ts: float = 0.0   # throttle repeated holding logs
         self._last_drawdown_log_ts: float = 0.0  # throttle repeated drawdown tier logs
         self._last_dd_tier: int = 0              # 0=none 1=65% 2=40% 3=25% 4=stop
+        # Momentum scaling (pyramiding) — tracks scale-in state per active trade
+        # Allowed modes: MINI_ASYM, NORMAL, AGGRESSIVE only
+        self._scaling_enabled: bool = mode in ("MINI_ASYM", "NORMAL", "AGGRESSIVE")
         self.session_start_equity: float = get_equity(email)
         # Peak must be the highest equity ever seen — read from user_state which survives
         # AI stop/restart (ai_runner_state is deleted on stop, user_state is permanent).
@@ -4520,6 +4563,38 @@ class AutoRunner:
                         f"close {exit_price:.4f} ({((exit_price - entry)/entry if side=='LONG' else (entry - exit_price)/entry)*100:+.3f}%) | "
                         f"SL={sl_price:.4f}  TP={tp_price:.4f}"
                     )
+
+                # ── Momentum Scaling (Pyramiding) — paper/demo only ───────────────────
+                # Scale into winning Grade A positions in two stages.
+                # Guards: must be in profit, drawdown < 7%, strictness ≤ 1.10.
+                # Not applied to Grade B (T1/T2 already multi-entry) or real trading.
+                if (not REAL_TRADING
+                        and pt.get("scaling_enabled")
+                        and best_move > 0
+                        and not pt.get("breakeven_after_t1")
+                        and drawdown_pct < 0.07
+                        and self.adaptive_strictness <= 1.10):
+                    _atr_now = float(atr) if atr else 0.0
+                    if _atr_now > 0 and not pt.get("scale1_done") and best_move >= 1.5 * _atr_now:
+                        pt["scale1_done"] = True
+                        pt["size_mult"] = round(float(pt.get("size_mult", 0.70)) + 0.20, 4)
+                        pt["breakeven"] = True   # SL → entry (breakeven)
+                        self.log(
+                            f"SCALE IN 1: +20% added at +{best_move*100:.2f}% "
+                            f"(threshold 1.5×ATR={1.5*_atr_now*100:.2f}%). "
+                            f"SL moved to breakeven. Total size {pt['size_mult']*100:.0f}% of mode."
+                        )
+                    elif _atr_now > 0 and pt.get("scale1_done") and not pt.get("scale2_done") and best_move >= 3.0 * _atr_now:
+                        pt["scale2_done"] = True
+                        pt["size_mult"] = round(float(pt.get("size_mult", 0.90)) + 0.10, 4)
+                        pt["breakeven"] = False
+                        pt["trail_locked_pct"] = round(1.5 * _atr_now, 6)  # lock +1.5× ATR profit
+                        self.log(
+                            f"SCALE IN 2: +10% added at +{best_move*100:.2f}% "
+                            f"(threshold 3.0×ATR={3.0*_atr_now*100:.2f}%). "
+                            f"SL locked at +{1.5*_atr_now*100:.2f}%. Total size {pt['size_mult']*100:.0f}% of mode."
+                        )
+
                 return None
 
         # Use the actual SL/TP price for display and DB when those levels were hit,
@@ -4884,7 +4959,14 @@ class AutoRunner:
                 higher_klines = _fetch_klines_sync(self.symbol, higher_tf, limit=100)
             except Exception:
                 higher_klines = []
-        res = _compute_signal_layers(klines, self.mode, self.adaptive_strictness, higher_klines, self.trade_style)
+        # 15m confirmation layer — DAY_TRADE and SWING only (SCALP IS 15m already)
+        mtf_klines: List[Dict] = []
+        if self.trade_style in ("DAY_TRADE", "SWING") and self.tf != "15m":
+            try:
+                mtf_klines = _fetch_klines_sync(self.symbol, "15m", limit=50)
+            except Exception:
+                mtf_klines = []
+        res = _compute_signal_layers(klines, self.mode, self.adaptive_strictness, higher_klines, self.trade_style, mtf_klines)
         self.last_breakdown = res.get("breakdown", {})
         self.last_score = res.get("score", 0.0)
         self.market_grade = res.get("grade", "-")
@@ -5390,9 +5472,12 @@ class AutoRunner:
                     real_order_id  = None
                     real_b_result  = None   # Grade B real only
                     _real_result   = None   # Grade A real only
+                    _mtf_sm = res.get("mtf_size_mult", 1.0)
+                    if not res.get("mtf_confirmed", True):
+                        self.log(f"15m not confirmed — size reduced to {_mtf_sm*100:.0f}% for lower conviction")
                     if REAL_TRADING:
                         try:
-                            size_pct  = float(c["size"])
+                            size_pct  = float(c["size"]) * _mtf_sm
                             usdt_size = equity_now * size_pct
                             if grade == "B":
                                 # Real Grade B: entry + two partial reduceOnly TP limit orders
@@ -5565,20 +5650,26 @@ class AutoRunner:
                             "sl_pct_open": sl_pct_open,
                             "tp_pct_open": tp_pct_open,
                         }
+                        _mtf_label = "" if res.get("mtf_confirmed", True) else f" | 15m unconfirmed→size {_mtf_sm*100:.0f}%"
                         if grade == "B":
                             self.pending_trades = [
-                                {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80,
+                                {**base_trade, "grade": "B", "size_mult": round(0.60 * _mtf_sm, 4), "tp_mult": 0.80,
                                  "is_primary": True,  "label": "T1"},
-                                {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00,
+                                {**base_trade, "grade": "B", "size_mult": round(0.40 * _mtf_sm, 4), "tp_mult": 1.00,
                                  "is_primary": False, "label": "T2", "breakeven_after_t1": True},
                             ]
-                            self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}")
+                            self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}{_mtf_label}")
                         else:
+                            # Scaling enabled: open at 70% to allow scale-ins. Builds to 100% on winners.
+                            _grade_a_sm = round((0.70 if self._scaling_enabled else 1.00) * _mtf_sm, 4)
+                            _scale_label = " | scaling: entry 70%" if self._scaling_enabled else ""
                             self.pending_trades = [
-                                {**base_trade, "grade": "A", "size_mult": 1.00, "tp_mult": 1.00,
-                                 "is_primary": True},
+                                {**base_trade, "grade": "A", "size_mult": _grade_a_sm, "tp_mult": 1.00,
+                                 "is_primary": True,
+                                 "scale1_done": False, "scale2_done": False,
+                                 "scaling_enabled": self._scaling_enabled},
                             ]
-                            self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}")
+                            self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}{_mtf_label}{_scale_label}")
                         self.last_trade_ts = now_ts
                         _save_runner_state(self)   # persist open position immediately
                 else:
@@ -7535,6 +7626,184 @@ def admin_save_notes(email: str, payload: AdminNotesIn, admin=Depends(require_ad
         )
         conn.commit()
     return {"ok": True}
+
+
+# =========================
+# ANALYTICS ENDPOINTS (admin only)
+# =========================
+
+def _analytics_win_rate(rows: List[Dict]) -> Dict:
+    """Helper: compute win rate, avg win, avg loss from a list of trade dicts."""
+    wins   = [float(r.get("unreal_pnl_value") or 0) for r in rows if (float(r.get("unreal_pnl_value") or 0)) > 0]
+    losses = [float(r.get("unreal_pnl_value") or 0) for r in rows if (float(r.get("unreal_pnl_value") or 0)) <= 0]
+    total  = len(rows)
+    return {
+        "total":    total,
+        "wins":     len(wins),
+        "losses":   len(losses),
+        "win_rate": round(len(wins) / total * 100, 1) if total > 0 else 0.0,
+        "avg_win":  round(sum(wins)   / len(wins),   2) if wins   else 0.0,
+        "avg_loss": round(sum(losses) / len(losses), 2) if losses else 0.0,
+        "total_pnl": round(sum(wins) + sum(losses), 2),
+    }
+
+@app.get("/analytics/overview")
+def analytics_overview(admin=Depends(require_admin)):
+    """Section 1 — overall platform performance across all accounts."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        # All closed trades (have outcome, not just paper holding)
+        cur.execute(
+            "SELECT email, unreal_pnl_value, time, equity_after FROM trades "
+            "WHERE outcome IS NOT NULL AND outcome != 'HOLDING' ORDER BY time DESC"
+        )
+        all_trades = [dict(r) for r in cur.fetchall()]
+
+        # Running AI count
+        cur.execute("SELECT COUNT(*) as cnt FROM user_state")
+        user_count = (cur.fetchone() or {}).get("cnt", 0)
+
+    stats = _analytics_win_rate(all_trades)
+
+    # Per-account equity (best/worst)
+    acct_pnl: Dict[str, float] = {}
+    for t in all_trades:
+        em = t.get("email") or "unknown"
+        acct_pnl[em] = acct_pnl.get(em, 0.0) + float(t.get("unreal_pnl_value") or 0)
+
+    best_acct  = max(acct_pnl, key=acct_pnl.get) if acct_pnl else None
+    worst_acct = min(acct_pnl, key=acct_pnl.get) if acct_pnl else None
+    live_running = len(AUTO_RUNNERS)
+
+    return {
+        "ok": True,
+        "total_trades":   stats["total"],
+        "combined_win_rate": stats["win_rate"],
+        "avg_win":  stats["avg_win"],
+        "avg_loss": stats["avg_loss"],
+        "total_pnl": stats["total_pnl"],
+        "total_accounts": user_count,
+        "live_running": live_running,
+        "best_account":  best_acct,
+        "worst_account": worst_acct,
+        "best_account_pnl":  round(acct_pnl.get(best_acct,  0), 2) if best_acct  else 0,
+        "worst_account_pnl": round(acct_pnl.get(worst_acct, 0), 2) if worst_acct else 0,
+    }
+
+@app.get("/analytics/win-rates")
+def analytics_win_rates(admin=Depends(require_admin)):
+    """Section 2 — win rate broken down by regime, session, grade, and score band."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT unreal_pnl_value, signal, mode, grade, signal_score "
+            "FROM trades WHERE outcome IS NOT NULL AND outcome != 'HOLDING'"
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+
+    def _band(rows_in, key, val):
+        return _analytics_win_rate([r for r in rows_in if (r.get(key) or "") == val])
+
+    def _score_band(rows_in, lo, hi):
+        return _analytics_win_rate([
+            r for r in rows_in
+            if lo <= float(r.get("signal_score") or 0) < hi
+        ])
+
+    def _signal_contains(rows_in, keyword):
+        return _analytics_win_rate([
+            r for r in rows_in
+            if keyword.upper() in (r.get("signal") or "").upper()
+        ])
+
+    return {
+        "ok": True,
+        "by_grade": {
+            "A": _band(rows, "grade", "A"),
+            "B": _band(rows, "grade", "B"),
+        },
+        "by_score": {
+            "0.65-0.70": _score_band(rows, 0.65, 0.70),
+            "0.70-0.78": _score_band(rows, 0.70, 0.78),
+            "0.78+":     _score_band(rows, 0.78, 9.99),
+        },
+        "by_regime": {
+            "TRENDING": _signal_contains(rows, "TRENDING"),
+            "MARGINAL": _signal_contains(rows, "MARGINAL"),
+        },
+        "by_session": {
+            "London_NY":  _signal_contains(rows, "LONDON+NY"),
+            "London":     _signal_contains(rows, "LONDON"),
+            "Asian":      _signal_contains(rows, "ASIAN"),
+        },
+    }
+
+@app.get("/analytics/by-coin")
+def analytics_by_coin(admin=Depends(require_admin)):
+    """Section 4 — per-symbol win rate, total PnL, and trade count."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT symbol, unreal_pnl_value, grade "
+            "FROM trades WHERE outcome IS NOT NULL AND outcome != 'HOLDING'"
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+
+    coins: Dict[str, List[Dict]] = {}
+    for r in rows:
+        sym = (r.get("symbol") or "UNKNOWN").upper()
+        coins.setdefault(sym, []).append(r)
+
+    result = {}
+    for sym, coin_rows in sorted(coins.items()):
+        s = _analytics_win_rate(coin_rows)
+        result[sym] = s
+    return {"ok": True, "by_coin": result}
+
+@app.get("/analytics/by-regime")
+def analytics_by_regime(admin=Depends(require_admin)):
+    """Signal quality trend — average score per day over last 30 days."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        # signal_score may be NULL for older trades — filter those out
+        cur.execute(
+            "SELECT DATE(time) as day, AVG(signal_score) as avg_score, COUNT(*) as cnt "
+            "FROM trades WHERE signal_score IS NOT NULL "
+            "AND time >= NOW() - INTERVAL '30 days' "
+            "GROUP BY DATE(time) ORDER BY day ASC"
+        )
+        rows = [{"day": str(r["day"]), "avg_score": round(float(r["avg_score"] or 0), 3), "count": int(r["cnt"])}
+                for r in cur.fetchall()]
+    return {"ok": True, "signal_trend": rows}
+
+@app.get("/analytics/by-session")
+def analytics_by_session(admin=Depends(require_admin)):
+    """Section 5 — actual vs backtested placeholder + session summary."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT unreal_pnl_value, trade_style, time "
+            "FROM trades WHERE outcome IS NOT NULL AND outcome != 'HOLDING'"
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+
+    by_style: Dict[str, List] = {}
+    for r in rows:
+        style = (r.get("trade_style") or "DAY_TRADE").upper()
+        by_style.setdefault(style, []).append(r)
+
+    result = {style: _analytics_win_rate(style_rows) for style, style_rows in by_style.items()}
+
+    # Monthly returns (last 6 months)
+    monthly: Dict[str, float] = {}
+    for r in rows:
+        t_str = str(r.get("time") or "")
+        if len(t_str) >= 7:
+            month = t_str[:7]
+            monthly[month] = round(monthly.get(month, 0.0) + float(r.get("unreal_pnl_value") or 0), 2)
+    monthly_sorted = [{"month": k, "pnl": v} for k, v in sorted(monthly.items())[-6:]]
+
+    return {"ok": True, "by_style": result, "monthly_returns": monthly_sorted}
 
 
 # =========================
