@@ -7694,122 +7694,156 @@ def _analytics_win_rate(rows: List[Dict]) -> Dict:
 @app.get("/analytics/overview")
 def analytics_overview(admin=Depends(require_admin)):
     """Section 1 — overall platform performance across all accounts."""
-    with db_conn() as conn:
-        cur = conn.cursor()
-        # trades table only stores closed trades — every row is a completed trade
-        cur.execute("SELECT email, unreal_pnl_value, time, equity_after FROM trades ORDER BY time DESC")
-        all_trades = [dict(r) for r in cur.fetchall()]
-        cur.execute("SELECT COUNT(*) as cnt FROM user_state")
-        user_count = int((cur.fetchone() or {}).get("cnt", 0))
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT email, unreal_pnl_value, time, equity_after FROM trades ORDER BY time DESC")
+            all_trades = [dict(r) for r in cur.fetchall()]
+            cur.execute("SELECT COUNT(*) as cnt FROM user_state")
+            user_count = int((cur.fetchone() or {}).get("cnt", 0))
 
-    stats = _analytics_win_rate(all_trades)
+        stats = _analytics_win_rate(all_trades)
 
-    acct_pnl: Dict[str, float] = {}
-    for t in all_trades:
-        em = t.get("email") or "unknown"
-        acct_pnl[em] = round(acct_pnl.get(em, 0.0) + float(t.get("unreal_pnl_value") or 0), 2)
+        acct_pnl: Dict[str, float] = {}
+        for t in all_trades:
+            em = t.get("email") or "unknown"
+            acct_pnl[em] = round(acct_pnl.get(em, 0.0) + float(t.get("unreal_pnl_value") or 0), 2)
 
-    best_acct  = max(acct_pnl, key=acct_pnl.get) if acct_pnl else None
-    worst_acct = min(acct_pnl, key=acct_pnl.get) if acct_pnl else None
+        best_acct  = max(acct_pnl, key=acct_pnl.get) if acct_pnl else None
+        worst_acct = min(acct_pnl, key=acct_pnl.get) if acct_pnl else None
 
-    return {
-        "ok": True,
-        "total_trades":      stats["total"],
-        "combined_win_rate": stats["win_rate"],
-        "avg_win":           stats["avg_win"],
-        "avg_loss":          stats["avg_loss"],
-        "total_pnl":         stats["total_pnl"],
-        "total_accounts":    user_count,
-        "live_running":      len(AUTO_RUNNERS),
-        "best_account":      best_acct,
-        "worst_account":     worst_acct,
-        "best_account_pnl":  round(acct_pnl.get(best_acct,  0), 2) if best_acct  else 0,
-        "worst_account_pnl": round(acct_pnl.get(worst_acct, 0), 2) if worst_acct else 0,
-    }
+        return {
+            "ok": True,
+            "total_trades":      stats["total"],
+            "combined_win_rate": stats["win_rate"],
+            "avg_win":           stats["avg_win"],
+            "avg_loss":          stats["avg_loss"],
+            "total_pnl":         stats["total_pnl"],
+            "total_accounts":    user_count,
+            "live_running":      len(AUTO_RUNNERS),
+            "best_account":      best_acct,
+            "worst_account":     worst_acct,
+            "best_account_pnl":  round(acct_pnl.get(best_acct,  0), 2) if best_acct  else 0,
+            "worst_account_pnl": round(acct_pnl.get(worst_acct, 0), 2) if worst_acct else 0,
+        }
+    except Exception as _e:
+        print(f"[analytics/overview] error: {_e}")
+        return {"ok": False, "error": str(_e), "total_trades": 0, "combined_win_rate": 0,
+                "avg_win": 0, "avg_loss": 0, "total_pnl": 0, "total_accounts": 0,
+                "live_running": len(AUTO_RUNNERS), "best_account": None, "worst_account": None,
+                "best_account_pnl": 0, "worst_account_pnl": 0}
+
 
 @app.get("/analytics/win-rates")
 def analytics_win_rates(admin=Depends(require_admin)):
     """Section 2 — win rate by mode and side (using columns that exist in trades table)."""
-    with db_conn() as conn:
-        cur = conn.cursor()
-        # Only use columns confirmed to exist: unreal_pnl_value, mode, side, symbol, leverage
-        cur.execute("SELECT unreal_pnl_value, mode, side FROM trades")
-        rows = [dict(r) for r in cur.fetchall()]
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT unreal_pnl_value, mode, side FROM trades")
+            rows = [dict(r) for r in cur.fetchall()]
 
-    def _band(rows_in: List[Dict], key: str, val: str) -> Dict:
-        return _analytics_win_rate([r for r in rows_in if (r.get(key) or "") == val])
+        def _band(rows_in: List[Dict], key: str, val: str) -> Dict:
+            return _analytics_win_rate([r for r in rows_in if (r.get(key) or "") == val])
 
-    return {
-        "ok": True,
-        "by_grade": {
-            "LONG":  _band(rows, "side", "LONG"),
-            "SHORT": _band(rows, "side", "SHORT"),
-        },
-        "by_score": {
-            "ULTRA_SAFE": _band(rows, "mode", "ULTRA_SAFE"),
-            "SAFE":       _band(rows, "mode", "SAFE"),
-            "NORMAL":     _band(rows, "mode", "NORMAL"),
-            "MINI_ASYM":  _band(rows, "mode", "MINI_ASYM"),
-            "AGGRESSIVE": _band(rows, "mode", "AGGRESSIVE"),
-        },
-        "by_regime": {},
-        "by_session": {},
-    }
+        return {
+            "ok": True,
+            "by_grade": {
+                "LONG":  _band(rows, "side", "LONG"),
+                "SHORT": _band(rows, "side", "SHORT"),
+            },
+            "by_score": {
+                "ULTRA_SAFE": _band(rows, "mode", "ULTRA_SAFE"),
+                "SAFE":       _band(rows, "mode", "SAFE"),
+                "NORMAL":     _band(rows, "mode", "NORMAL"),
+                "MINI_ASYM":  _band(rows, "mode", "MINI_ASYM"),
+                "AGGRESSIVE": _band(rows, "mode", "AGGRESSIVE"),
+            },
+            "by_regime": {},
+            "by_session": {},
+        }
+    except Exception as _e:
+        print(f"[analytics/win-rates] error: {_e}")
+        return {"ok": False, "error": str(_e), "by_grade": {}, "by_score": {}, "by_regime": {}, "by_session": {}}
+
 
 @app.get("/analytics/by-coin")
 def analytics_by_coin(admin=Depends(require_admin)):
     """Section 4 — per-symbol win rate, total PnL, and trade count."""
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT symbol, unreal_pnl_value FROM trades")
-        rows = [dict(r) for r in cur.fetchall()]
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT symbol, unreal_pnl_value FROM trades")
+            rows = [dict(r) for r in cur.fetchall()]
 
-    coins: Dict[str, List[Dict]] = {}
-    for r in rows:
-        sym = (r.get("symbol") or "UNKNOWN").upper()
-        coins.setdefault(sym, []).append(r)
+        coins: Dict[str, List[Dict]] = {}
+        for r in rows:
+            sym = (r.get("symbol") or "UNKNOWN").upper()
+            coins.setdefault(sym, []).append(r)
 
-    result = {sym: _analytics_win_rate(coin_rows) for sym, coin_rows in sorted(coins.items())}
-    return {"ok": True, "by_coin": result}
+        result = {sym: _analytics_win_rate(coin_rows) for sym, coin_rows in sorted(coins.items())}
+        return {"ok": True, "by_coin": result}
+    except Exception as _e:
+        print(f"[analytics/by-coin] error: {_e}")
+        return {"ok": False, "error": str(_e), "by_coin": {}}
+
 
 @app.get("/analytics/by-regime")
 def analytics_by_regime(admin=Depends(require_admin)):
-    """Signal quality trend — trade count and PnL per day over last 30 days.
-    Note: signal_score is not in the trades table — uses trade count + pnl as proxy."""
-    with db_conn() as conn:
-        cur = conn.cursor()
-        # Use time (exists) — group by day, count trades and sum PnL
-        cur.execute(
-            "SELECT SUBSTRING(time, 1, 10) as day, COUNT(*) as cnt, "
-            "AVG(CASE WHEN unreal_pnl_value > 0 THEN 1.0 ELSE 0.0 END) as win_rate "
-            "FROM trades "
-            "WHERE SUBSTRING(time, 1, 10) >= TO_CHAR(NOW() - INTERVAL '30 days', 'YYYY-MM-DD') "
-            "GROUP BY SUBSTRING(time, 1, 10) ORDER BY day ASC"
-        )
-        rows = [
-            {"day": str(r["day"]), "avg_score": round(float(r["win_rate"] or 0), 3), "count": int(r["cnt"])}
-            for r in cur.fetchall()
-        ]
-    return {"ok": True, "signal_trend": rows}
+    """Signal quality trend — trade count and win rate per day over last 30 days."""
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            if USING_PG:
+                cur.execute(
+                    "SELECT SUBSTRING(time, 1, 10) AS day, COUNT(*) AS cnt, "
+                    "AVG(CASE WHEN unreal_pnl_value > 0 THEN 1.0 ELSE 0.0 END) AS win_rate "
+                    "FROM trades "
+                    "WHERE LENGTH(time) >= 10 AND SUBSTRING(time, 1, 10) >= "
+                    "TO_CHAR(NOW() - INTERVAL '30 days', 'YYYY-MM-DD') "
+                    "GROUP BY SUBSTRING(time, 1, 10) ORDER BY day ASC"
+                )
+            else:
+                # SQLite fallback — uses strftime and SUBSTR
+                cur.execute(
+                    "SELECT SUBSTR(time, 1, 10) AS day, COUNT(*) AS cnt, "
+                    "AVG(CASE WHEN unreal_pnl_value > 0 THEN 1.0 ELSE 0.0 END) AS win_rate "
+                    "FROM trades "
+                    "WHERE LENGTH(time) >= 10 AND SUBSTR(time, 1, 10) >= "
+                    "strftime('%Y-%m-%d', datetime('now', '-30 days')) "
+                    "GROUP BY SUBSTR(time, 1, 10) ORDER BY day ASC"
+                )
+            rows = [
+                {"day": str(r["day"]), "avg_score": round(float(r["win_rate"] or 0), 3), "count": int(r["cnt"])}
+                for r in cur.fetchall()
+            ]
+        return {"ok": True, "signal_trend": rows}
+    except Exception as _e:
+        print(f"[analytics/by-regime] error: {_e}")
+        return {"ok": False, "error": str(_e), "signal_trend": []}
+
 
 @app.get("/analytics/by-session")
 def analytics_by_session(admin=Depends(require_admin)):
     """Monthly returns over last 6 months using existing trades columns."""
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT unreal_pnl_value, time FROM trades")
-        rows = [dict(r) for r in cur.fetchall()]
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT unreal_pnl_value, time FROM trades")
+            rows = [dict(r) for r in cur.fetchall()]
 
-    # Monthly P&L (last 6 months)
-    monthly: Dict[str, float] = {}
-    for r in rows:
-        t_str = str(r.get("time") or "")
-        if len(t_str) >= 7:
-            month = t_str[:7]
-            monthly[month] = round(monthly.get(month, 0.0) + float(r.get("unreal_pnl_value") or 0), 2)
-    monthly_sorted = [{"month": k, "pnl": v} for k, v in sorted(monthly.items())[-6:]]
+        monthly: Dict[str, float] = {}
+        for r in rows:
+            t_str = str(r.get("time") or "")
+            if len(t_str) >= 7:
+                month = t_str[:7]
+                monthly[month] = round(monthly.get(month, 0.0) + float(r.get("unreal_pnl_value") or 0), 2)
+        monthly_sorted = [{"month": k, "pnl": v} for k, v in sorted(monthly.items())[-6:]]
 
-    return {"ok": True, "by_style": {}, "monthly_returns": monthly_sorted}
+        return {"ok": True, "by_style": {}, "monthly_returns": monthly_sorted}
+    except Exception as _e:
+        print(f"[analytics/by-session] error: {_e}")
+        return {"ok": False, "error": str(_e), "by_style": {}, "monthly_returns": []}
 
 
 # =========================
