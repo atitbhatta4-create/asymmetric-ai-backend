@@ -565,6 +565,10 @@ def init_db() -> None:
         # Fixes: floor dropping after redeploy when ai_runner_state (and its floor_equity column) is cleared.
         if not column_exists(conn, "user_state", "floor_equity"):
             cur.execute("ALTER TABLE user_state ADD COLUMN floor_equity REAL DEFAULT 0")
+        # Persists why the engine last stopped — allows frontend to show correct warning on restart.
+        # Cleared when engine starts successfully (auto_start writes NULL).
+        if not column_exists(conn, "user_state", "last_stop_reason"):
+            cur.execute("ALTER TABLE user_state ADD COLUMN last_stop_reason TEXT DEFAULT NULL")
         # Live runner state — persists adaptive_strictness, open positions, etc. across redeploys
         for col, coltype, defval in [
             ("adaptive_strictness",  "REAL",    "1.0"),
@@ -5363,6 +5367,15 @@ class AutoRunner:
                     self.blocked_reason = "HARD_FLOOR"
                     self.stop_event.set()
                     email_ai_stopped(self.email, self.symbol, "HARD_FLOOR", current_equity)
+                    try:
+                        with db_conn() as _hf_conn:
+                            _hf_conn.cursor().execute(
+                                "UPDATE user_state SET last_stop_reason=%s WHERE email=%s",
+                                ("HARD_FLOOR", self.email),
+                            )
+                            _hf_conn.commit()
+                    except Exception:
+                        pass
                     break
 
                 if self.peak_equity > 0:
@@ -6576,8 +6589,20 @@ def auto_status(user=Depends(require_user)):
     with AUTO_LOCK:
         r = AUTO_RUNNERS.get(email)
         if not r:
+            _last_stop = None
+            try:
+                with db_conn() as _sc:
+                    _sc_cur = _sc.cursor()
+                    _sc_cur.execute(
+                        "SELECT last_stop_reason FROM user_state WHERE email=%s", (email,)
+                    )
+                    _sc_row = _sc_cur.fetchone()
+                    _last_stop = (_sc_row or {}).get("last_stop_reason")
+            except Exception:
+                pass
             return {
                 "ok": True, "running": False,
+                "blocked_reason": _last_stop,
                 "restart_locked": lock_sec > 0,
                 "restart_lock_sec": lock_sec,
             }
@@ -6861,6 +6886,15 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         AUTO_RUNNERS[email] = runner
         runner.start()
         _save_runner_state(runner)   # persist so deploy/restart auto-resumes this runner
+
+    try:
+        with db_conn() as _clr_conn:
+            _clr_conn.cursor().execute(
+                "UPDATE user_state SET last_stop_reason=NULL WHERE email=%s", (email,)
+            )
+            _clr_conn.commit()
+    except Exception:
+        pass
 
     email_ai_started(
         to=email, symbol=symbol, mode=payload.mode, trade_style=payload.trade_style,
@@ -7633,18 +7667,19 @@ def admin_save_notes(email: str, payload: AdminNotesIn, admin=Depends(require_ad
 # =========================
 
 def _analytics_win_rate(rows: List[Dict]) -> Dict:
-    """Helper: compute win rate, avg win, avg loss from a list of trade dicts."""
-    wins   = [float(r.get("unreal_pnl_value") or 0) for r in rows if (float(r.get("unreal_pnl_value") or 0)) > 0]
-    losses = [float(r.get("unreal_pnl_value") or 0) for r in rows if (float(r.get("unreal_pnl_value") or 0)) <= 0]
+    """Helper: compute win rate, avg win, avg loss from a list of trade dicts.
+    A trade is a win when unreal_pnl_value > 0 (stored for all closed trades in DB)."""
+    wins   = [float(r.get("unreal_pnl_value") or 0) for r in rows if float(r.get("unreal_pnl_value") or 0) > 0]
+    losses = [float(r.get("unreal_pnl_value") or 0) for r in rows if float(r.get("unreal_pnl_value") or 0) <= 0]
     total  = len(rows)
     return {
-        "total":    total,
-        "wins":     len(wins),
-        "losses":   len(losses),
-        "win_rate": round(len(wins) / total * 100, 1) if total > 0 else 0.0,
-        "avg_win":  round(sum(wins)   / len(wins),   2) if wins   else 0.0,
-        "avg_loss": round(sum(losses) / len(losses), 2) if losses else 0.0,
-        "total_pnl": round(sum(wins) + sum(losses), 2),
+        "total":     total,
+        "wins":      len(wins),
+        "losses":    len(losses),
+        "win_rate":  round(len(wins) / total * 100, 1) if total > 0 else 0.0,
+        "avg_win":   round(sum(wins)   / len(wins),   2) if wins   else 0.0,
+        "avg_loss":  round(sum(losses) / len(losses), 2) if losses else 0.0,
+        "total_pnl": round(sum(wins) + sum(losses),   2),
     }
 
 @app.get("/analytics/overview")
@@ -7652,90 +7687,64 @@ def analytics_overview(admin=Depends(require_admin)):
     """Section 1 — overall platform performance across all accounts."""
     with db_conn() as conn:
         cur = conn.cursor()
-        # All closed trades (have outcome, not just paper holding)
-        cur.execute(
-            "SELECT email, unreal_pnl_value, time, equity_after FROM trades "
-            "WHERE outcome IS NOT NULL AND outcome != 'HOLDING' ORDER BY time DESC"
-        )
+        # trades table only stores closed trades — every row is a completed trade
+        cur.execute("SELECT email, unreal_pnl_value, time, equity_after FROM trades ORDER BY time DESC")
         all_trades = [dict(r) for r in cur.fetchall()]
-
-        # Running AI count
         cur.execute("SELECT COUNT(*) as cnt FROM user_state")
-        user_count = (cur.fetchone() or {}).get("cnt", 0)
+        user_count = int((cur.fetchone() or {}).get("cnt", 0))
 
     stats = _analytics_win_rate(all_trades)
 
-    # Per-account equity (best/worst)
     acct_pnl: Dict[str, float] = {}
     for t in all_trades:
         em = t.get("email") or "unknown"
-        acct_pnl[em] = acct_pnl.get(em, 0.0) + float(t.get("unreal_pnl_value") or 0)
+        acct_pnl[em] = round(acct_pnl.get(em, 0.0) + float(t.get("unreal_pnl_value") or 0), 2)
 
     best_acct  = max(acct_pnl, key=acct_pnl.get) if acct_pnl else None
     worst_acct = min(acct_pnl, key=acct_pnl.get) if acct_pnl else None
-    live_running = len(AUTO_RUNNERS)
 
     return {
         "ok": True,
-        "total_trades":   stats["total"],
+        "total_trades":      stats["total"],
         "combined_win_rate": stats["win_rate"],
-        "avg_win":  stats["avg_win"],
-        "avg_loss": stats["avg_loss"],
-        "total_pnl": stats["total_pnl"],
-        "total_accounts": user_count,
-        "live_running": live_running,
-        "best_account":  best_acct,
-        "worst_account": worst_acct,
+        "avg_win":           stats["avg_win"],
+        "avg_loss":          stats["avg_loss"],
+        "total_pnl":         stats["total_pnl"],
+        "total_accounts":    user_count,
+        "live_running":      len(AUTO_RUNNERS),
+        "best_account":      best_acct,
+        "worst_account":     worst_acct,
         "best_account_pnl":  round(acct_pnl.get(best_acct,  0), 2) if best_acct  else 0,
         "worst_account_pnl": round(acct_pnl.get(worst_acct, 0), 2) if worst_acct else 0,
     }
 
 @app.get("/analytics/win-rates")
 def analytics_win_rates(admin=Depends(require_admin)):
-    """Section 2 — win rate broken down by regime, session, grade, and score band."""
+    """Section 2 — win rate by mode and side (using columns that exist in trades table)."""
     with db_conn() as conn:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT unreal_pnl_value, signal, mode, grade, signal_score "
-            "FROM trades WHERE outcome IS NOT NULL AND outcome != 'HOLDING'"
-        )
+        # Only use columns confirmed to exist: unreal_pnl_value, mode, side, symbol, leverage
+        cur.execute("SELECT unreal_pnl_value, mode, side FROM trades")
         rows = [dict(r) for r in cur.fetchall()]
 
-    def _band(rows_in, key, val):
+    def _band(rows_in: List[Dict], key: str, val: str) -> Dict:
         return _analytics_win_rate([r for r in rows_in if (r.get(key) or "") == val])
-
-    def _score_band(rows_in, lo, hi):
-        return _analytics_win_rate([
-            r for r in rows_in
-            if lo <= float(r.get("signal_score") or 0) < hi
-        ])
-
-    def _signal_contains(rows_in, keyword):
-        return _analytics_win_rate([
-            r for r in rows_in
-            if keyword.upper() in (r.get("signal") or "").upper()
-        ])
 
     return {
         "ok": True,
         "by_grade": {
-            "A": _band(rows, "grade", "A"),
-            "B": _band(rows, "grade", "B"),
+            "LONG":  _band(rows, "side", "LONG"),
+            "SHORT": _band(rows, "side", "SHORT"),
         },
         "by_score": {
-            "0.65-0.70": _score_band(rows, 0.65, 0.70),
-            "0.70-0.78": _score_band(rows, 0.70, 0.78),
-            "0.78+":     _score_band(rows, 0.78, 9.99),
+            "ULTRA_SAFE": _band(rows, "mode", "ULTRA_SAFE"),
+            "SAFE":       _band(rows, "mode", "SAFE"),
+            "NORMAL":     _band(rows, "mode", "NORMAL"),
+            "MINI_ASYM":  _band(rows, "mode", "MINI_ASYM"),
+            "AGGRESSIVE": _band(rows, "mode", "AGGRESSIVE"),
         },
-        "by_regime": {
-            "TRENDING": _signal_contains(rows, "TRENDING"),
-            "MARGINAL": _signal_contains(rows, "MARGINAL"),
-        },
-        "by_session": {
-            "London_NY":  _signal_contains(rows, "LONDON+NY"),
-            "London":     _signal_contains(rows, "LONDON"),
-            "Asian":      _signal_contains(rows, "ASIAN"),
-        },
+        "by_regime": {},
+        "by_session": {},
     }
 
 @app.get("/analytics/by-coin")
@@ -7743,10 +7752,7 @@ def analytics_by_coin(admin=Depends(require_admin)):
     """Section 4 — per-symbol win rate, total PnL, and trade count."""
     with db_conn() as conn:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT symbol, unreal_pnl_value, grade "
-            "FROM trades WHERE outcome IS NOT NULL AND outcome != 'HOLDING'"
-        )
+        cur.execute("SELECT symbol, unreal_pnl_value FROM trades")
         rows = [dict(r) for r in cur.fetchall()]
 
     coins: Dict[str, List[Dict]] = {}
@@ -7754,47 +7760,38 @@ def analytics_by_coin(admin=Depends(require_admin)):
         sym = (r.get("symbol") or "UNKNOWN").upper()
         coins.setdefault(sym, []).append(r)
 
-    result = {}
-    for sym, coin_rows in sorted(coins.items()):
-        s = _analytics_win_rate(coin_rows)
-        result[sym] = s
+    result = {sym: _analytics_win_rate(coin_rows) for sym, coin_rows in sorted(coins.items())}
     return {"ok": True, "by_coin": result}
 
 @app.get("/analytics/by-regime")
 def analytics_by_regime(admin=Depends(require_admin)):
-    """Signal quality trend — average score per day over last 30 days."""
+    """Signal quality trend — trade count and PnL per day over last 30 days.
+    Note: signal_score is not in the trades table — uses trade count + pnl as proxy."""
     with db_conn() as conn:
         cur = conn.cursor()
-        # signal_score may be NULL for older trades — filter those out
+        # Use time (exists) — group by day, count trades and sum PnL
         cur.execute(
-            "SELECT DATE(time) as day, AVG(signal_score) as avg_score, COUNT(*) as cnt "
-            "FROM trades WHERE signal_score IS NOT NULL "
-            "AND time >= NOW() - INTERVAL '30 days' "
-            "GROUP BY DATE(time) ORDER BY day ASC"
+            "SELECT SUBSTRING(time, 1, 10) as day, COUNT(*) as cnt, "
+            "AVG(CASE WHEN unreal_pnl_value > 0 THEN 1.0 ELSE 0.0 END) as win_rate "
+            "FROM trades "
+            "WHERE SUBSTRING(time, 1, 10) >= TO_CHAR(NOW() - INTERVAL '30 days', 'YYYY-MM-DD') "
+            "GROUP BY SUBSTRING(time, 1, 10) ORDER BY day ASC"
         )
-        rows = [{"day": str(r["day"]), "avg_score": round(float(r["avg_score"] or 0), 3), "count": int(r["cnt"])}
-                for r in cur.fetchall()]
+        rows = [
+            {"day": str(r["day"]), "avg_score": round(float(r["win_rate"] or 0), 3), "count": int(r["cnt"])}
+            for r in cur.fetchall()
+        ]
     return {"ok": True, "signal_trend": rows}
 
 @app.get("/analytics/by-session")
 def analytics_by_session(admin=Depends(require_admin)):
-    """Section 5 — actual vs backtested placeholder + session summary."""
+    """Monthly returns over last 6 months using existing trades columns."""
     with db_conn() as conn:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT unreal_pnl_value, trade_style, time "
-            "FROM trades WHERE outcome IS NOT NULL AND outcome != 'HOLDING'"
-        )
+        cur.execute("SELECT unreal_pnl_value, time FROM trades")
         rows = [dict(r) for r in cur.fetchall()]
 
-    by_style: Dict[str, List] = {}
-    for r in rows:
-        style = (r.get("trade_style") or "DAY_TRADE").upper()
-        by_style.setdefault(style, []).append(r)
-
-    result = {style: _analytics_win_rate(style_rows) for style, style_rows in by_style.items()}
-
-    # Monthly returns (last 6 months)
+    # Monthly P&L (last 6 months)
     monthly: Dict[str, float] = {}
     for r in rows:
         t_str = str(r.get("time") or "")
@@ -7803,7 +7800,7 @@ def analytics_by_session(admin=Depends(require_admin)):
             monthly[month] = round(monthly.get(month, 0.0) + float(r.get("unreal_pnl_value") or 0), 2)
     monthly_sorted = [{"month": k, "pnl": v} for k, v in sorted(monthly.items())[-6:]]
 
-    return {"ok": True, "by_style": result, "monthly_returns": monthly_sorted}
+    return {"ok": True, "by_style": {}, "monthly_returns": monthly_sorted}
 
 
 # =========================
