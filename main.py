@@ -25,6 +25,23 @@ from pydantic import BaseModel, Field, field_validator
 
 from database import db, db_conn, USING_PG, column_exists, serial_pk
 
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.starlette import StarletteIntegration
+
+_SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
+if _SENTRY_DSN:
+    sentry_sdk.init(
+        dsn=_SENTRY_DSN,
+        integrations=[
+            StarletteIntegration(transaction_style="endpoint"),
+            FastApiIntegration(transaction_style="endpoint"),
+        ],
+        traces_sample_rate=0.05,  # 5% of requests — stays within free tier
+        environment=os.getenv("RENDER_SERVICE_NAME", "local"),
+        release=os.getenv("RENDER_GIT_COMMIT", "unknown"),
+    )
+
 # =========================
 # App
 # =========================
@@ -5376,6 +5393,15 @@ class AutoRunner:
                     self.blocked_reason = "HARD_FLOOR"
                     self.stop_event.set()
                     email_ai_stopped(self.email, self.symbol, "HARD_FLOOR", current_equity)
+                    if _SENTRY_DSN:
+                        with sentry_sdk.new_scope() as scope:
+                            scope.set_user({"email": self.email})
+                            scope.set_tag("symbol", self.symbol)
+                            scope.set_tag("mode", self.mode)
+                            scope.set_level("warning")
+                            sentry_sdk.capture_message(
+                                f"HARD_FLOOR triggered: {self.email} | equity ${current_equity:.2f} < floor ${self.floor_equity:.2f}"
+                            )
                     try:
                         with db_conn() as _hf_conn:
                             _hf_conn.cursor().execute(
@@ -5703,6 +5729,12 @@ class AutoRunner:
                 self.blocked_reason = "ERROR"
                 self.last_signal = f"ERROR: {str(e)[:120]}"
                 self.log(self.last_signal)
+                if _SENTRY_DSN:
+                    with sentry_sdk.new_scope() as scope:
+                        scope.set_user({"email": self.email})
+                        scope.set_tag("symbol", self.symbol)
+                        scope.set_tag("mode", self.mode)
+                        sentry_sdk.capture_exception(e)
             finally:
                 # Sleep in 30-second chunks so the loop wakes up quickly when
                 # the mid-candle monitor opens a trade and sets pending_trades.
@@ -7746,6 +7778,12 @@ def analytics_win_rates(admin=Depends(require_admin)):
         def _band(rows_in: List[Dict], key: str, val: str) -> Dict:
             return _analytics_win_rate([r for r in rows_in if (r.get(key) or "") == val])
 
+        def _lev_band(rows_in: List[Dict], lo: float, hi: float) -> Dict:
+            return _analytics_win_rate([
+                r for r in rows_in
+                if lo <= float(r.get("leverage") or 0) <= hi
+            ])
+
         return {
             "ok": True,
             "by_grade": {
@@ -7759,7 +7797,11 @@ def analytics_win_rates(admin=Depends(require_admin)):
                 "MINI_ASYM":  _band(rows, "mode", "MINI_ASYM"),
                 "AGGRESSIVE": _band(rows, "mode", "AGGRESSIVE"),
             },
-            "by_regime": {},
+            "by_leverage": {
+                "Low (1-5×)":  _lev_band(rows, 1, 5),
+                "Mid (6-10×)": _lev_band(rows, 6, 10),
+                "High (11+×)": _lev_band(rows, 11, 999),
+            },
             "by_session": {},
         }
     except Exception as _e:
