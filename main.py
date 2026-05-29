@@ -1794,7 +1794,6 @@ def _bybit_signed_get(api_key: str, api_secret: str, path: str, query: str) -> t
             last_error = f"{type(e).__name__} from {host}: {e}"
             print(f"[bybit] exception: {last_error}")
     return None, last_error
-    return None
 
 
 def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
@@ -2079,6 +2078,7 @@ def _fetch_klines_bybit_sync(symbol: str, tf: str, limit: int = 200) -> List[Dic
             headers={"accept": "application/json"},
         )
         if r.status_code != 200:
+            print(f"[klines-bybit] HTTP {r.status_code} for {sym}/{interval}: {r.text[:120]}")
             return []
         items = ((r.json() or {}).get("result") or {}).get("list") or []
         if not items:
@@ -3014,6 +3014,15 @@ async def _place_trade_internal(
 # =========================
 AUTO_LOCK = threading.Lock()
 AUTO_RUNNERS: Dict[str, "AutoRunner"] = {}
+
+# ── Engine start queue (Task 11) ──────────────────────────────────────────────
+# Prevents server overload when many users start engines simultaneously.
+# Max 10 starts per 60s rolling window, minimum 6s gap between any two starts.
+_ENGINE_START_LOCK  = threading.Lock()
+_engine_start_times: List[float] = []   # timestamps of accepted starts in last 60s
+_last_engine_start_ts: float = 0.0      # timestamp of most recent accepted start
+_MAX_STARTS_PER_MIN = 10
+_ENGINE_START_GAP   = 6                 # seconds
 
 
 # ── Runner state persistence (survive deploys) ────────────────────────────────
@@ -4321,18 +4330,28 @@ class AutoRunner:
         )
 
     def _fetch_price_sync(self, symbol: str) -> float:
-        """Sync OKX price fetch for use inside runner thread."""
+        """Sync OKX price fetch for use inside runner thread. 1 retry on transient errors."""
         inst = to_okx_inst(symbol)
-        r = httpx.get(
-            f"{OKX_BASE}/api/v5/market/ticker",
-            params={"instId": inst},
-            timeout=8,
-            headers={"accept": "application/json"},
-        )
-        arr = (r.json() or {}).get("data") or []
-        if not arr:
-            raise RuntimeError(f"No price data for {symbol}")
-        return float(arr[0]["last"])
+        last_err: Exception = RuntimeError("price fetch failed")
+        for _attempt in range(2):
+            try:
+                r = httpx.get(
+                    f"{OKX_BASE}/api/v5/market/ticker",
+                    params={"instId": inst},
+                    timeout=8,
+                    headers={"accept": "application/json"},
+                )
+                if r.status_code != 200:
+                    raise RuntimeError(f"OKX HTTP {r.status_code} for {inst}")
+                arr = (r.json() or {}).get("data") or []
+                if not arr:
+                    raise RuntimeError(f"No price data for {symbol}")
+                return float(arr[0]["last"])
+            except Exception as _pe:
+                last_err = _pe
+                if _attempt == 0:
+                    time.sleep(2)
+        raise RuntimeError(f"Price fetch failed after 2 attempts: {last_err}")
 
     def _close_one_trade(self, pt: Dict, exit_price: float, equity_before: float,
                          candle_high: float = 0.0, candle_low: float = 0.0) -> float:
@@ -6978,6 +6997,36 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
                 conn.commit()
     except Exception as _sce:
         print(f"[auto-start] starting_capital set failed: {_sce}")
+
+    # ── Engine start queue ────────────────────────────────────────────────────
+    with _ENGINE_START_LOCK:
+        _now = time.time()
+        _engine_start_times[:] = [t for t in _engine_start_times if _now - t < 60]
+        _count = len(_engine_start_times)
+        _gap   = _now - _last_engine_start_ts
+
+        if _count >= _MAX_STARTS_PER_MIN:
+            _oldest   = min(_engine_start_times)
+            _retry_in = int(60 - (_now - _oldest)) + 1
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Engine start queued — {_MAX_STARTS_PER_MIN} engines are starting this minute. "
+                    f"You are position {_count - _MAX_STARTS_PER_MIN + 1} in queue. "
+                    f"Retry in {_retry_in}s."
+                ),
+            )
+        if _gap < _ENGINE_START_GAP:
+            _retry_in = int(_ENGINE_START_GAP - _gap) + 1
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Engine start queued — system staggers starts to protect stability. "
+                    f"Retry in {_retry_in}s."
+                ),
+            )
+        _engine_start_times.append(_now)
+        _last_engine_start_ts = _now
 
     with AUTO_LOCK:
         old = AUTO_RUNNERS.get(email)
