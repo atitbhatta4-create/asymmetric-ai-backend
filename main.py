@@ -43,6 +43,30 @@ if _SENTRY_DSN:
     )
 
 # =========================
+# Telegram alerts
+# =========================
+_TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+_TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID",  "").strip()
+
+def _tg_alert(text: str) -> None:
+    """Fire-and-forget Telegram message. Never raises, never blocks the engine."""
+    if not (_TG_TOKEN and _TG_CHAT):
+        return
+    def _send():
+        try:
+            import urllib.request, urllib.parse
+            url = f"https://api.telegram.org/bot{_TG_TOKEN}/sendMessage"
+            payload = urllib.parse.urlencode({
+                "chat_id": _TG_CHAT, "text": text, "parse_mode": "HTML"
+            }).encode()
+            req = urllib.request.Request(url, data=payload, method="POST")
+            with urllib.request.urlopen(req, timeout=8):
+                pass
+        except Exception:
+            pass
+    threading.Thread(target=_send, daemon=True).start()
+
+# =========================
 # App
 # =========================
 app = FastAPI(title="Asymmetric AI Backend", version="0.9.0")
@@ -4404,8 +4428,12 @@ class AutoRunner:
                         ("HARD_FLOOR", self.peak_equity, self.floor_equity, self.email),
                     )
                     _hf2.commit()
-            except Exception:
-                pass
+            except Exception as _hf_db_err:
+                _tg_alert(
+                    f"⚠️ <b>DB write failed — hard floor state not saved</b>\n"
+                    f"{self.email} | {self.symbol}\n"
+                    f"<code>{str(_hf_db_err)[:200]}</code>"
+                )
             return equity_before
 
         # ── Drawdown protection (4-tier, from peak equity) ────────────────
@@ -5179,6 +5207,11 @@ class AutoRunner:
                                                     real_order_id = _mc_real_result.get("order_id")
                                             except Exception as _re:
                                                 self.log(f"MID_CANDLE REAL ORDER FAILED — {_re}")
+                                                _tg_alert(
+                                                    f"❌ <b>Real order failed (mid-candle)</b>\n"
+                                                    f"{self.email} | {self.symbol} {signal_side}\n"
+                                                    f"<code>{str(_re)[:250]}</code>"
+                                                )
                                                 raise _MidCandleSkip()
 
                                         base_trade = {
@@ -5357,7 +5390,14 @@ class AutoRunner:
         _last_reconcile_ts = time.time()   # startup reconcile runs via _restore_live_state thread
         while not self.stop_event.is_set():
             try:
-                self._reset_if_new_day()
+                try:
+                    self._reset_if_new_day()
+                except Exception as _mrf_err:
+                    _tg_alert(
+                        f"⚠️ <b>Midnight reset failed</b>\n"
+                        f"{self.email} | {self.symbol}\n"
+                        f"<code>{str(_mrf_err)[:200]}</code>"
+                    )
                 self.last_run_ts = time.time()
 
                 # FIX 3: Reconcile exchange positions every hour
@@ -5395,6 +5435,11 @@ class AutoRunner:
                     self.blocked_reason = "HARD_FLOOR"
                     self.stop_event.set()
                     email_ai_stopped(self.email, self.symbol, "HARD_FLOOR", current_equity)
+                    _tg_alert(
+                        f"🛑 <b>Hard floor hit — AI stopped</b>\n"
+                        f"{self.email} | {self.symbol}\n"
+                        f"Equity <b>${current_equity:.2f}</b> fell below floor <b>${self.floor_equity:.2f}</b>"
+                    )
                     if _SENTRY_DSN:
                         with sentry_sdk.new_scope() as scope:
                             scope.set_user({"email": self.email})
@@ -5412,8 +5457,12 @@ class AutoRunner:
                                 ("HARD_FLOOR", self.peak_equity, self.floor_equity, self.email),
                             )
                             _hf_conn.commit()
-                    except Exception:
-                        pass
+                    except Exception as _hfl_db_err:
+                        _tg_alert(
+                            f"⚠️ <b>DB write failed — hard floor state not saved</b>\n"
+                            f"{self.email} | {self.symbol}\n"
+                            f"<code>{str(_hfl_db_err)[:200]}</code>"
+                        )
                     break
 
                 if self.peak_equity > 0:
@@ -5555,6 +5604,11 @@ class AutoRunner:
                                 self.log(f"REAL ORDER PLACED | id={real_order_id} | {desired_side} {self.symbol} size=${usdt_size:.2f} lev={c['leverage']}×")
                         except Exception as _re:
                             self.log(f"REAL ORDER FAILED — trade skipped: {_re}")
+                            _tg_alert(
+                                f"❌ <b>Real order failed</b>\n"
+                                f"{self.email} | {self.symbol} {desired_side}\n"
+                                f"<code>{str(_re)[:250]}</code>"
+                            )
                             continue
 
                         # ── FIX 1: Entry succeeded — log position to DB BEFORE SL ──
@@ -5732,6 +5786,19 @@ class AutoRunner:
                 self.blocked_reason = "ERROR"
                 self.last_signal = f"ERROR: {str(e)[:120]}"
                 self.log(self.last_signal)
+                _err_str = str(e)
+                if "EXCHANGE_AUTH_ERROR" in _err_str:
+                    _tg_alert(
+                        f"🔑 <b>API key rejected by exchange</b>\n"
+                        f"{self.email} | {self.symbol}\n"
+                        f"<code>{_err_str[:300]}</code>"
+                    )
+                else:
+                    _tg_alert(
+                        f"🔴 <b>Engine crash</b>\n"
+                        f"{self.email} | {self.symbol}\n"
+                        f"<code>{_err_str[:300]}</code>"
+                    )
                 if _SENTRY_DSN:
                     with sentry_sdk.new_scope() as scope:
                         scope.set_user({"email": self.email})
