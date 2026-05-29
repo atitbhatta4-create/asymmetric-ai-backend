@@ -4439,6 +4439,12 @@ class AutoRunner:
             )
             self.blocked_reason = "HARD_FLOOR"
             self.stop_event.set()
+            email_ai_stopped(self.email, self.symbol, "HARD_FLOOR", equity_before)
+            _tg_alert(
+                f"🛑 <b>Hard floor hit — AI stopped</b>\n"
+                f"{self.email} | {self.symbol}\n"
+                f"Equity <b>${equity_before:.2f}</b> fell below floor <b>${self.floor_equity:.2f}</b>"
+            )
             try:
                 with db_conn() as _hf2:
                     _hf2.cursor().execute(
