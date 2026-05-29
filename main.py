@@ -3801,10 +3801,11 @@ def _compute_signal_layers(
         _bull3 = sum(1 for c in _last3 if c["close"] > c["open"])
         _bear3 = sum(1 for c in _last3 if c["close"] < c["open"])
         _vol_up = len(_mtf_volumes) >= 3 and _mtf_volumes[-2] > _mtf_volumes[-3]
+        _mtf_ema21_last = _mtf_ema21[-1] if _mtf_ema21 else _mtf_price
         if desired_side == "LONG":
-            _mtf_ok = _bull3 >= 2 and _mtf_rsi > 40 and _vol_up and _mtf_price > _mtf_ema21
+            _mtf_ok = _bull3 >= 2 and _mtf_rsi > 40 and _vol_up and _mtf_price > _mtf_ema21_last
         else:
-            _mtf_ok = _bear3 >= 2 and _mtf_rsi < 60 and _vol_up and _mtf_price < _mtf_ema21
+            _mtf_ok = _bear3 >= 2 and _mtf_rsi < 60 and _vol_up and _mtf_price < _mtf_ema21_last
         if _mtf_ok:
             total_score = round(min(1.0, total_score + 0.03), 3)
             mtf_confirmed = True
@@ -4398,8 +4399,9 @@ class AutoRunner:
             try:
                 with db_conn() as _hf2:
                     _hf2.cursor().execute(
-                        "UPDATE user_state SET last_stop_reason=%s WHERE email=%s",
-                        ("HARD_FLOOR", self.email),
+                        "UPDATE user_state SET last_stop_reason=%s, "
+                        "peak_equity=%s, floor_equity=%s WHERE email=%s",
+                        ("HARD_FLOOR", self.peak_equity, self.floor_equity, self.email),
                     )
                     _hf2.commit()
             except Exception:
@@ -5405,8 +5407,9 @@ class AutoRunner:
                     try:
                         with db_conn() as _hf_conn:
                             _hf_conn.cursor().execute(
-                                "UPDATE user_state SET last_stop_reason=%s WHERE email=%s",
-                                ("HARD_FLOOR", self.email),
+                                "UPDATE user_state SET last_stop_reason=%s, "
+                                "peak_equity=%s, floor_equity=%s WHERE email=%s",
+                                ("HARD_FLOOR", self.peak_equity, self.floor_equity, self.email),
                             )
                             _hf_conn.commit()
                     except Exception:
