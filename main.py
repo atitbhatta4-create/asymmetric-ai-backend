@@ -7006,6 +7006,7 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
 
     # ── Engine start queue ────────────────────────────────────────────────────
     with _ENGINE_START_LOCK:
+        global _last_engine_start_ts
         _now = time.time()
         _engine_start_times[:] = [t for t in _engine_start_times if _now - t < 60]
         _count = len(_engine_start_times)
