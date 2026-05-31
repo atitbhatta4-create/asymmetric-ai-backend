@@ -243,6 +243,85 @@ def _rsi_divergence(closes: List[float], rsi_vals: List[float], side: str, n: in
 
     return divergence, (0.28 if divergence else 0.0)
 
+def _reversal_signal(klines: List[Dict], rsi: Optional[float], adx: Optional[float], atr: Optional[float]) -> Dict:
+    """
+    T16 Reversal Detection — catches extreme RSI bounces in choppy/ranging markets.
+    Fires when the 4-layer trend system is blocked (ADX 12-22 choppy zone).
+
+    All 5 conditions required:
+      1. RSI < 28 (LONG) or RSI > 72 (SHORT)
+      2. Volume ≥ 3× 20-candle median
+      3. Price ≥ 3% beyond EMA21 in reversal direction
+      4. Last candle closes in reversal direction (green/LONG, red/SHORT)
+      5. ADX 12-22 (choppy — where reversals happen, unlike trends)
+
+    Returns: {ok, side, score, signal_type, grade, sl_atr_override, tp_atr_override, log}
+    """
+    if rsi is None or adx is None or atr is None or len(klines) < 25:
+        return {"ok": False}
+
+    closes  = [k["close"]  for k in klines]
+    opens   = [k["open"]   for k in klines]
+    volumes = [k["volume"] for k in klines]
+
+    price = closes[-1]
+    ema21 = _ema(closes, 21)[-1]
+
+    # 1 — Extreme RSI
+    is_long = rsi < 28
+    is_short = rsi > 72
+    if not (is_long or is_short):
+        return {"ok": False}
+    side = "LONG" if is_long else "SHORT"
+
+    # 2 — Volume ≥ 3× 20-candle median (use [-2] = last completed candle)
+    vol_window = sorted(volumes[-22:-2]) if len(volumes) >= 22 else sorted(volumes[:-2])
+    avg_vol = vol_window[len(vol_window) // 2] if vol_window else 0.0
+    vol_ratio = volumes[-2] / avg_vol if avg_vol > 0 else 0.0
+    if vol_ratio < 3.0:
+        return {"ok": False}
+
+    # 3 — Price ≥ 3% beyond EMA21 in reversal direction
+    if side == "LONG":
+        ema_dist = (ema21 - price) / ema21  # positive = price below EMA21
+    else:
+        ema_dist = (price - ema21) / ema21  # positive = price above EMA21
+    if ema_dist < 0.03:
+        return {"ok": False}
+
+    # 4 — Last candle closes in reversal direction
+    last_green = closes[-1] > opens[-1]
+    last_red   = closes[-1] < opens[-1]
+    if side == "LONG" and not last_green:
+        return {"ok": False}
+    if side == "SHORT" and not last_red:
+        return {"ok": False}
+
+    # 5 — ADX 12-22 (choppy/ranging — NOT trending)
+    if not (12 <= adx <= 22):
+        return {"ok": False}
+
+    # All conditions met — score based on extremity
+    score = 0.72
+    if side == "LONG":
+        score += min(0.08, (28 - rsi) / 100)
+    else:
+        score += min(0.08, (rsi - 72) / 100)
+    score += min(0.05, (vol_ratio - 3.0) / 20)
+
+    candle_word = "green" if side == "LONG" else "red"
+    log_msg = (
+        f"REVERSAL SIGNAL: RSI {rsi:.1f} extreme + volume {vol_ratio:.1f}× spike + "
+        f"EMA {ema_dist*100:.1f}% away + {candle_word} candle confirmed → {side} reversal"
+    )
+    return {
+        "ok": True, "side": side, "score": round(min(0.85, score), 3),
+        "signal_type": "REVERSAL", "grade": "B",
+        "sl_atr_override": 1.5, "tp_atr_override": 3.0,
+        "log": log_msg,
+    }
+
+
 def _classify_regime(
     highs: List[float], lows: List[float], closes: List[float],
     adx: Optional[float], atr_pct: float,
@@ -386,9 +465,28 @@ def _compute_signal_layers(
     price      = closes[-1]
     atr_pct    = (atr / price) if atr else 0.0
 
+    # ── T16 Reversal check — runs before regime block ────────────────────────
+    # Reversals fire in choppy conditions (ADX 12-22) that the normal 4-layer
+    # system would reject. If regime would block AND reversal conditions are met,
+    # return the reversal signal instead of BLOCKED.
+    _rev = _reversal_signal(klines, rsi, adx, atr)
+
     # ── Phase 4: Regime classification (before any layer scoring) ────────────
     regime_class = _classify_regime(highs, lows, closes, adx, atr_pct)
     if regime_class["block"]:
+        if _rev["ok"]:
+            return {
+                "ok": True, "signal": "REVERSAL", "side": _rev["side"],
+                "score": _rev["score"], "grade": "B",
+                "signal_type": "REVERSAL",
+                "sl_atr_override": _rev["sl_atr_override"],
+                "tp_atr_override": _rev["tp_atr_override"],
+                "reversal_log": _rev["log"],
+                "breakdown": {"reversal": _rev["log"]},
+                "atr_pct": atr_pct,
+                "market_regime": regime_class["regime"],
+                "adaptive_strictness": adaptive_strictness,
+            }
         return {
             "ok": False,
             "blocked": f"REGIME_{regime_class['regime']}: {regime_class['reason']}",
