@@ -1913,6 +1913,9 @@ def _validate_exchange_param(ex: Optional[str]) -> str:
         raise HTTPException(status_code=400, detail=f"Unknown exchange '{v}'. Use: bybit, okx, binance")
     return v
 
+import re as _re
+_SYMBOL_RE = _re.compile(r'^[A-Z0-9]{2,20}$')
+
 def _validate_path_symbol(symbol: str) -> str:
     """Validate and normalise a symbol coming in as a URL path segment."""
     sym = symbol.upper().strip()
