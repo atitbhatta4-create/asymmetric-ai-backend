@@ -346,6 +346,7 @@ def _compute_signal_layers(
     higher_klines: Optional[List[Dict]] = None,
     trade_style: str = "DAY_TRADE",
     mtf_klines: Optional[List[Dict]] = None,
+    param_overrides: Optional[Dict] = None,
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -408,6 +409,8 @@ def _compute_signal_layers(
 
     # Apply adaptive strictness for MINI_ASYM
     p = MODE_SIGNAL_PARAMS.get(mode, MODE_SIGNAL_PARAMS["NORMAL"]).copy()
+    if param_overrides:
+        p.update({k: v for k, v in param_overrides.items() if k in p})
 
     # Trade-style tightens/relaxes entry thresholds — SCALP must be strict
     # because 15m candles are noisy; SWING can tolerate wider pullbacks.
