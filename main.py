@@ -43,6 +43,7 @@ from indicators import (
     _session_quality, _ema_spread_trend, _candle_pattern, _rsi_divergence,
     _classify_regime, _compute_signal_layers,
 )
+from routes_backtest import backtest_router
 
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
@@ -92,6 +93,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(backtest_router)
 
 # Strip /api prefix forwarded by Vercel
 @app.middleware("http")
@@ -431,6 +433,8 @@ def init_db() -> None:
 
 
 init_db()
+from backtester import init_backtest_tables
+init_backtest_tables()
 
 # Runners are resumed after all AutoRunner code is defined — see bottom of file.
 
