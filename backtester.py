@@ -570,12 +570,13 @@ def _run_worker(
 
     try:
         higher_tf = HIGHER_TF_MAP.get(tf, tf)
-        mtf_tf    = "15m" if style in ("DAY_TRADE", "SWING") and tf != "15m" else None
+        # MTF (15m) skipped in backtesting: 2yr of 15m = 700+ pages (3+ min fetch).
+        # MTF only adjusts size ±15% and never blocks — omitting it is acceptable.
 
         # ── 1. Fetch candles (cached in DB after first fetch) ──────────────
         _set("fetching", 5)
         main_candles = _ensure_candles(symbol, tf, start_ms, end_ms,
-                                       on_progress=_fetch_cb(5, 25, tf))
+                                       on_progress=_fetch_cb(5, 60, tf))
         if len(main_candles) < WARMUP_CANDLES + 10:
             raise ValueError(
                 f"Not enough {tf} candles for {symbol} ({len(main_candles)} fetched, "
@@ -583,17 +584,12 @@ def _run_worker(
                 f"Try a wider date range or check the symbol name."
             )
 
-        _set("fetching", 25)
+        _set("fetching", 60)
         higher_candles = _ensure_candles(symbol, higher_tf, start_ms, end_ms,
-                                         on_progress=_fetch_cb(25, 40, higher_tf))
-
-        _set("fetching", 40)
+                                         on_progress=_fetch_cb(60, 75, higher_tf))
         mtf_candles: List[Dict] = []
-        if mtf_tf:
-            mtf_candles = _ensure_candles(symbol, mtf_tf, start_ms, end_ms,
-                                          on_progress=_fetch_cb(40, 50, mtf_tf))
 
-        _set("running", 50)
+        _set("running", 75)
 
         # ── 2. Simulation loop ─────────────────────────────────────────────
         st = TRADE_STYLE_PARAMS[style]
@@ -613,7 +609,7 @@ def _run_worker(
             # Progress reporting every 50 candles (50-99%)
             if i % 50 == 0:
                 done_pct = (i - WARMUP_CANDLES) / max(1, total_candles)
-                _set("running", 50 + int(done_pct * 49))
+                _set("running", 75 + int(done_pct * 24))
 
             # ── Check exit for open trade ──────────────────────────────
             if open_trade:
