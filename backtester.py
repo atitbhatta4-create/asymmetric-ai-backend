@@ -125,7 +125,7 @@ def init_backtest_tables() -> None:
                 id     {pk},
                 symbol TEXT    NOT NULL,
                 tf     TEXT    NOT NULL,
-                ts     INTEGER NOT NULL,
+                ts     BIGINT  NOT NULL,
                 open   REAL    NOT NULL,
                 high   REAL    NOT NULL,
                 low    REAL    NOT NULL,
@@ -134,6 +134,14 @@ def init_backtest_tables() -> None:
                 UNIQUE(symbol, tf, ts)
             )
         """)
+        # Migrate existing INTEGER column to BIGINT (ms timestamps overflow INT)
+        if USING_PG:
+            try:
+                cur.execute(
+                    "ALTER TABLE backtest_candles ALTER COLUMN ts TYPE BIGINT"
+                )
+            except Exception:
+                pass  # already BIGINT or table doesn't exist yet
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_bt_candles_sym_tf_ts"
             " ON backtest_candles(symbol, tf, ts)"
