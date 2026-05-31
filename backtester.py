@@ -529,9 +529,35 @@ def _run_worker(
     end_ms: int,
     start_equity: float,
 ) -> None:
+    _last_db_write = [0.0]  # throttle DB progress writes
+
     def _set(status: str, progress: int = 0, error: str = None):
         with _active_lock:
             _active[run_id] = {"status": status, "progress": progress, "error": error}
+        # Write to DB every 5s so multi-worker setups see live progress
+        now = time.time()
+        if now - _last_db_write[0] >= 5:
+            _last_db_write[0] = now
+            try:
+                with db_conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "UPDATE backtest_runs SET status=%s, progress=%s WHERE run_id=%s",
+                        (status, progress, run_id),
+                    )
+                    conn.commit()
+            except Exception:
+                pass
+
+    # Build a fetch-progress callback for _ensure_candles
+    _tf_ms = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
+    def _fetch_cb(start_pct: int, end_pct: int, tf_name: str):
+        interval_ms   = _tf_ms.get(tf_name, 3_600_000)
+        expected_pages = max(1, (end_ms - start_ms) // interval_ms // 100 + 1)
+        def cb(pages_done: int):
+            frac = min(1.0, pages_done / expected_pages)
+            _set("fetching", int(start_pct + frac * (end_pct - start_pct)))
+        return cb
 
     _set("fetching", 0)
 
@@ -541,7 +567,8 @@ def _run_worker(
 
         # ── 1. Fetch candles (cached in DB after first fetch) ──────────────
         _set("fetching", 5)
-        main_candles = _ensure_candles(symbol, tf, start_ms, end_ms)
+        main_candles = _ensure_candles(symbol, tf, start_ms, end_ms,
+                                       on_progress=_fetch_cb(5, 25, tf))
         if len(main_candles) < WARMUP_CANDLES + 10:
             raise ValueError(
                 f"Not enough {tf} candles for {symbol} ({len(main_candles)} fetched, "
@@ -550,12 +577,14 @@ def _run_worker(
             )
 
         _set("fetching", 25)
-        higher_candles = _ensure_candles(symbol, higher_tf, start_ms, end_ms)
+        higher_candles = _ensure_candles(symbol, higher_tf, start_ms, end_ms,
+                                         on_progress=_fetch_cb(25, 40, higher_tf))
 
         _set("fetching", 40)
         mtf_candles: List[Dict] = []
         if mtf_tf:
-            mtf_candles = _ensure_candles(symbol, mtf_tf, start_ms, end_ms)
+            mtf_candles = _ensure_candles(symbol, mtf_tf, start_ms, end_ms,
+                                          on_progress=_fetch_cb(40, 50, mtf_tf))
 
         _set("running", 50)
 
@@ -574,9 +603,10 @@ def _run_worker(
         for i in range(WARMUP_CANDLES, len(main_candles)):
             candle = main_candles[i]
 
-            # Progress reporting (50-99%)
-            done_pct = (i - WARMUP_CANDLES) / max(1, total_candles)
-            _set("running", 50 + int(done_pct * 49))
+            # Progress reporting every 50 candles (50-99%)
+            if i % 50 == 0:
+                done_pct = (i - WARMUP_CANDLES) / max(1, total_candles)
+                _set("running", 50 + int(done_pct * 49))
 
             # ── Check exit for open trade ──────────────────────────────
             if open_trade:
