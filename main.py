@@ -1680,7 +1680,8 @@ def get_real_usdt_balance(email: str, force: bool = False) -> Optional[float]:
 
 
 # =========================
-# MARKET (PUBLIC) — OKX
+# MARKET (PUBLIC) — PRICE (multi-source fallback)
+# OKX geo-blocks Render US; Binance US is primary, OKX as secondary fallback.
 # =========================
 def to_okx_inst(symbol: str) -> str:
     s = (symbol or "").upper().strip()
@@ -1691,23 +1692,56 @@ def to_okx_inst(symbol: str) -> str:
     return s
 
 
-async def okx_price(symbol: str) -> float:
+async def _fetch_price_binance_us(symbol: str) -> float:
+    async with httpx.AsyncClient(timeout=8) as client:
+        r = await client.get(
+            "https://api.binance.us/api/v3/ticker/price",
+            params={"symbol": symbol.upper()},
+            headers={"accept": "application/json"},
+        )
+    if r.status_code != 200:
+        raise ValueError(f"HTTP {r.status_code}: {r.text[:120]}")
+    price = r.json().get("price")
+    if price is None:
+        raise ValueError(f"no price field")
+    return float(price)
+
+
+async def _fetch_price_okx(symbol: str) -> float:
     inst = to_okx_inst(symbol)
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=8) as client:
         r = await client.get(
             f"{OKX_BASE}/api/v5/market/ticker",
             params={"instId": inst},
             headers={"accept": "application/json"},
         )
     if r.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"OKX price error: {r.text[:200]}")
+        raise ValueError(f"HTTP {r.status_code}: {r.text[:120]}")
     arr = (r.json() or {}).get("data") or []
     if not arr:
-        raise HTTPException(status_code=400, detail=f"OKX: no ticker for {inst}")
+        raise ValueError(f"no ticker for {inst}")
     last = arr[0].get("last")
     if last is None:
-        raise HTTPException(status_code=400, detail=f"OKX: missing last price for {inst}")
+        raise ValueError(f"missing last price for {inst}")
     return float(last)
+
+
+async def okx_price(symbol: str) -> float:
+    """Fetch spot price with fallback: Binance US → OKX."""
+    errors: list = []
+    for name, fn in [
+        ("BinanceUS", _fetch_price_binance_us),
+        ("OKX",       _fetch_price_okx),
+    ]:
+        try:
+            return await fn(symbol)
+        except Exception as e:
+            errors.append(f"{name}: {e}")
+            print(f"[price] {name} failed for {symbol}: {e}")
+    raise HTTPException(
+        status_code=503,
+        detail=f"All price sources failed for {symbol} — {'; '.join(errors)}"
+    )
 
 
 # ── Market data cache ─────────────────────────────────────────────────────
@@ -1878,62 +1912,71 @@ async def get_price(symbol: str, exchange: Optional[str] = Query(default=None)):
     return {"symbol": sym, "price": price, "exchange": ex}
 
 
-@app.get("/market/ticker/{symbol}")
-async def market_ticker(symbol: str, exchange: Optional[str] = Query(default=None)):
-    """24h stats for a symbol: price, change%, high, low, volume in USDT.
-    exchange param is accepted for labelling — data always sourced from OKX because
-    Binance and Bybit geo-block Render US servers."""
-    _validate_path_symbol(symbol)
-    inst = to_okx_inst(symbol.upper().strip())
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(
-            f"{OKX_BASE}/api/v5/market/ticker",
-            params={"instId": inst},
-            headers={"accept": "application/json"},
-        )
-    d = ((r.json() or {}).get("data") or [{}])[0]
-    last   = float(d.get("last") or 0)
-    open24 = float(d.get("open24h") or last or 1)
-    high   = float(d.get("high24h") or 0)
-    low    = float(d.get("low24h") or 0)
-    vol    = float(d.get("volCcy24h") or 0)   # volume in USDT
-    chg    = ((last - open24) / open24 * 100) if open24 else 0.0
-    return {
-        "symbol": symbol.upper().strip(),
-        "price": last, "open24h": open24,
-        "high24h": high, "low24h": low,
-        "change24h": round(chg, 3),
-        "volume24h": round(vol, 2),
-        "exchange": (exchange or "okx").lower(),
-    }
-
-
-@app.get("/market/tickers")
-async def market_tickers(symbols: str = Query(..., max_length=500)):
-    """Batch 24h stats. Pass ?symbols=BTCUSDT,ETHUSDT,... (max 20 symbols)"""
-    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()][:20]
-    async with httpx.AsyncClient(timeout=12) as client:
-        results = await asyncio.gather(*[
-            client.get(
-                f"{OKX_BASE}/api/v5/market/ticker",
-                params={"instId": to_okx_inst(s)},
+async def _fetch_ticker_24h(symbol: str) -> dict:
+    """24h stats with Binance US primary, OKX fallback."""
+    sym = symbol.upper().strip()
+    # Try Binance US first
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                "https://api.binance.us/api/v3/ticker/24hr",
+                params={"symbol": sym},
                 headers={"accept": "application/json"},
             )
-            for s in syms
-        ], return_exceptions=True)
-    out = []
-    for sym, res in zip(syms, results):
-        try:
-            d = ((res.json() or {}).get("data") or [{}])[0]  # type: ignore
+        if r.status_code == 200:
+            d = r.json()
+            last   = float(d.get("lastPrice") or 0)
+            open24 = float(d.get("openPrice") or last or 1)
+            high   = float(d.get("highPrice") or 0)
+            low    = float(d.get("lowPrice") or 0)
+            vol    = float(d.get("quoteVolume") or 0)
+            chg    = float(d.get("priceChangePercent") or 0)
+            return {"price": last, "open24h": open24, "high24h": high, "low24h": low,
+                    "change24h": round(chg, 3), "volume24h": round(vol, 2)}
+    except Exception as e:
+        print(f"[ticker24h] BinanceUS failed for {sym}: {e}")
+    # OKX fallback
+    try:
+        inst = to_okx_inst(sym)
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(
+                f"{OKX_BASE}/api/v5/market/ticker",
+                params={"instId": inst},
+                headers={"accept": "application/json"},
+            )
+        if r.status_code == 200:
+            d = ((r.json() or {}).get("data") or [{}])[0]
             last   = float(d.get("last") or 0)
             open24 = float(d.get("open24h") or last or 1)
             high   = float(d.get("high24h") or 0)
             low    = float(d.get("low24h") or 0)
             vol    = float(d.get("volCcy24h") or 0)
             chg    = ((last - open24) / open24 * 100) if open24 else 0.0
-            out.append({"symbol": sym, "price": last, "change24h": round(chg, 3),
-                        "high24h": high, "low24h": low, "volume24h": round(vol, 2)})
-        except Exception:
+            return {"price": last, "open24h": open24, "high24h": high, "low24h": low,
+                    "change24h": round(chg, 3), "volume24h": round(vol, 2)}
+    except Exception as e:
+        print(f"[ticker24h] OKX failed for {sym}: {e}")
+    return {"price": 0, "open24h": 0, "high24h": 0, "low24h": 0, "change24h": 0.0, "volume24h": 0}
+
+
+@app.get("/market/ticker/{symbol}")
+async def market_ticker(symbol: str, exchange: Optional[str] = Query(default=None)):
+    """24h stats for a symbol: price, change%, high, low, volume in USDT."""
+    sym = _validate_path_symbol(symbol)
+    stats = await _fetch_ticker_24h(sym)
+    return {"symbol": sym, **stats, "exchange": (exchange or "okx").lower()}
+
+
+@app.get("/market/tickers")
+async def market_tickers(symbols: str = Query(..., max_length=500)):
+    """Batch 24h stats. Pass ?symbols=BTCUSDT,ETHUSDT,... (max 20 symbols)"""
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()][:20]
+    results = await asyncio.gather(*[_fetch_ticker_24h(s) for s in syms], return_exceptions=True)
+    out = []
+    for sym, res in zip(syms, results):
+        if isinstance(res, dict):
+            out.append({"symbol": sym, **res})
+        else:
             out.append({"symbol": sym, "price": 0, "change24h": 0, "high24h": 0, "low24h": 0, "volume24h": 0})
     return {"tickers": out}
 
