@@ -7,6 +7,7 @@ Safe to import anywhere with zero side effects.
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Literal
+from config import now_dubai
 
 RiskMode = Literal["ULTRA_SAFE", "SAFE", "NORMAL", "MINI_ASYM", "AGGRESSIVE"]
 
