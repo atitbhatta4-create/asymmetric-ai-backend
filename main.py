@@ -3063,6 +3063,9 @@ class AutoRunner:
         self.last_score: float = 0.0
         self.last_atr_pct: float = 0.01   # fallback 1% ATR until first signal
         self.market_grade: str = "-"
+        self.signal_type: str = "NORMAL"  # "NORMAL" or "REVERSAL" (T16)
+        self.sl_atr_override: Optional[float] = None   # T16 reversal uses 1.5
+        self.tp_atr_override: Optional[float] = None   # T16 reversal uses 3.0
         self.market_regime: str = "-"     # Phase 4: TRENDING / MARGINAL / CHOPPY / VOLATILE
         self._last_trade_bad: bool = False
         self._last_holding_log_ts: float = 0.0   # throttle repeated holding logs
@@ -4122,6 +4125,11 @@ class AutoRunner:
         self.last_breakdown = res.get("breakdown", {})
         self.last_score = res.get("score", 0.0)
         self.market_grade = res.get("grade", "-")
+        self.signal_type = res.get("signal_type", "NORMAL")
+        self.sl_atr_override = res.get("sl_atr_override")
+        self.tp_atr_override = res.get("tp_atr_override")
+        if res.get("signal_type") == "REVERSAL" and res.get("reversal_log"):
+            self.log(res["reversal_log"])
         if res.get("market_regime"):
             self.market_regime = res["market_regime"]
         if res.get("atr_pct"):
@@ -4647,8 +4655,11 @@ class AutoRunner:
                     grade = self.market_grade
                     c = presets_for_mode(self.mode)
                     st = TRADE_STYLE_PARAMS.get(self.trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
-                    sl_pct_open = min(self.last_atr_pct * st["sl_atr"], st["sl_max"] / 100.0)
-                    tp_pct_open = min(self.last_atr_pct * st["tp_atr"], st["tp_max"] / 100.0)
+                    # T16 reversal overrides SL/TP multipliers (1.5×ATR SL, 3×ATR TP)
+                    _sl_atr = self.sl_atr_override if self.sl_atr_override else st["sl_atr"]
+                    _tp_atr = self.tp_atr_override if self.tp_atr_override else st["tp_atr"]
+                    sl_pct_open = min(self.last_atr_pct * _sl_atr, st["sl_max"] / 100.0)
+                    tp_pct_open = min(self.last_atr_pct * _tp_atr, st["tp_max"] / 100.0)
 
                     if REAL_TRADING:
                         real_bal = get_real_usdt_balance(self.email, force=True)
