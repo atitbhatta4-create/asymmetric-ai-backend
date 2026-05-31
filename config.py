@@ -45,6 +45,7 @@ Side       = Literal["LONG", "SHORT"]
 TF         = Literal["15m", "1h", "4h", "1d"]
 TradeStyle = Literal["SCALP", "DAY_TRADE", "SWING"]
 TF_MAP: Dict[str, str] = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
+HIGHER_TF_MAP: Dict[str, str] = {"15m": "4h", "1h": "4h", "4h": "1d", "1d": "1d"}
 
 # ── Trading style params ──────────────────────────────────────────────────────
 # Each style sets the timeframe, candle interval, and ATR multiples for SL/TP.
