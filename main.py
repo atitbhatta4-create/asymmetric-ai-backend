@@ -1744,7 +1744,23 @@ async def _fetch_price_binance_us(symbol: str) -> float:
         raise ValueError(f"HTTP {r.status_code}: {r.text[:120]}")
     price = r.json().get("price")
     if price is None:
-        raise ValueError(f"no price field")
+        raise ValueError("no price field")
+    return float(price)
+
+
+async def _fetch_price_mexc(symbol: str) -> float:
+    """MEXC global exchange — no geo-blocking, same format as Binance."""
+    async with httpx.AsyncClient(timeout=8) as client:
+        r = await client.get(
+            "https://api.mexc.com/api/v3/ticker/price",
+            params={"symbol": symbol.upper()},
+            headers={"accept": "application/json"},
+        )
+    if r.status_code != 200:
+        raise ValueError(f"HTTP {r.status_code}: {r.text[:120]}")
+    price = r.json().get("price")
+    if price is None:
+        raise ValueError("no price field")
     return float(price)
 
 
@@ -1768,10 +1784,11 @@ async def _fetch_price_okx(symbol: str) -> float:
 
 
 async def okx_price(symbol: str) -> float:
-    """Fetch spot price with fallback: Binance US → OKX."""
+    """Fetch spot price with fallback: Binance US → MEXC → OKX."""
     errors: list = []
     for name, fn in [
         ("BinanceUS", _fetch_price_binance_us),
+        ("MEXC",      _fetch_price_mexc),
         ("OKX",       _fetch_price_okx),
     ]:
         try:
@@ -1953,29 +1970,33 @@ async def get_price(symbol: str, exchange: Optional[str] = Query(default=None)):
     return {"symbol": sym, "price": price, "exchange": ex}
 
 
+def _parse_binance_style_24h(d: dict) -> dict:
+    """Parse Binance-format 24h ticker (used by Binance US and MEXC)."""
+    last   = float(d.get("lastPrice") or 0)
+    open24 = float(d.get("openPrice") or last or 1)
+    high   = float(d.get("highPrice") or 0)
+    low    = float(d.get("lowPrice") or 0)
+    vol    = float(d.get("quoteVolume") or 0)
+    chg    = ((last - open24) / open24 * 100) if open24 else 0.0
+    return {"price": last, "open24h": open24, "high24h": high, "low24h": low,
+            "change24h": round(chg, 3), "volume24h": round(vol, 2)}
+
+
 async def _fetch_ticker_24h(symbol: str) -> dict:
-    """24h stats with Binance US primary, OKX fallback."""
+    """24h stats: Binance US → MEXC → OKX."""
     sym = symbol.upper().strip()
-    # Try Binance US first
-    try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(
-                "https://api.binance.us/api/v3/ticker/24hr",
-                params={"symbol": sym},
-                headers={"accept": "application/json"},
-            )
-        if r.status_code == 200:
-            d = r.json()
-            last   = float(d.get("lastPrice") or 0)
-            open24 = float(d.get("openPrice") or last or 1)
-            high   = float(d.get("highPrice") or 0)
-            low    = float(d.get("lowPrice") or 0)
-            vol    = float(d.get("quoteVolume") or 0)
-            chg    = float(d.get("priceChangePercent") or 0)
-            return {"price": last, "open24h": open24, "high24h": high, "low24h": low,
-                    "change24h": round(chg, 3), "volume24h": round(vol, 2)}
-    except Exception as e:
-        print(f"[ticker24h] BinanceUS failed for {sym}: {e}")
+    for name, url in [
+        ("BinanceUS", "https://api.binance.us/api/v3/ticker/24hr"),
+        ("MEXC",      "https://api.mexc.com/api/v3/ticker/24hr"),
+    ]:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.get(url, params={"symbol": sym},
+                                     headers={"accept": "application/json"})
+            if r.status_code == 200:
+                return _parse_binance_style_24h(r.json())
+        except Exception as e:
+            print(f"[ticker24h] {name} failed for {sym}: {e}")
     # OKX fallback
     try:
         inst = to_okx_inst(sym)
