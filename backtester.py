@@ -67,12 +67,13 @@ _active_lock = threading.Lock()
 
 # ── Symbol helpers ─────────────────────────────────────────────────────────────
 def _to_okx_inst(symbol: str) -> str:
-    """BTCUSDT → BTC-USDT  (OKX spot/linear format used by history-candles)."""
+    """BTCUSDT / BTCUSDC / ETHBTC → BTC-USDT / BTC-USDC / ETH-BTC  (OKX format)."""
     s = symbol.upper().strip()
     if "-" in s:
         return s
-    if s.endswith("USDT"):
-        return f"{s[:-4]}-USDT"
+    for quote in ("USDT", "USDC", "BTC", "ETH", "BNB"):
+        if s.endswith(quote) and len(s) > len(quote):
+            return f"{s[:-len(quote)]}-{quote}"
     return s
 
 
