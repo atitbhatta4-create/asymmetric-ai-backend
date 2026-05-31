@@ -166,6 +166,13 @@ def init_backtest_tables() -> None:
                 result_json  TEXT
             )
         """)
+        # On restart, any run still "pending/fetching/running" was killed mid-flight
+        cur.execute(
+            "UPDATE backtest_runs SET status=%s, error=%s, completed_at=%s"
+            " WHERE status IN ('pending','fetching','running')",
+            ("error", "Server restarted — please retry",
+             datetime.utcnow().isoformat()),
+        )
         conn.commit()
 
 
