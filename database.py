@@ -128,6 +128,6 @@ else:
     def column_exists(conn, table: str, col: str) -> bool:
         raw_cur = conn._raw.cursor()
         raw_cur.execute(f"PRAGMA table_info({table})")
-        cols = [r[1] for r in raw_cur.fetchall()]
+        cols = [r["name"] for r in raw_cur.fetchall()]
         raw_cur.close()
         return col in cols
