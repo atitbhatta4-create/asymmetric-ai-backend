@@ -3090,6 +3090,11 @@ class AutoRunner:
         self.chop_min_sep_pct = float(max(0.0, chop_min_sep_pct))
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        # Single background log-writer thread drains a queue — replaces one-thread-per-entry.
+        import queue as _queue_mod
+        self._log_queue: "_queue_mod.Queue[Optional[Dict]]" = _queue_mod.Queue()
+        self._log_writer = threading.Thread(target=self._log_writer_loop, daemon=True)
+        self._log_writer.start()
         self.last_signal: str = "-"
         self.last_side: Side = "LONG"
         # Allow first trade after 60s (enough to initialize) — not a full interval wait.
@@ -3317,19 +3322,44 @@ class AutoRunner:
     def log(self, msg):
         entry = {"t": now_dubai().strftime("%Y-%m-%d %H:%M:%S"), "msg": msg}
         self.history.appendleft(entry)
-        threading.Thread(target=self._persist_log, args=(entry,), daemon=True).start()
+        self._log_queue.put(entry)  # handed off to single writer thread — no new thread per entry
 
-    def _persist_log(self, entry: Dict) -> None:
-        try:
-            with db_conn() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "INSERT INTO ai_logs(email, session_id, t, msg) VALUES(%s, %s, %s, %s)",
-                    (self.email, self.ai_session_id, entry["t"], entry["msg"]),
-                )
-                conn.commit()
-        except Exception:
-            pass
+    def _log_writer_loop(self) -> None:
+        """Single background thread that drains the log queue in batches.
+        Replaces one-thread-per-entry pattern — cuts thread count by ~95%."""
+        import queue as _q
+        while True:
+            try:
+                entry = self._log_queue.get(timeout=5)
+            except _q.Empty:
+                if self.stop_event.is_set():
+                    break
+                continue
+            if entry is None:  # sentinel: writer told to exit
+                break
+            batch = [entry]
+            # Drain any additional queued entries without waiting
+            while True:
+                try:
+                    nxt = self._log_queue.get_nowait()
+                    if nxt is None:
+                        break
+                    batch.append(nxt)
+                    if len(batch) >= 20:
+                        break
+                except _q.Empty:
+                    break
+            try:
+                with db_conn() as conn:
+                    cur = conn.cursor()
+                    for e in batch:
+                        cur.execute(
+                            "INSERT INTO ai_logs(email, session_id, t, msg) VALUES(%s, %s, %s, %s)",
+                            (self.email, self.ai_session_id, e["t"], e["msg"]),
+                        )
+                    conn.commit()
+            except Exception:
+                pass
 
     def _open_ai_session(self) -> None:
         try:
@@ -3391,6 +3421,7 @@ class AutoRunner:
         self.log(reason)
         self._close_ai_session(reason)
         self.stop_event.set()
+        self._log_queue.put(None)  # sentinel: tell log writer to exit after draining
         if self.pending_trades:
             self.log(f"Pending trade(s) abandoned at stop (entry={self.pending_trades[0].get('entry_price', '?')}).")
             self.pending_trades = []

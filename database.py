@@ -21,12 +21,14 @@ if DATABASE_URL:
 
     USING_PG = True
 
-    # Connection pool — max 15 connections to PostgreSQL regardless of user count.
-    # Callers that exceed this block briefly until a connection is free (up to 30s).
+    # Connection pool — sized for ~100 concurrent active engines.
+    # Render free PostgreSQL allows max 25 connections; Standard allows 97.
+    # Set max_size to leave headroom for migrations / admin tools.
+    _PG_POOL_MAX = int(os.getenv("PG_POOL_MAX", "25"))
     _pool = ConnectionPool(
         conninfo=_url,
-        min_size=2,
-        max_size=15,
+        min_size=3,
+        max_size=_PG_POOL_MAX,
         kwargs={"row_factory": dict_row},
         open=False,
     )
