@@ -6024,9 +6024,12 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
     # Without this, runner reads DB default ($1,000) for session_start_equity
     # and floor_equity, even if the real account has a different balance.
     if REAL_TRADING:
-        _pre_bal = get_real_usdt_balance(email, force=True)
-        if _pre_bal is not None:
-            set_equity(email, _pre_bal)
+        try:
+            _pre_bal = get_real_usdt_balance(email, force=True)
+            if _pre_bal is not None:
+                set_equity(email, _pre_bal)
+        except Exception as _bal_err:
+            print(f"[auto-start] real balance pre-sync failed (non-fatal): {_bal_err}")
 
             # ── Guard: stale demo peak causes instant hard floor on real accounts ──
             # Problem: user registers on demo branch (START_EQUITY=$1,000), gets
@@ -6113,24 +6116,36 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
         _engine_start_times.append(_now)
         _last_engine_start_ts = _now
 
-    with AUTO_LOCK:
-        old = AUTO_RUNNERS.get(email)
-        if old:
-            old.stop("Stopped: restarted with new settings.")
-            del AUTO_RUNNERS[email]
+    try:
+        with AUTO_LOCK:
+            old = AUTO_RUNNERS.get(email)
+            if old:
+                old.stop("Stopped: restarted with new settings.")
+                del AUTO_RUNNERS[email]
 
-        runner = AutoRunner(
-            email=email, symbol=symbol, trade_style=payload.trade_style,
-            mode=payload.mode,
-            max_trades_per_day=int(max_trades),
-            stop_after_bad_trades=int(payload.stop_after_bad_trades),
-            duration_days=int(payload.duration_days),
-            trend_filter=bool(payload.trend_filter),
-            chop_min_sep_pct=float(payload.chop_min_sep_pct),
+            runner = AutoRunner(
+                email=email, symbol=symbol, trade_style=payload.trade_style,
+                mode=payload.mode,
+                max_trades_per_day=int(max_trades),
+                stop_after_bad_trades=int(payload.stop_after_bad_trades),
+                duration_days=int(payload.duration_days),
+                trend_filter=bool(payload.trend_filter),
+                chop_min_sep_pct=float(payload.chop_min_sep_pct),
+            )
+            AUTO_RUNNERS[email] = runner
+            runner.start()
+            _save_runner_state(runner)   # persist so deploy/restart auto-resumes this runner
+    except Exception as _start_err:
+        import traceback as _tb
+        _err_detail = f"Engine start failed for {email} ({symbol}): {_start_err}\n{_tb.format_exc()}"
+        print(f"[auto-start] CRITICAL: {_err_detail}")
+        _tg_alert(
+            f"🚨 *Engine start FAILED* ({symbol})\n"
+            f"User: `{email}`\n"
+            f"Error: `{_start_err}`\n"
+            f"This caused a 500 on /auto/start — engine NOT running."
         )
-        AUTO_RUNNERS[email] = runner
-        runner.start()
-        _save_runner_state(runner)   # persist so deploy/restart auto-resumes this runner
+        raise HTTPException(status_code=500, detail=f"Engine failed to start: {_start_err}")
 
     try:
         with db_conn() as _clr_conn:
