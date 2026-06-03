@@ -7162,3 +7162,9 @@ def analytics_by_session(admin=Depends(require_admin)):
 import threading as _threading
 _threading.Thread(target=_resume_runners_on_startup, daemon=True).start()
 _threading.Thread(target=_resume_watchdog, daemon=True).start()
+
+# ── Deploy/restart notification ───────────────────────────────────────────────
+# Fires on every successful startup so you know the service is alive.
+# Absence of this message = service crashed before reaching this point.
+if REAL_TRADING:
+    _tg_alert("🚀 *Real trading service restarted* — backend is live and accepting connections.")
