@@ -11,12 +11,14 @@ import time
 from typing import Dict, Optional
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from database import db_conn
 from optimizer import (
     apply_opt_params,
     get_opt_run,
+    get_opt_results_csv,
     list_applied_params,
     list_opt_runs,
     start_optimizer,
@@ -144,3 +146,16 @@ def optimizer_history(
 def optimizer_applied(admin: str = Depends(_require_admin)):
     """List all currently applied parameter overrides."""
     return list_applied_params()
+
+
+@optimizer_router.get("/download/{run_id}")
+def optimizer_download(run_id: str, admin: str = Depends(_require_admin)):
+    """Download all optimizer results for a run as a CSV file."""
+    csv_content = get_opt_results_csv(run_id)
+    if csv_content is None:
+        raise HTTPException(status_code=404, detail="Run not found or has no results")
+    return Response(
+        content=csv_content,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="optimizer_{run_id[:8]}.csv"'},
+    )

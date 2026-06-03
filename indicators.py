@@ -509,6 +509,11 @@ def _compute_signal_layers(
     p = MODE_SIGNAL_PARAMS.get(mode, MODE_SIGNAL_PARAMS["NORMAL"]).copy()
     if param_overrides:
         p.update({k: v for k, v in param_overrides.items() if k in p})
+        # Delta keys: optimizer passes offsets, not absolute replacements
+        if "adx_min_delta" in param_overrides:
+            p["adx_min"] = max(5, p["adx_min"] + param_overrides["adx_min_delta"])
+        if "score_min_delta" in param_overrides:
+            p["min_score"] = max(0.20, min(0.95, p["min_score"] + param_overrides["score_min_delta"]))
 
     # Trade-style tightens/relaxes entry thresholds — SCALP must be strict
     # because 15m candles are noisy; SWING can tolerate wider pullbacks.
