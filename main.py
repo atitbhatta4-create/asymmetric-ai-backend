@@ -1957,6 +1957,13 @@ def _validate_exchange_param(ex: Optional[str]) -> str:
 import re as _re
 _SYMBOL_RE = _re.compile(r'^[A-Z0-9]{2,20}$')
 
+
+def _validate_symbol(v: str) -> str:
+    """Normalise a symbol from a Pydantic model field — uppercase + strip only.
+    Endpoint-level checks (USDT suffix, length) happen after this."""
+    return v.upper().strip()
+
+
 def _validate_path_symbol(symbol: str) -> str:
     """Validate and normalise a symbol coming in as a URL path segment."""
     sym = symbol.upper().strip()
@@ -6069,42 +6076,41 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
             _pre_bal = get_real_usdt_balance(email, force=True)
             if _pre_bal is not None:
                 set_equity(email, _pre_bal)
+                # ── Guard: stale demo peak causes instant hard floor on real accounts ──
+                # Problem: user registers on demo branch (START_EQUITY=$1,000), gets
+                # user_state.peak_equity=$1,000. Switches to real branch with $25.
+                # Runner reads peak=$1,000 → floor=$850 → real equity $25 < $850 → instant hard floor.
+                # Fix: if stored peak is 5× or more above the real balance (clearly a different
+                # scale — demo default vs small real account), reset it to the real balance.
+                # We do NOT reset if the peak is close to real balance (might be a legitimate
+                # real-account peak that the user should respect for drawdown protection).
+                try:
+                    with db_conn() as conn:
+                        _gpk_cur = conn.cursor()
+                        _gpk_cur.execute(
+                            "SELECT peak_equity, floor_equity FROM user_state WHERE email=%s", (email,)
+                        )
+                        _gpk_row = _gpk_cur.fetchone()
+                        _gpk_peak = float((_gpk_row or {}).get("peak_equity") or 0)
+                        _gpk_floor = float((_gpk_row or {}).get("floor_equity") or 0)
+                        # 5× threshold: $1,000 peak vs $25 real = 40× → stale demo value.
+                        # Real account that grew from $25 to $30 then fell to $25 = 1.2× → preserved.
+                        _is_stale_demo_peak = _gpk_peak > _pre_bal * 5 and _gpk_peak > 50
+                        if _is_stale_demo_peak:
+                            _corrected_floor = round(_pre_bal * 0.85, 2)
+                            _gpk_cur.execute(
+                                "UPDATE user_state SET peak_equity=%s, floor_equity=%s WHERE email=%s",
+                                (_pre_bal, _corrected_floor, email),
+                            )
+                            conn.commit()
+                            print(
+                                f"[auto-start] REAL peak corrected: demo peak ${_gpk_peak:.2f} "
+                                f"→ real balance ${_pre_bal:.2f} (was causing instant hard floor)"
+                            )
+                except Exception as _gpke:
+                    print(f"[auto-start] real peak guard failed: {_gpke}")
         except Exception as _bal_err:
             print(f"[auto-start] real balance pre-sync failed (non-fatal): {_bal_err}")
-
-            # ── Guard: stale demo peak causes instant hard floor on real accounts ──
-            # Problem: user registers on demo branch (START_EQUITY=$1,000), gets
-            # user_state.peak_equity=$1,000. Switches to real branch with $25.
-            # Runner reads peak=$1,000 → floor=$850 → real equity $25 < $850 → instant hard floor.
-            # Fix: if stored peak is 5× or more above the real balance (clearly a different
-            # scale — demo default vs small real account), reset it to the real balance.
-            # We do NOT reset if the peak is close to real balance (might be a legitimate
-            # real-account peak that the user should respect for drawdown protection).
-            try:
-                with db_conn() as conn:
-                    _gpk_cur = conn.cursor()
-                    _gpk_cur.execute(
-                        "SELECT peak_equity, floor_equity FROM user_state WHERE email=%s", (email,)
-                    )
-                    _gpk_row = _gpk_cur.fetchone()
-                    _gpk_peak = float((_gpk_row or {}).get("peak_equity") or 0)
-                    _gpk_floor = float((_gpk_row or {}).get("floor_equity") or 0)
-                    # 5× threshold: $1,000 peak vs $25 real = 40× → stale demo value.
-                    # Real account that grew from $25 to $30 then fell to $25 = 1.2× → preserved.
-                    _is_stale_demo_peak = _gpk_peak > _pre_bal * 5 and _gpk_peak > 50
-                    if _is_stale_demo_peak:
-                        _corrected_floor = round(_pre_bal * 0.85, 2)
-                        _gpk_cur.execute(
-                            "UPDATE user_state SET peak_equity=%s, floor_equity=%s WHERE email=%s",
-                            (_pre_bal, _corrected_floor, email),
-                        )
-                        conn.commit()
-                        print(
-                            f"[auto-start] REAL peak corrected: demo peak ${_gpk_peak:.2f} "
-                            f"→ real balance ${_pre_bal:.2f} (was causing instant hard floor)"
-                        )
-            except Exception as _gpke:
-                print(f"[auto-start] real peak guard failed: {_gpke}")
 
     # Record starting_capital on the very first AI start — never overwritten after initial set.
     # This anchors the Situation 1/2/3 logic in the floor-reset endpoint:
