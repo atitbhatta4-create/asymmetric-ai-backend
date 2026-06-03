@@ -47,8 +47,9 @@ TF_FROM_STYLE: Dict[str, str] = {
 }
 
 MIN_TRADES     = 10   # reject combos with fewer trades (unreliable stats)
-MIN_WIN_RATE   = 0.35 # reject combos below this win rate
-MAX_DRAWDOWN   = 0.25 # reject combos with deeper drawdown
+MIN_WIN_RATE   = 0.25 # flag combos below this win rate (lowered from 0.35)
+MAX_DRAWDOWN   = 0.25 # flag combos with deeper drawdown
+TOP_RESULTS    = 50   # store top N results per run (raised from 20)
 
 # Active optimizer runs in memory: run_id → {status, progress, done, total}
 _active: Dict[str, Dict] = {}
@@ -83,19 +84,26 @@ def init_optimizer_tables() -> None:
         """)
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS optimizer_results (
-                id           {pk},
-                run_id       TEXT NOT NULL,
-                params_json  TEXT NOT NULL,
-                total_trades INTEGER,
-                win_rate     REAL,
-                total_return REAL,
-                max_drawdown REAL,
-                sharpe_ratio REAL,
-                reward_risk  REAL,
-                is_applied   INTEGER DEFAULT 0,
-                created_at   TEXT NOT NULL
+                id             {pk},
+                run_id         TEXT NOT NULL,
+                params_json    TEXT NOT NULL,
+                total_trades   INTEGER,
+                win_rate       REAL,
+                total_return   REAL,
+                max_drawdown   REAL,
+                sharpe_ratio   REAL,
+                reward_risk    REAL,
+                passed_filters INTEGER DEFAULT 1,
+                is_applied     INTEGER DEFAULT 0,
+                created_at     TEXT NOT NULL
             )
         """)
+        # Migration: add passed_filters if upgrading from older schema
+        try:
+            cur.execute("ALTER TABLE optimizer_results ADD COLUMN passed_filters INTEGER DEFAULT 1")
+            conn.commit()
+        except Exception:
+            pass
         cur.execute("""
             CREATE TABLE IF NOT EXISTS optimizer_applied (
                 symbol      TEXT NOT NULL,
@@ -321,25 +329,30 @@ def _run_opt_worker(
             if metrics:
                 wr = metrics.get("win_rate_pct", 0) / 100
                 dd = abs(metrics.get("max_drawdown_pct", 0)) / 100
-                if wr >= MIN_WIN_RATE and dd <= MAX_DRAWDOWN:
-                    results.append({
-                        "adx_delta":   adx_d,
-                        "score_delta": score_d,
-                        "sl_mult":     sl_m,
-                        "tp_mult":     tp_m,
-                        "total_trades":  metrics.get("total_trades", 0),
-                        "win_rate":      round(wr, 4),
-                        "total_return":  round(metrics.get("total_return_pct", 0), 2),
-                        "max_drawdown":  round(metrics.get("max_drawdown_pct", 0), 2),
-                        "sharpe_ratio":  round(metrics.get("sharpe_ratio", 0), 3),
-                        "reward_risk":   round(metrics.get("reward_risk", 0), 3),
-                    })
+                passed = (
+                    metrics.get("total_trades", 0) >= MIN_TRADES
+                    and wr >= MIN_WIN_RATE
+                    and dd <= MAX_DRAWDOWN
+                )
+                results.append({
+                    "adx_delta":     adx_d,
+                    "score_delta":   score_d,
+                    "sl_mult":       sl_m,
+                    "tp_mult":       tp_m,
+                    "total_trades":  metrics.get("total_trades", 0),
+                    "win_rate":      round(wr, 4),
+                    "total_return":  round(metrics.get("total_return_pct", 0), 2),
+                    "max_drawdown":  round(metrics.get("max_drawdown_pct", 0), 2),
+                    "sharpe_ratio":  round(metrics.get("sharpe_ratio", 0), 3),
+                    "reward_risk":   round(metrics.get("reward_risk", 0), 3),
+                    "passed_filters": 1 if passed else 0,
+                })
             if i % 5 == 0:
                 _set("running", i + 1)
 
-        # Sort by Sharpe descending, store top 20
-        results.sort(key=lambda r: r["sharpe_ratio"], reverse=True)
-        top = results[:20]
+        # Sort passing combos first, then by Sharpe descending within each group
+        results.sort(key=lambda r: (r["passed_filters"], r["sharpe_ratio"]), reverse=True)
+        top = results[:TOP_RESULTS]
 
         with db_conn() as conn:
             cur = conn.cursor()
@@ -348,13 +361,13 @@ def _run_opt_worker(
                 cur.execute(
                     "INSERT INTO optimizer_results"
                     "(run_id,params_json,total_trades,win_rate,total_return,"
-                    "max_drawdown,sharpe_ratio,reward_risk,created_at)"
-                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+                    "max_drawdown,sharpe_ratio,reward_risk,passed_filters,created_at)"
+                    " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
                     if USING_PG else
                     "INSERT INTO optimizer_results"
                     "(run_id,params_json,total_trades,win_rate,total_return,"
-                    "max_drawdown,sharpe_ratio,reward_risk,created_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    "max_drawdown,sharpe_ratio,reward_risk,passed_filters,created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
                     (run_id, json.dumps({
                         "adx_delta":   r["adx_delta"],
                         "score_delta": r["score_delta"],
@@ -363,7 +376,7 @@ def _run_opt_worker(
                     }),
                     r["total_trades"], r["win_rate"], r["total_return"],
                     r["max_drawdown"], r["sharpe_ratio"], r["reward_risk"],
-                    now_iso),
+                    r["passed_filters"], now_iso),
                 )
             cur.execute(
                 "UPDATE optimizer_runs SET status=%s, progress=100,"
@@ -468,13 +481,13 @@ def get_opt_run(run_id: str) -> Optional[Dict]:
 
         cur.execute(
             "SELECT id, params_json, total_trades, win_rate, total_return,"
-            " max_drawdown, sharpe_ratio, reward_risk, is_applied"
+            " max_drawdown, sharpe_ratio, reward_risk, passed_filters, is_applied"
             " FROM optimizer_results WHERE run_id=%s"
-            " ORDER BY sharpe_ratio DESC LIMIT 20" if USING_PG else
+            " ORDER BY passed_filters DESC, sharpe_ratio DESC LIMIT 50" if USING_PG else
             "SELECT id, params_json, total_trades, win_rate, total_return,"
-            " max_drawdown, sharpe_ratio, reward_risk, is_applied"
+            " max_drawdown, sharpe_ratio, reward_risk, passed_filters, is_applied"
             " FROM optimizer_results WHERE run_id=?"
-            " ORDER BY sharpe_ratio DESC LIMIT 20",
+            " ORDER BY passed_filters DESC, sharpe_ratio DESC LIMIT 50",
             (run_id,),
         )
         rows = cur.fetchall()
@@ -488,20 +501,23 @@ def get_opt_run(run_id: str) -> Optional[Dict]:
         if mem.get("error"):
             run["error"] = mem["error"]
 
+    result_rows = rows or []
     run["results"] = [
         {
-            "id":           r["id"],
-            "params":       json.loads(r["params_json"]),
-            "total_trades": r["total_trades"],
-            "win_rate_pct": round(r["win_rate"] * 100, 1),
-            "total_return": r["total_return"],
-            "max_drawdown": r["max_drawdown"],
-            "sharpe_ratio": r["sharpe_ratio"],
-            "reward_risk":  r["reward_risk"],
-            "is_applied":   bool(r["is_applied"]),
+            "id":             r["id"],
+            "params":         json.loads(r["params_json"]),
+            "total_trades":   r["total_trades"],
+            "win_rate_pct":   round(r["win_rate"] * 100, 1),
+            "total_return":   r["total_return"],
+            "max_drawdown":   r["max_drawdown"],
+            "sharpe_ratio":   r["sharpe_ratio"],
+            "reward_risk":    r["reward_risk"],
+            "passed_filters": bool(r.get("passed_filters", 1)),
+            "is_applied":     bool(r["is_applied"]),
         }
-        for r in (rows or [])
+        for r in result_rows
     ]
+    run["passed_count"] = sum(1 for r in result_rows if r.get("passed_filters", 1))
     return run
 
 
@@ -610,3 +626,51 @@ def get_applied_params(symbol: str, mode: str, style: str) -> Optional[Dict]:
         )
         row = cur.fetchone()
     return json.loads(row["params_json"]) if row else None
+
+
+def get_opt_results_csv(run_id: str) -> Optional[str]:
+    """Return all optimizer results for a run as a CSV string."""
+    import csv, io
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT r.symbol, r.mode, r.style, r.date_from, r.date_to,"
+            " o.params_json, o.total_trades, o.win_rate, o.total_return,"
+            " o.max_drawdown, o.sharpe_ratio, o.reward_risk, o.passed_filters, o.is_applied"
+            " FROM optimizer_results o"
+            " JOIN optimizer_runs r ON r.run_id = o.run_id"
+            " WHERE o.run_id=%s ORDER BY o.passed_filters DESC, o.sharpe_ratio DESC" if USING_PG else
+            "SELECT r.symbol, r.mode, r.style, r.date_from, r.date_to,"
+            " o.params_json, o.total_trades, o.win_rate, o.total_return,"
+            " o.max_drawdown, o.sharpe_ratio, o.reward_risk, o.passed_filters, o.is_applied"
+            " FROM optimizer_results o"
+            " JOIN optimizer_runs r ON r.run_id = o.run_id"
+            " WHERE o.run_id=? ORDER BY o.passed_filters DESC, o.sharpe_ratio DESC",
+            (run_id,),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return None
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "symbol", "mode", "style", "date_from", "date_to",
+        "adx_delta", "score_delta", "sl_mult", "tp_mult",
+        "total_trades", "win_rate_pct", "total_return_pct",
+        "max_drawdown_pct", "sharpe_ratio", "reward_risk",
+        "passed_filters", "is_applied",
+    ])
+    for r in rows:
+        p = json.loads(r["params_json"])
+        writer.writerow([
+            r["symbol"], r["mode"], r["style"], r["date_from"], r["date_to"],
+            p.get("adx_delta", 0), p.get("score_delta", 0),
+            p.get("sl_mult", 1.0), p.get("tp_mult", 1.0),
+            r["total_trades"],
+            round(r["win_rate"] * 100, 1),
+            r["total_return"], r["max_drawdown"],
+            r["sharpe_ratio"], r["reward_risk"],
+            1 if r.get("passed_filters", 1) else 0,
+            1 if r.get("is_applied", 0) else 0,
+        ])
+    return buf.getvalue()
