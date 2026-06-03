@@ -1916,6 +1916,13 @@ def _validate_exchange_param(ex: Optional[str]) -> str:
 import re as _re
 _SYMBOL_RE = _re.compile(r'^[A-Z0-9]{2,20}$')
 
+
+def _validate_symbol(v: str) -> str:
+    """Normalise a symbol from a Pydantic model field — uppercase + strip only.
+    Endpoint-level checks (USDT suffix, length) happen after this."""
+    return v.upper().strip()
+
+
 def _validate_path_symbol(symbol: str) -> str:
     """Validate and normalise a symbol coming in as a URL path segment."""
     sym = symbol.upper().strip()
