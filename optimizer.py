@@ -103,7 +103,7 @@ def init_optimizer_tables() -> None:
             cur.execute("ALTER TABLE optimizer_results ADD COLUMN passed_filters INTEGER DEFAULT 1")
             conn.commit()
         except Exception:
-            pass
+            conn.rollback()  # PostgreSQL: aborted txn must be rolled back before next statement
         cur.execute("""
             CREATE TABLE IF NOT EXISTS optimizer_applied (
                 symbol      TEXT NOT NULL,
