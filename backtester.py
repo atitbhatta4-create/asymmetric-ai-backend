@@ -412,8 +412,28 @@ def _sim_check_exit(trade: Dict, candle: Dict, exchange: str) -> Optional[Dict]:
         return None  # trade still open
 
     else:
-        # Grade A — standard single exit
+        # Grade A — standard single exit (+ T18 breakeven / profit-lock exits)
         size_dollar = equity * trade["effective_size"]
+
+        # T18 Scale-in 2: profit lock at +1.5× ATR — acts as trailing stop
+        profit_lock = trade.get("profit_lock", 0.0)
+        if profit_lock > 0:
+            lock_price = (entry * (1 + profit_lock) if side == "LONG"
+                          else entry * (1 - profit_lock))
+            if (side == "LONG" and low <= lock_price) or (side == "SHORT" and high >= lock_price):
+                pnl = size_dollar * (profit_lock * leverage) - _fee_cost(size_dollar, "TP_HIT", exchange)
+                return {"closed": True, "outcome": "SCALE_TRAIL", "pnl": pnl, "exit_ts": candle["t"]}
+
+        # T18 Scale-in 1: breakeven SL — SL is at entry price
+        if trade.get("be_active"):
+            if (side == "LONG" and low <= entry) or (side == "SHORT" and high >= entry):
+                pnl = -_fee_cost(size_dollar, "SL_HIT", exchange)
+                return {"closed": True, "outcome": "SCALE_BE", "pnl": pnl, "exit_ts": candle["t"]}
+            # Also check TP
+            if tp_hit(tp_price):
+                pnl = size_dollar * (tp_pct * leverage) - _fee_cost(size_dollar, "TP_HIT", exchange)
+                return {"closed": True, "outcome": "TP_HIT", "pnl": pnl, "exit_ts": candle["t"]}
+            return None
 
         if tp_hit(tp_price) and sl_hit(sl_price):
             # Both hit same candle → SL wins (worst-case, conservative)
@@ -505,6 +525,17 @@ def _calc_metrics(
 
     buy_hold_ret = round((buy_hold_exit - buy_hold_entry) / buy_hold_entry * 100, 2) if buy_hold_entry > 0 else 0.0
 
+    # T16 reversal sub-stats
+    rev_trades = [t for t in trades if t.get("signal") == "REVERSAL"]
+    rev_wins   = [t for t in rev_trades if t["pnl"] > 0]
+    rev_win_rate = round(len(rev_wins) / len(rev_trades) * 100, 1) if rev_trades else 0.0
+
+    # T18 scaling sub-stats (scale-in events tracked per trade)
+    scaled_trades = [t for t in trades if t.get("scaled")]
+    scaled_wins   = [t for t in scaled_trades if t["pnl"] > 0]
+    avg_scaled_win  = round(statistics.mean(t["pnl"] / start_equity * 100 for t in scaled_wins), 2)  if scaled_wins  else 0.0
+    avg_normal_win  = round(statistics.mean(t["pnl"] / start_equity * 100 for t in wins if not t.get("scaled")), 2) if [w for w in wins if not w.get("scaled")] else 0.0
+
     return {
         "total_trades": total,
         "win_count":    len(wins),
@@ -520,6 +551,13 @@ def _calc_metrics(
         "buy_hold_return_pct": buy_hold_ret,
         "monthly_returns": monthly_returns,
         "equity_curve": equity_curve,
+        # T16 reversal stats
+        "reversal_trades":   len(rev_trades),
+        "reversal_win_rate": rev_win_rate,
+        # T18 scaling stats
+        "scaled_trades":    len(scaled_trades),
+        "avg_scaled_win_pct": avg_scaled_win,
+        "avg_normal_win_pct": avg_normal_win,
     }
 
 
@@ -535,6 +573,8 @@ def _run_worker(
     start_ms: int,
     end_ms: int,
     start_equity: float,
+    enable_t16: bool = True,
+    enable_t18: bool = True,
 ) -> None:
     _last_db_write = [0.0]  # throttle DB progress writes
 
@@ -613,6 +653,26 @@ def _run_worker(
 
             # ── Check exit for open trade ──────────────────────────────
             if open_trade:
+                # T18: track best unrealized move before exit check, scale in if thresholds met
+                if enable_t18 and open_trade.get("grade") == "A":
+                    _entry = open_trade["entry"]
+                    _side  = open_trade["side"]
+                    _atr   = open_trade.get("atr_pct", ATR_BASELINE.get(tf, 0.009))
+                    _bm_now = (candle["high"] - _entry) / _entry if _side == "LONG" else (_entry - candle["low"]) / _entry
+                    open_trade["best_move"] = max(open_trade.get("best_move", 0.0), _bm_now)
+                    _bm = open_trade["best_move"]
+                    # Scale-in 1: +1.5× ATR → add 20%, SL → breakeven
+                    if not open_trade.get("scale1_done") and _bm >= 1.5 * _atr and _atr > 0:
+                        open_trade["effective_size"] *= 1.20
+                        open_trade["scale1_done"]  = True
+                        open_trade["be_active"]    = True   # SL → entry (breakeven)
+                        open_trade["scaled"]       = True
+                    # Scale-in 2: +3× ATR → add 10%, lock SL at +1.5× ATR profit
+                    elif open_trade.get("scale1_done") and not open_trade.get("scale2_done") and _bm >= 3.0 * _atr and _atr > 0:
+                        open_trade["effective_size"] *= (1.10 / 1.20)  # net relative to current size
+                        open_trade["scale2_done"]   = True
+                        open_trade["profit_lock"]   = 1.5 * _atr   # SL at +1.5× ATR from entry
+
                 result = _sim_check_exit(open_trade, candle, exchange)
                 if result and result.get("closed"):
                     equity += result["pnl"]
@@ -628,6 +688,7 @@ def _run_worker(
                         "open_ts":  open_trade["open_ts"],
                         "exit_ts":  result["exit_ts"],
                         "entry":    open_trade["entry"],
+                        "scaled":   open_trade.get("scaled", False),
                     })
                     equity_curve.append({"ts": result["exit_ts"], "equity": round(equity, 4)})
                     open_trade = None
@@ -649,7 +710,8 @@ def _run_worker(
                 if hist_sess == 0.0:
                     continue  # SCALP dead-zone block
 
-                sig = _compute_signal_layers(klines, mode, 1.0, higher_slice, style, mtf_slice)
+                sig = _compute_signal_layers(klines, mode, 1.0, higher_slice, style, mtf_slice,
+                                            enable_t16=enable_t16)
 
                 if sig.get("ok"):
                     side          = sig["side"]
@@ -657,8 +719,11 @@ def _run_worker(
                     atr_pct       = sig.get("atr_pct", ATR_BASELINE.get(tf, 0.009))
                     mtf_size_mult = sig.get("mtf_size_mult", 1.0)
 
-                    sl_pct = min(atr_pct * st["sl_atr"], st["sl_max"] / 100)
-                    tp_pct = min(atr_pct * st["tp_atr"], st["tp_max"] / 100)
+                    # T16 reversal uses wider SL/TP multipliers for choppy-market entries
+                    sl_atr_mult = sig.get("sl_atr_override", st["sl_atr"])
+                    tp_atr_mult = sig.get("tp_atr_override", st["tp_atr"])
+                    sl_pct = min(atr_pct * sl_atr_mult, st["sl_max"] / 100)
+                    tp_pct = min(atr_pct * tp_atr_mult, st["tp_max"] / 100)
 
                     # Volatility-adjusted size (same formula as live engine)
                     baseline  = ATR_BASELINE.get(tf, 0.009)
@@ -685,6 +750,7 @@ def _run_worker(
                         "effective_size": effective_size,
                         "leverage":       c["leverage"],
                         "equity_at_open": equity,
+                        "atr_pct":        atr_pct,
                         # Grade B legs
                         "t1_size":           effective_size * 0.60,
                         "t2_size":           effective_size * 0.40,
@@ -744,6 +810,8 @@ def start_backtest(
     date_from: str,
     date_to: str,
     start_equity: float,
+    enable_t16: bool = True,
+    enable_t18: bool = True,
 ) -> str:
     """Validate inputs, create DB record, start background thread, return run_id."""
     from datetime import datetime
@@ -796,7 +864,7 @@ def start_backtest(
     t = threading.Thread(
         target=_run_worker,
         args=(run_id, email, symbol.upper(), tf, mode, style, exchange,
-              start_ms, end_ms, start_equity),
+              start_ms, end_ms, start_equity, enable_t16, enable_t18),
         daemon=True,
     )
     t.start()

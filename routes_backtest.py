@@ -73,6 +73,8 @@ class BacktestRunIn(BaseModel):
     date_from:    str   = Field(..., description="YYYY-MM-DD")
     date_to:      str   = Field(..., description="YYYY-MM-DD")
     start_equity: float = Field(1000.0, ge=100, le=1_000_000)
+    enable_t16:   bool  = Field(True,  description="T16 Reversal Detection (choppy-market entries)")
+    enable_t18:   bool  = Field(True,  description="T18 Momentum Scaling (scale in at +1.5× / +3× ATR)")
 
 
 class CompareIn(BaseModel):
@@ -97,6 +99,8 @@ def backtest_run(payload: BacktestRunIn, admin: str = Depends(_require_admin)):
             date_from    = payload.date_from,
             date_to      = payload.date_to,
             start_equity = payload.start_equity,
+            enable_t16   = payload.enable_t16,
+            enable_t18   = payload.enable_t18,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

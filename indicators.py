@@ -426,6 +426,7 @@ def _compute_signal_layers(
     trade_style: str = "DAY_TRADE",
     mtf_klines: Optional[List[Dict]] = None,
     param_overrides: Optional[Dict] = None,
+    enable_t16: bool = True,
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -469,7 +470,7 @@ def _compute_signal_layers(
     # Reversals fire in choppy conditions (ADX 12-22) that the normal 4-layer
     # system would reject. If regime would block AND reversal conditions are met,
     # return the reversal signal instead of BLOCKED.
-    _rev = _reversal_signal(klines, rsi, adx, atr)
+    _rev = _reversal_signal(klines, rsi, adx, atr) if enable_t16 else {"ok": False}
 
     # ── Phase 4: Regime classification (before any layer scoring) ────────────
     regime_class = _classify_regime(highs, lows, closes, adx, atr_pct)
