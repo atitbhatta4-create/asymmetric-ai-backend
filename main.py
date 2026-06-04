@@ -424,6 +424,8 @@ def init_db() -> None:
             cur.execute("ALTER TABLE user_state ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
         if not column_exists(conn, "trades", "hard_floor"):
             cur.execute("ALTER TABLE trades ADD COLUMN hard_floor REAL DEFAULT 0")
+        if not column_exists(conn, "trades", "is_primary"):
+            cur.execute("ALTER TABLE trades ADD COLUMN is_primary INTEGER DEFAULT 1")
         if not column_exists(conn, "user_state", "peak_equity"):
             cur.execute("ALTER TABLE user_state ADD COLUMN peak_equity REAL DEFAULT 0")
         if not column_exists(conn, "user_state", "all_time_high"):
@@ -2247,6 +2249,7 @@ class Trade:
     unreal_pnl_value: float
     equity_after: float
     reason: Optional[str] = None
+    is_primary: int = 1
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
@@ -3124,6 +3127,7 @@ class AutoRunner:
         self._last_holding_log_ts: float = 0.0   # throttle repeated holding logs
         self._last_drawdown_log_ts: float = 0.0  # throttle repeated drawdown tier logs
         self._last_dd_tier: int = 0              # 0=none 1=65% 2=40% 3=25% 4=stop
+        self._last_mc_log_ts: float = 0.0        # throttle mid-candle noise logs
         # Momentum scaling (pyramiding) — tracks scale-in state per active trade
         # Allowed modes: MINI_ASYM, NORMAL, AGGRESSIVE only
         self._scaling_enabled: bool = mode in ("MINI_ASYM", "NORMAL", "AGGRESSIVE")
@@ -3300,17 +3304,15 @@ class AutoRunner:
             sid = get_session_id(self.email)
             with db_conn() as conn:
                 cur = conn.cursor()
-                # Only count primary trades (T1 / Grade A) — T2 has size_mult=0.40
-                # so its stored size is always < 50% of base. Threshold: base_size * 0.45
-                sp = TRADE_STYLE_PARAMS.get(self.trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
-                base_size = presets_for_mode(self.mode)["size"]
-                primary_threshold = round(base_size * 0.45, 4)
+                # Only count primary trades (T1 / Grade A) — T2 is_primary=0.
+                # Older rows without is_primary default to 1 (column default), so they
+                # are still counted — no data loss from the schema migration.
                 cur.execute(
                     "SELECT COUNT(*) as cnt, "
                     "SUM(CASE WHEN unreal_pnl_percent < 0 THEN 1 ELSE 0 END) as bad "
                     "FROM trades WHERE email = %s AND time >= %s AND session_id = %s "
-                    "AND size >= %s",
-                    (self.email, utc_midnight_str, sid, primary_threshold),
+                    "AND is_primary = 1",
+                    (self.email, utc_midnight_str, sid),
                 )
                 row = cur.fetchone()
             trades = int((row or {}).get("cnt") or 0)
@@ -3995,7 +3997,10 @@ class AutoRunner:
                 # slippage, or partial fills). We always trust what Bybit paid us.
                 if size_dollar > 0:
                     pnl_value = real_pnl
-                    pnl_pct_leveraged = real_pnl / size_dollar
+                    # Use account equity as denominator so T1 and T2 show the same scale.
+                    # Dividing by size_dollar inflates T2 % because T2's position is only 40%
+                    # of base size — a $6 loss on a $5.60 T2 position shows -107% (impossible).
+                    pnl_pct_leveraged = real_pnl / equity_before if equity_before > 0 else 0.0
                 _old_outcome = outcome
                 if real_pnl > 0 and outcome in ("SL_HIT", "TRAIL_STOP"):
                     outcome = "TP_HIT"
@@ -4032,6 +4037,7 @@ class AutoRunner:
             unreal_pnl_percent=float(pnl_pct_leveraged * 100.0),
             unreal_pnl_value=float(pnl_value),
             equity_after=float(equity_after), reason=reason_text,
+            is_primary=int(is_primary),
         )
 
         with db_conn() as conn:
@@ -4040,17 +4046,24 @@ class AutoRunner:
                 """INSERT INTO trades(
                     email, time, side, symbol, mode, size, sl, tp, leverage,
                     entry_price, current_price, unreal_pnl_percent, unreal_pnl_value,
-                    equity_after, reason, session_id, hard_floor
-                ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                    equity_after, reason, session_id, hard_floor, is_primary
+                ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (self.email, tr.time, tr.side, tr.symbol, tr.mode,
                  float(tr.size), float(tr.sl), float(tr.tp), float(tr.leverage),
                  float(tr.entry_price), float(tr.current_price),
                  float(tr.unreal_pnl_percent), float(tr.unreal_pnl_value),
-                 float(tr.equity_after), tr.reason, int(sid), float(self.floor_equity)),
+                 float(tr.equity_after), tr.reason, int(sid), float(self.floor_equity),
+                 int(is_primary)),
             )
             conn.commit()
 
         set_equity(self.email, equity_after)
+        # Update in-memory peak immediately so the next trade's drawdown calc is accurate.
+        # Without this, a profitable real trade raises equity_after above equity_before but
+        # self.peak_equity stays stale — floor_equity never ratchets up until the NEXT trade.
+        if equity_after > self.peak_equity:
+            self.peak_equity = equity_after
+            self.floor_equity = round(self.peak_equity * 0.85, 2)
         update_peak_ath(self.email, float(self.peak_equity), float(equity_after))
 
         # A "bad trade" requires an ACTUAL loss > 0.5% of current equity.
@@ -4310,36 +4323,38 @@ class AutoRunner:
                             abs_move     = abs(move_pct)
 
                             if abs_move >= threshold:
-                                self.log(
-                                    f"MID_CANDLE: price moved {move_pct*100:+.2f}% from candle open "
-                                    f"(open={candle_open:.4f} now={current_px:.4f}) — "
-                                    f"triggering early signal check"
-                                )
-
                                 # ── Full 4-layer signal analysis ──────────────────
                                 res = self._signal_and_filters()
                                 score      = res.get("score", 0.0)
                                 signal_ok  = res.get("ok", False)
                                 signal_side: Side = res.get("side", "LONG")
 
+                                _now_ts = time.time()
+                                _mc_log_ok = (_now_ts - self._last_mc_log_ts) >= 1800  # 30 min quiet period
                                 if not signal_ok:
-                                    self.log(
-                                        f"MID_CANDLE: signal blocked ({(res.get('blocked') or '?')[:60]}) — skipped"
-                                    )
+                                    if _mc_log_ok:
+                                        self._last_mc_log_ts = _now_ts
+                                        self.log(
+                                            f"MID_CANDLE: {move_pct*100:+.2f}% move but signal blocked "
+                                            f"({(res.get('blocked') or '?')[:60]}) — skipped"
+                                        )
                                 elif score < _MID_CANDLE_MIN_SCORE:
-                                    self.log(
-                                        f"MID_CANDLE: score {score:.2f} below "
-                                        f"{_MID_CANDLE_MIN_SCORE:.2f} threshold — skipped. "
-                                        f"Next candle close check unchanged."
-                                    )
+                                    if _mc_log_ok:
+                                        self._last_mc_log_ts = _now_ts
+                                        self.log(
+                                            f"MID_CANDLE: {move_pct*100:+.2f}% move, score {score:.2f} "
+                                            f"below {_MID_CANDLE_MIN_SCORE:.2f} — skipped"
+                                        )
                                 else:
                                     # Direction gate: price move must align with signal
                                     expected_side: Side = "LONG" if move_pct > 0 else "SHORT"
                                     if signal_side != expected_side:
-                                        self.log(
-                                            f"MID_CANDLE: score {score:.2f} OK but move direction "
-                                            f"({expected_side}) conflicts with signal ({signal_side}) — skipped"
-                                        )
+                                        if _mc_log_ok:
+                                            self._last_mc_log_ts = _now_ts
+                                            self.log(
+                                                f"MID_CANDLE: score {score:.2f} OK but move direction "
+                                                f"({expected_side}) conflicts with signal ({signal_side}) — skipped"
+                                            )
                                     else:
                                         # ── Fire trade ────────────────────────────
                                         entry_price = self._fetch_price_sync(self.symbol)
