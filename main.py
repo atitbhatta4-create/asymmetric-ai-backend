@@ -4558,8 +4558,25 @@ class AutoRunner:
                                         _mc_real_result = None
                                         if REAL_TRADING:
                                             try:
-                                                size_pct  = float(c["size"])
+                                                # Apply vol and drawdown size adjustments — same
+                                                # logic as _run_loop fix; no mtf mult here because
+                                                # mid-candle trades don't go through MTF confirmation.
+                                                _atr_bl_mc = {"15m": 0.0040, "1h": 0.0090, "4h": 0.0180, "1d": 0.0350}
+                                                _atr_nm_mc = _atr_bl_mc.get(self.tf, 0.0050)
+                                                _vol_sm_mc = (max(0.4, _atr_nm_mc / self.last_atr_pct)
+                                                              if self.last_atr_pct > _atr_nm_mc else 1.0)
+                                                _dd_now_mc = (max(0.0, (self.peak_equity - equity_now) / self.peak_equity)
+                                                              if self.peak_equity > 0 else 0.0)
+                                                _dd_sm_mc  = (0.25 if _dd_now_mc >= 0.10 else
+                                                              0.40 if _dd_now_mc >= 0.07 else
+                                                              0.65 if _dd_now_mc >= 0.04 else 1.0)
+                                                size_pct  = float(c["size"]) * _vol_sm_mc * _dd_sm_mc
                                                 usdt_size = equity_now * size_pct
+                                                self.log(
+                                                    f"MID-CANDLE REAL ORDER SIZE: base={float(c['size'])*100:.0f}% "
+                                                    f"× vol={_vol_sm_mc:.2f} × dd={_dd_sm_mc:.2f} "
+                                                    f"= {size_pct*100:.1f}% → ${usdt_size:.2f}"
+                                                )
                                                 if grade == "B":
                                                     real_b_result = place_real_grade_b_order(
                                                         email=self.email, symbol=self.symbol,
@@ -4952,8 +4969,27 @@ class AutoRunner:
                         self.log(f"15m not confirmed — size reduced to {_mtf_sm*100:.0f}% for lower conviction")
                     if REAL_TRADING:
                         try:
-                            size_pct  = float(c["size"]) * _mtf_sm
+                            # Apply vol and drawdown size adjustments to the real order —
+                            # mirrors the paper calculation in _close_one_trade (effective_size).
+                            # Without this, Bybit gets the full c["size"] (e.g. 65% of equity
+                            # for MINI_ASYM) even when high volatility reduces paper size to 40%.
+                            # That caused real positions to be 2–6× larger than paper expected.
+                            _atr_bl = {"15m": 0.0040, "1h": 0.0090, "4h": 0.0180, "1d": 0.0350}
+                            _atr_nm = _atr_bl.get(self.tf, 0.0050)
+                            _vol_sm = (max(0.4, _atr_nm / self.last_atr_pct)
+                                       if self.last_atr_pct > _atr_nm else 1.0)
+                            _dd_now = (max(0.0, (self.peak_equity - equity_now) / self.peak_equity)
+                                       if self.peak_equity > 0 else 0.0)
+                            _dd_sm  = (0.25 if _dd_now >= 0.10 else
+                                       0.40 if _dd_now >= 0.07 else
+                                       0.65 if _dd_now >= 0.04 else 1.0)
+                            size_pct  = float(c["size"]) * _mtf_sm * _vol_sm * _dd_sm
                             usdt_size = equity_now * size_pct
+                            self.log(
+                                f"REAL ORDER SIZE: base={float(c['size'])*100:.0f}% "
+                                f"× mtf={_mtf_sm:.2f} × vol={_vol_sm:.2f} × dd={_dd_sm:.2f} "
+                                f"= {size_pct*100:.1f}% → ${usdt_size:.2f}"
+                            )
                             if grade == "B":
                                 # Real Grade B: entry + two partial reduceOnly TP limit orders
                                 real_b_result = place_real_grade_b_order(
