@@ -161,7 +161,7 @@ _GLOBAL_RL_SKIP = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
 _GLOBAL_RL_DASHBOARD = {
     "/balance", "/exchange/balance", "/exchange/status",
     "/auto/status", "/auto/history", "/auto/sessions", "/auto/signal",
-    "/portfolio/stats", "/market/tickers",
+    "/portfolio/stats", "/portfolio/pnl", "/market/tickers",
 }
 
 # Authenticated users: 300/min  |  Unauthenticated (IP): 60/min
@@ -2794,6 +2794,184 @@ def portfolio_stats(user=Depends(require_user)):
         "ratios":              {"sharpe": sharpe, "sortino": sortino, "calmar": calmar},
         "most_traded_symbol":  sym_list[0]["symbol"] if sym_list else "-",
     }
+
+
+@app.get("/portfolio/pnl")
+def portfolio_pnl(user=Depends(require_user)):
+    """Today / week / month PnL cards + full monthly history for the PnL section."""
+    from datetime import timezone as _tz, timedelta as _td, datetime as _dt
+
+    email = user["email"]
+    now_utc = _dt.now(_tz.utc)
+    dubai_now = now_utc + _td(hours=4)
+
+    # Dubai midnight boundaries
+    today_dubai  = dubai_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start   = today_dubai - _td(days=today_dubai.weekday())
+    month_start  = today_dubai.replace(day=1)
+
+    # Convert back to UTC ISO for DB comparison
+    def _to_utc(dt_dubai):
+        return (dt_dubai - _td(hours=4)).strftime("%Y-%m-%dT%H:%M:%S")
+
+    today_utc = _to_utc(today_dubai)
+    week_utc  = _to_utc(week_start)
+    month_utc = _to_utc(month_start)
+
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT time, unreal_pnl_value, equity_after FROM trades "
+            "WHERE email = %s ORDER BY time ASC",
+            (email,),
+        )
+        rows = cur.fetchall()
+
+    if not rows:
+        return {"empty": True}
+
+    def _agg(subset):
+        if not subset:
+            return {"pnl": 0.0, "pnl_pct": 0.0, "trades": 0, "wins": 0}
+        pnls = [float(r["unreal_pnl_value"]) for r in subset]
+        wins = sum(1 for p in pnls if p >= 0)
+        # Use equity_before of first trade as base for % calc
+        first_eq_after = float(subset[0]["equity_after"])
+        first_pnl      = float(subset[0]["unreal_pnl_value"])
+        base_eq        = first_eq_after - first_pnl
+        total_pnl      = sum(pnls)
+        pnl_pct        = round(total_pnl / base_eq * 100, 2) if base_eq > 0 else 0.0
+        return {"pnl": round(total_pnl, 2), "pnl_pct": pnl_pct,
+                "trades": len(subset), "wins": wins}
+
+    today_rows = [r for r in rows if str(r["time"]) >= today_utc]
+    week_rows  = [r for r in rows if str(r["time"]) >= week_utc]
+    month_rows = [r for r in rows if str(r["time"]) >= month_utc]
+
+    # ── monthly history ───────────────────────────────────────────────────────
+    monthly: dict = {}
+    for r in rows:
+        ts  = str(r["time"])
+        key = ts[:7]  # "YYYY-MM"
+        if key not in monthly:
+            monthly[key] = {"period": key, "pnl": 0.0, "trades": 0, "wins": 0,
+                            "_first_pnl": float(r["unreal_pnl_value"]),
+                            "_first_eq_after": float(r["equity_after"])}
+        monthly[key]["pnl"]    += float(r["unreal_pnl_value"])
+        monthly[key]["trades"] += 1
+        if float(r["unreal_pnl_value"]) >= 0:
+            monthly[key]["wins"] += 1
+
+    history = []
+    for m in sorted(monthly.values(), key=lambda x: x["period"]):
+        base = m["_first_eq_after"] - m["_first_pnl"]
+        pnl  = round(m["pnl"], 2)
+        pct  = round(pnl / base * 100, 2) if base > 0 else 0.0
+        history.append({
+            "period": m["period"],
+            "pnl":    pnl,
+            "pnl_pct": pct,
+            "trades": m["trades"],
+            "wins":   m["wins"],
+            "losses": m["trades"] - m["wins"],
+        })
+
+    best_month  = max(history, key=lambda x: x["pnl"])  if history else None
+    worst_month = min(history, key=lambda x: x["pnl"]) if history else None
+
+    # ── yearly grouping ───────────────────────────────────────────────────────
+    years_dict: dict = {}
+    for m in history:
+        yr = m["period"][:4]
+        if yr not in years_dict:
+            years_dict[yr] = {"year": yr, "pnl": 0.0, "trades": 0, "wins": 0, "months": []}
+        years_dict[yr]["pnl"]    += m["pnl"]
+        years_dict[yr]["trades"] += m["trades"]
+        years_dict[yr]["wins"]   += m["wins"]
+        years_dict[yr]["months"].append(m)
+    for y in years_dict.values():
+        y["pnl"]    = round(y["pnl"], 2)
+        y["losses"] = y["trades"] - y["wins"]
+
+    yearly = sorted(years_dict.values(), key=lambda x: x["year"])
+
+    return {
+        "today":       _agg(today_rows),
+        "week":        _agg(week_rows),
+        "month":       _agg(month_rows),
+        "history":     history,
+        "yearly":      yearly,
+        "best_month":  best_month,
+        "worst_month": worst_month,
+        "has_multiple_years": len(years_dict) > 1,
+    }
+
+
+@app.get("/portfolio/pnl/month/{year_month}")
+def portfolio_pnl_month(year_month: str, user=Depends(require_user)):
+    """Return individual trades for a specific month (YYYY-MM) — drill-down view."""
+    if len(year_month) != 7 or year_month[4] != "-":
+        raise HTTPException(status_code=400, detail="Format must be YYYY-MM")
+    email = user["email"]
+    yr, mo = int(year_month[:4]), int(year_month[5:])
+    next_yr, next_mo = (yr + 1, 1) if mo == 12 else (yr, mo + 1)
+    end_str = f"{next_yr}-{next_mo:02d}-01"
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT time, side, symbol, mode, unreal_pnl_value, unreal_pnl_percent, "
+            "entry_price, current_price, equity_after, leverage, reason "
+            "FROM trades WHERE email = %s AND time >= %s AND time < %s "
+            "ORDER BY time ASC",
+            (email, year_month + "-01", end_str),
+        )
+        trades = [dict(r) for r in cur.fetchall()]
+    return {"month": year_month, "trades": trades, "count": len(trades)}
+
+
+@app.get("/portfolio/pnl/csv/{year}")
+def portfolio_pnl_csv(year: str, user=Depends(require_user)):
+    """Download all trades for a given year as CSV (tax export)."""
+    from fastapi.responses import StreamingResponse
+    import io, csv as _csv
+
+    if not year.isdigit() or len(year) != 4:
+        raise HTTPException(status_code=400, detail="Year must be 4 digits")
+
+    email = user["email"]
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT time, side, symbol, mode, size, leverage, "
+            "entry_price, current_price, unreal_pnl_value, unreal_pnl_percent, "
+            "equity_after, reason "
+            "FROM trades WHERE email = %s AND time >= %s AND time < %s "
+            "ORDER BY time ASC",
+            (email, f"{year}-01-01", f"{int(year)+1}-01-01"),
+        )
+        rows = cur.fetchall()
+
+    buf = io.StringIO()
+    w   = _csv.writer(buf)
+    w.writerow(["Date (UTC)", "Side", "Symbol", "Mode", "Size %", "Leverage",
+                "Entry Price", "Exit Price", "PnL ($)", "PnL (%)", "Equity After"])
+    for r in rows:
+        w.writerow([
+            str(r["time"])[:19],
+            r["side"], r["symbol"], r["mode"],
+            r["size"], r["leverage"],
+            r["entry_price"], r["current_price"],
+            round(float(r["unreal_pnl_value"]), 4),
+            round(float(r["unreal_pnl_percent"]), 4),
+            round(float(r["equity_after"]), 4),
+        ])
+
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=trades_{year}.csv"},
+    )
 
 
 async def _place_trade_internal(

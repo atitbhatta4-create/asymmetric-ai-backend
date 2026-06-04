@@ -327,7 +327,7 @@ def _run_opt_worker(
                 adx_d, score_d, sl_m, tp_m,
             )
             if metrics:
-                wr = metrics.get("win_rate_pct", 0) / 100
+                wr = metrics.get("win_rate", 0) / 100
                 dd = abs(metrics.get("max_drawdown_pct", 0)) / 100
                 passed = (
                     metrics.get("total_trades", 0) >= MIN_TRADES
