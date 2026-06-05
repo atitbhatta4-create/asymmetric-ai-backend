@@ -45,6 +45,7 @@ from indicators import (
 )
 from routes_backtest import backtest_router
 from routes_optimizer import optimizer_router
+from routes_support import support_router
 
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
@@ -137,6 +138,7 @@ app.add_middleware(
 )
 app.include_router(backtest_router)
 app.include_router(optimizer_router)
+app.include_router(support_router)
 
 # Strip /api prefix forwarded by Vercel
 @app.middleware("http")
@@ -461,6 +463,33 @@ def init_db() -> None:
         ]:
             if not column_exists(conn, "ai_runner_state", col):
                 cur.execute(f"ALTER TABLE ai_runner_state ADD COLUMN {col} {coltype} DEFAULT {defval}")
+
+        # Support chat tables
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            id                  {_serial},
+            user_email          TEXT NOT NULL,
+            status              TEXT NOT NULL DEFAULT 'open',
+            subject             TEXT NOT NULL DEFAULT '',
+            created_at          TIMESTAMPTZ DEFAULT NOW(),
+            last_user_msg_at    TIMESTAMPTZ DEFAULT NOW(),
+            last_admin_reply_at TIMESTAMPTZ
+        )
+        """)
+
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS support_messages (
+            id          {_serial},
+            ticket_id   INTEGER NOT NULL,
+            sender      TEXT NOT NULL,
+            message     TEXT NOT NULL,
+            sent_at     TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_support_tickets_user ON support_tickets(user_email)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_support_tickets_status ON support_tickets(status, last_user_msg_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_support_messages_ticket ON support_messages(ticket_id, sent_at)")
 
         # Seed admin settings defaults
         def _set_default(key: str, value: str):

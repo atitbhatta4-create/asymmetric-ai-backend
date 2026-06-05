@@ -213,6 +213,22 @@ def email_otp_reset(to: str, code: str) -> None:
     send_email(to, "Asymmetric AI — Password Reset Code", _email_base(content))
 
 
+def email_support_reply(to: str, admin_message: str) -> None:
+    content = f"""
+    <h2 style="margin:0 0 14px;font-size:20px;font-weight:900;color:#f1f5f9;">Support Reply</h2>
+    <p style="margin:0 0 18px;opacity:0.85;line-height:1.6;">
+      Our team has replied to your support ticket:
+    </p>
+    <div style="background:#0f172a;border:1px solid rgba(0,255,224,0.20);border-radius:14px;
+                padding:18px;margin-bottom:18px;font-size:14px;line-height:1.7;color:#f1f5f9;">
+      {admin_message}
+    </div>
+    <p style="margin:0;font-size:12px;color:#4b5563;">
+      Log in to Asymmetric AI to continue the conversation.
+    </p>"""
+    send_email(to, "Asymmetric AI — Support Reply", _email_base(content))
+
+
 def email_2fa_enabled(to: str) -> None:
     content = f"""
     <h2 style="margin:0 0 14px;font-size:20px;font-weight:900;color:#f1f5f9;">Two-Factor Authentication Enabled</h2>
