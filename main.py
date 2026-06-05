@@ -560,8 +560,8 @@ def ensure_user_state(email: str) -> None:
                 (email, START_EQUITY, 0),
             )
             conn.commit()
-        elif START_EQUITY > 1000 and float(row["equity"]) <= 1000.0:
-            # User was created before SIMULATED_EQUITY was configured; bump to current default
+        elif float(row["equity"]) <= 0:
+            # Equity is zero — reset to configured start amount
             cur.execute("UPDATE user_state SET equity = %s WHERE email = %s", (START_EQUITY, email))
             conn.commit()
 
