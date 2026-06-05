@@ -62,7 +62,7 @@ _MID_CANDLE_THRESHOLDS: Dict[str, float] = {
     "SWING":     0.015,
 }
 _MID_CANDLE_MIN_SCORE = 0.75
-_MID_CANDLE_INTERVAL  = 300   # seconds between mid-candle checks
+_MID_CANDLE_INTERVAL  = 600   # seconds between mid-candle checks
 
 # ── Dubai timezone ────────────────────────────────────────────────────────────
 DUBAI_TZ = timezone(timedelta(hours=4))

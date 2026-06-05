@@ -1774,6 +1774,8 @@ async def _fetch_price_okx(symbol: str) -> float:
             params={"instId": inst},
             headers={"accept": "application/json"},
         )
+    if r.status_code == 429:
+        raise ValueError(f"OKX 429 rate-limit — backing off")
     if r.status_code != 200:
         raise ValueError(f"HTTP {r.status_code}: {r.text[:120]}")
     arr = (r.json() or {}).get("data") or []
@@ -1826,6 +1828,10 @@ def _fetch_klines_raw(symbol: str, tf: str, limit: int) -> List[Dict[str, Any]]:
             timeout=12,
             headers={"accept": "application/json"},
         )
+        if r.status_code == 429:
+            print(f"[klines] OKX 429 rate-limit for {inst}/{bar} — sleeping 60s")
+            time.sleep(60)
+            return []
         if r.status_code != 200:
             print(f"[klines] OKX HTTP {r.status_code} for {inst}/{bar}: {r.text[:120]}")
             return []
@@ -4405,17 +4411,6 @@ class AutoRunner:
         if res.get("atr_pct"):
             self.last_atr_pct = res["atr_pct"]
         slope_pct = res.get("htf_bear_slope_pct")
-        if res.get("htf_bear_triggered") and slope_pct is not None:
-            # Override fired — always log
-            self.log(
-                f"EARLY BEAR OVERRIDE: EMA21 dropped {abs(slope_pct):.3f}% "
-                f"over 8 candles — flipping direction to SHORT mode"
-            )
-        elif slope_pct is not None and slope_pct < -0.002:
-            # Within 0.10% of the -0.30% trigger — log a warning
-            self.log(
-                f"Early bear check: EMA21 at {slope_pct:+.3f}% — approaching trigger at -0.30%"
-            )
         return res
 
     def _secs_until_dubai_midnight(self) -> int:
@@ -4507,32 +4502,15 @@ class AutoRunner:
                                 signal_ok  = res.get("ok", False)
                                 signal_side: Side = res.get("side", "LONG")
 
-                                _now_ts = time.time()
-                                _mc_log_ok = (_now_ts - self._last_mc_log_ts) >= 1800  # 30 min quiet period
                                 if not signal_ok:
-                                    if _mc_log_ok:
-                                        self._last_mc_log_ts = _now_ts
-                                        self.log(
-                                            f"MID_CANDLE: {move_pct*100:+.2f}% move but signal blocked "
-                                            f"({(res.get('blocked') or '?')[:60]}) — skipped"
-                                        )
+                                    pass  # blocked — silent
                                 elif score < _MID_CANDLE_MIN_SCORE:
-                                    if _mc_log_ok:
-                                        self._last_mc_log_ts = _now_ts
-                                        self.log(
-                                            f"MID_CANDLE: {move_pct*100:+.2f}% move, score {score:.2f} "
-                                            f"below {_MID_CANDLE_MIN_SCORE:.2f} — skipped"
-                                        )
+                                    pass  # score too low — silent
                                 else:
                                     # Direction gate: price move must align with signal
                                     expected_side: Side = "LONG" if move_pct > 0 else "SHORT"
                                     if signal_side != expected_side:
-                                        if _mc_log_ok:
-                                            self._last_mc_log_ts = _now_ts
-                                            self.log(
-                                                f"MID_CANDLE: score {score:.2f} OK but move direction "
-                                                f"({expected_side}) conflicts with signal ({signal_side}) — skipped"
-                                            )
+                                        pass  # direction mismatch — silent
                                     else:
                                         # ── Fire trade ────────────────────────────
                                         entry_price = self._fetch_price_sync(self.symbol)
@@ -4922,11 +4900,6 @@ class AutoRunner:
                     self.last_side = res["side"]
                 if not res.get("ok"):
                     self.blocked_reason = res.get("blocked") or "BLOCKED"
-                    regime = res.get("market_regime", "")
-                    if regime in ("CHOPPY", "VOLATILE"):
-                        self.log(f"REGIME_{regime}: {self.blocked_reason[len(f'REGIME_{regime}: '):120]}")
-                    else:
-                        self.log(f"Blocked: {self.blocked_reason[:100]}")
                     continue
 
                 self.blocked_reason = None
@@ -5374,6 +5347,11 @@ def _resume_watchdog() -> None:
 
             except Exception as e:
                 print(f"[watchdog] {email} — error: {e}")
+                _tg_alert(
+                    f"🚨 <b>Engine failed to start</b>\n"
+                    f"User: {email}\n"
+                    f"Error: <code>{str(e)[:250]}</code>"
+                )
 
         if resumed:
             print(f"[watchdog] {resumed} runner(s) started this attempt")
