@@ -29,6 +29,105 @@ from pydantic import BaseModel, Field
 from database import db_conn
 from notifications import tg_alert, email_support_reply
 
+# ── Bot FAQ knowledge base ─────────────────────────────────────────────────────
+
+_FAQ: list[tuple[list[str], str]] = [
+    (
+        ["connect", "exchange", "api", "bybit", "okx", "binance", "key"],
+        (
+            "To connect your exchange, go to <b>Exchange</b> in the left menu and enter your API Key and Secret.\n\n"
+            "When creating the API key on your exchange, make sure to enable <b>Read + Trade permissions</b> — do NOT enable withdrawal.\n\n"
+            "📌 We recommend <b>Bybit</b> — best execution speed and lowest fees. OKX works great too. Binance US is geo-restricted on our servers, so use Bybit or OKX if you're in the US.\n\n"
+            "Once connected, your exchange balance will appear on the Dashboard within a few seconds."
+        ),
+    ),
+    (
+        ["not starting", "won't start", "not start", "ai start", "start ai", "why isn't", "not working", "blocked"],
+        (
+            "Here are the most common reasons the AI won't start:\n\n"
+            "1️⃣ <b>Exchange not connected</b> — go to the Exchange page and add your API keys first\n"
+            "2️⃣ <b>Balance too low</b> — you need at least ~$50 to open a minimum-size position\n"
+            "3️⃣ <b>Bad trade limit hit</b> — the AI pauses after too many losses in one day and auto-resets at midnight Dubai time (UTC+4)\n"
+            "4️⃣ <b>Another session already running</b> — stop it first, then start a new one\n\n"
+            "Check the status card on your Dashboard — it shows the exact reason the AI is currently blocked."
+        ),
+    ),
+    (
+        ["mini_asym", "mini asym", "miniasym", "flagship", "how does mini", "what is mini"],
+        (
+            "<b>MINI_ASYM</b> is our flagship mode and what we recommend for most users. Here's how it works:\n\n"
+            "• <b>2× leverage</b> — much safer than AGGRESSIVE (8×)\n"
+            "• <b>Dynamic position sizing</b> — automatically scales down when volatility spikes or your equity drops\n"
+            "• <b>4-layer signal filter</b> — only enters trades when trend, momentum, market regime, and candle patterns all align at the same time\n"
+            "• <b>Capital protection</b> — hard floor at 85% of starting equity; AI stops completely if it's ever hit\n\n"
+            "Best pairing: <b>MINI_ASYM + DAY_TRADE</b> — this combination has the strongest historical Sharpe ratio in our backtests."
+        ),
+    ),
+    (
+        ["withdraw", "reset", "balance", "restart balance", "reset balance", "reset sandbox"],
+        (
+            "<b>Demo mode:</b> Go to Dashboard → scroll down → tap <b>Reset Sandbox</b>. This resets your balance back to the starting amount. Your trade history is kept.\n\n"
+            "<b>Real trading mode:</b> Asymmetric AI never holds your funds — they stay on your exchange at all times. To withdraw, log directly into Bybit / OKX / Binance and withdraw from there.\n\n"
+            "If your balance shows $0 and you haven't reset it, please message us and we'll fix it manually."
+        ),
+    ),
+    (
+        ["which mode", "best mode", "what mode", "recommend", "best for me", "which is best", "mode should"],
+        (
+            "Our recommendation for most users is <b>MINI_ASYM + DAY_TRADE</b>.\n\n"
+            "Here's a quick comparison:\n\n"
+            "🟢 <b>MINI_ASYM</b> (2× leverage) — Flagship. Best risk/reward. Recommended for 95% of users\n"
+            "🔵 <b>SAFE</b> (1× leverage) — Most conservative. Slow but very protected\n"
+            "🟡 <b>NORMAL</b> (3× leverage) — Good middle ground for experienced traders\n"
+            "🔴 <b>AGGRESSIVE</b> (8× leverage) — Highest potential returns but significant drawdown risk. Not recommended for beginners\n\n"
+            "For trade style: <b>DAY_TRADE</b> performs best on most coins in our backtests, followed by SWING. SCALP with AGGRESSIVE mode showed negative returns — avoid that combination."
+        ),
+    ),
+    (
+        ["leverage", "how much leverage", "what leverage"],
+        (
+            "Each mode uses different leverage:\n\n"
+            "• ULTRA_SAFE: 0.5× (no real leverage)\n"
+            "• SAFE: 1×\n"
+            "• NORMAL: 3×\n"
+            "• MINI_ASYM: 2× (with smart dynamic sizing)\n"
+            "• AGGRESSIVE: 8×\n\n"
+            "Remember: leverage multiplies both gains AND losses. MINI_ASYM's dynamic sizing means it uses less than 2× when conditions are risky — making it behave more conservatively than the number suggests."
+        ),
+    ),
+    (
+        ["fee", "fees", "cost", "pricing", "free", "subscription", "pay"],
+        (
+            "Asymmetric AI is currently <b>free to use</b> during our beta phase.\n\n"
+            "Paid plans with additional features will launch later this year. All current users will be grandfathered in at a special rate.\n\n"
+            "Your exchange charges its own trading fees directly — typically 0.02-0.1% per trade depending on the exchange."
+        ),
+    ),
+    (
+        ["safe", "is it safe", "trust", "funds", "money", "secure"],
+        (
+            "Your funds are always safe on your exchange — Asymmetric AI <b>never has access to your money directly</b>.\n\n"
+            "We connect using an API key with Trade-only permissions (no withdrawal access). Even if our servers were compromised, your funds cannot be moved.\n\n"
+            "The AI can only open and close positions. It cannot deposit, withdraw, or transfer funds."
+        ),
+    ),
+]
+
+
+def _find_bot_answer(message: str, user_mode: str | None = None) -> str | None:
+    """Return a bot answer if the message matches a known FAQ, else None."""
+    msg = message.lower()
+    for keywords, answer in _FAQ:
+        if any(kw in msg for kw in keywords):
+            # Personalise with current mode if we know it
+            if user_mode and "which mode" in msg or "best mode" in msg or "recommend" in msg:
+                answer = (
+                    f"You're currently on <b>{user_mode}</b> mode. "
+                    + answer.replace("Our recommendation for most users is", "For context,")
+                )
+            return answer
+    return None
+
 support_router = APIRouter(tags=["support"])
 
 
@@ -208,6 +307,53 @@ def send_message(body: MessageIn, user=Depends(_require_user)):
         f"Message: <code>{body.message.strip()[:200]}</code>"
     )
     return {"ok": True}
+
+
+@support_router.post("/support/bot-reply")
+def bot_reply(body: MessageIn, user=Depends(_require_user)):
+    """Check if message matches a known FAQ and save an automatic reply."""
+    email = user["email"]
+
+    # Look up user's current mode for personalised answers
+    user_mode: str | None = None
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT mode FROM ai_runner_state WHERE email=%s",
+                (email,)
+            )
+            row = cur.fetchone()
+            if row:
+                user_mode = row["mode"]
+    except Exception:
+        pass
+
+    answer = _find_bot_answer(body.message, user_mode)
+    if not answer:
+        return {"ok": True, "replied": False}
+
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM support_tickets WHERE user_email=%s AND status='open' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (email,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return {"ok": True, "replied": False}
+        cur.execute(
+            "INSERT INTO support_messages(ticket_id, sender, message) VALUES(%s,'admin',%s)",
+            (row["id"], answer),
+        )
+        cur.execute(
+            "UPDATE support_tickets SET last_admin_reply_at=NOW() WHERE id=%s",
+            (row["id"],),
+        )
+        conn.commit()
+
+    return {"ok": True, "replied": True}
 
 
 # ── Admin endpoints ────────────────────────────────────────────────────────────
