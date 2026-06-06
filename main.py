@@ -8,11 +8,7 @@ import time
 import hashlib
 import hmac
 import threading
-import smtplib
-import bcrypt
 from cryptography.fernet import Fernet
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Literal, Any, Deque
@@ -777,6 +773,7 @@ def config():
         "env": ENV,
         "frontend_origins": FRONTEND_ORIGINS,
         "db": "postgresql" if USING_PG else "sqlite",
+        "real_trading": REAL_TRADING,
     }
 
 
@@ -820,11 +817,6 @@ def update_profile(payload: ProfileIn, user=Depends(require_user)):
         cur.execute("UPDATE users SET display_name = %s WHERE email = %s", (name, email))
         conn.commit()
     return {"ok": True, "display_name": name}
-
-@app.get("/config")
-def get_config():
-    return {"real_trading": REAL_TRADING}
-
 
 # =========================
 # EXCHANGE CONNECT
