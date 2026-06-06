@@ -166,9 +166,9 @@ _GLOBAL_RL_DASHBOARD = {
     "/portfolio/stats", "/portfolio/pnl", "/market/tickers",
 }
 
-# Authenticated users: 300/min  |  Unauthenticated (IP): 60/min
+# Authenticated users: 300/min  |  Unauthenticated (real IP): 120/min
 _RL_LIMIT_AUTH = 300
-_RL_LIMIT_IP   = 60
+_RL_LIMIT_IP   = 120
 _RL_LIMIT_DASH = 600  # dashboard polling endpoints
 
 @app.middleware("http")
@@ -196,7 +196,12 @@ async def global_rate_limit(request: Request, call_next):
         except Exception:
             pass
     if not rl_key:
-        rl_key = f"ip:{(request.client.host if request.client else 'unknown')}"
+        # X-Forwarded-For is set by Render's proxy with the real client IP.
+        # Falling back to request.client.host gives Render's internal proxy IP,
+        # which is shared by all users — they all hit the same 60/min bucket.
+        xff = request.headers.get("x-forwarded-for", "")
+        real_ip = xff.split(",")[0].strip() if xff else (request.client.host if request.client else "unknown")
+        rl_key = f"ip:{real_ip}"
 
     # Choose limit based on endpoint type and auth status
     if path in _GLOBAL_RL_DASHBOARD and is_authed:
