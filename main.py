@@ -30,9 +30,8 @@ from config import (
 )
 from notifications import (
     tg_alert as _tg_alert,
-    send_email, _email_base,
-    email_password_changed, email_ai_started, email_trade_closed,
-    email_ai_stopped, email_otp_reset, email_2fa_enabled,
+    email_ai_started, email_trade_opened,
+    email_trade_closed, email_ai_stopped,
 )
 from indicators import (
     _ema, _rsi, _atr, _adx, _rsi_series,
