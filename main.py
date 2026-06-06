@@ -4934,6 +4934,12 @@ class AutoRunner:
                     self.last_side = res["side"]
                 if not res.get("ok"):
                     self.blocked_reason = res.get("blocked") or "BLOCKED"
+                    _side_lbl = res.get("side", "?")
+                    _score_lbl = f"{res.get('score', 0.0):.2f}"
+                    _raw = res.get("blocked") or "signal not ready"
+                    # "BLOCKED (entry): Price 4.3% from EMA21" → "Price 4.3% from EMA21"
+                    _reason_lbl = _raw.split("): ", 1)[-1] if "): " in _raw else _raw
+                    self.log(f"Market check — {_side_lbl} score={_score_lbl} | {_reason_lbl}")
                     continue
 
                 self.blocked_reason = None
