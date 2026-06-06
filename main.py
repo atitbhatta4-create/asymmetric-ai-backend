@@ -4018,12 +4018,11 @@ class AutoRunner:
                         f"SL={sl_price:.4f}  TP={tp_price:.4f}"
                     )
 
-                # ── Momentum Scaling (Pyramiding) — paper/demo only ───────────────────
-                # Scale into winning Grade A positions in two stages.
-                # Guards: must be in profit, drawdown < 7%, strictness ≤ 1.10.
-                # Not applied to Grade B (T1/T2 already multi-entry) or real trading.
-                if (not REAL_TRADING
-                        and pt.get("scaling_enabled")
+                # ── Momentum Scaling (Pyramiding) — Grade A only, both paper and real ──
+                # Scale into winning positions in two stages.
+                # Guards: in profit, drawdown < 7%, strictness ≤ 1.10.
+                # Grade B excluded (T1/T2 already multi-entry).
+                if (pt.get("scaling_enabled")
                         and best_move > 0
                         and not pt.get("breakeven_after_t1")
                         and drawdown_pct < 0.07
@@ -4032,7 +4031,14 @@ class AutoRunner:
                     if _atr_now > 0 and not pt.get("scale1_done") and best_move >= 1.5 * _atr_now:
                         pt["scale1_done"] = True
                         pt["size_mult"] = round(float(pt.get("size_mult", 0.70)) + 0.20, 4)
-                        pt["breakeven"] = True   # SL → entry (breakeven)
+                        pt["breakeven"] = True
+                        if REAL_TRADING:
+                            _si_usdt = pt.get("usdt_size_base", 0) * 0.20
+                            _si_lev  = pt.get("leverage_used", 6)
+                            if _si_usdt > 0:
+                                _si_ok = _place_real_scalein(self, self.symbol, side, _si_usdt, _si_lev)
+                                if _si_ok:
+                                    _move_real_sl_to_breakeven(self.email, self.symbol, entry)
                         self.log(
                             f"SCALE IN 1: +20% added at +{best_move*100:.2f}% "
                             f"(threshold 1.5×ATR={1.5*_atr_now*100:.2f}%). "
@@ -4042,7 +4048,22 @@ class AutoRunner:
                         pt["scale2_done"] = True
                         pt["size_mult"] = round(float(pt.get("size_mult", 0.90)) + 0.10, 4)
                         pt["breakeven"] = False
-                        pt["trail_locked_pct"] = round(1.5 * _atr_now, 6)  # lock +1.5× ATR profit
+                        pt["trail_locked_pct"] = round(1.5 * _atr_now, 6)
+                        if REAL_TRADING:
+                            _si2_usdt = pt.get("usdt_size_base", 0) * 0.10
+                            _si2_lev  = pt.get("leverage_used", 6)
+                            _sl2_price = (entry * (1 - 1.5 * _atr_now) if side == "LONG"
+                                          else entry * (1 + 1.5 * _atr_now))
+                            if _si2_usdt > 0:
+                                _si2_ok = _place_real_scalein(self, self.symbol, side, _si2_usdt, _si2_lev)
+                                if _si2_ok:
+                                    try:
+                                        _ex_row = get_exchange(self.email)
+                                        if _ex_row:
+                                            _ex2 = _make_ccxt_exchange(_ex_row)
+                                            _set_position_sl(_ex2, _ex_row.get("exchange","bybit"), self.symbol, side, _sl2_price)
+                                    except Exception:
+                                        pass
                         self.log(
                             f"SCALE IN 2: +10% added at +{best_move*100:.2f}% "
                             f"(threshold 3.0×ATR={3.0*_atr_now*100:.2f}%). "
@@ -4554,11 +4575,22 @@ class AutoRunner:
                                         sl_pct_open = min(self.last_atr_pct * st["sl_atr"], st["sl_max"] / 100.0)
                                         tp_pct_open = min(self.last_atr_pct * st["tp_atr"], st["tp_max"] / 100.0)
 
+                                        # BTC correlation check for mid-candle (skip BTC itself)
+                                        _btc_mc_mult = 1.0
+                                        if "BTC" not in self.symbol.upper():
+                                            _btc_mc = _get_btc_momentum(self.tf)
+                                            if _btc_mc is not None:
+                                                _mc_against = ((signal_side == "LONG"  and _btc_mc < -0.02) or
+                                                               (signal_side == "SHORT" and _btc_mc >  0.02))
+                                                if _mc_against:
+                                                    if abs(_btc_mc) >= 0.04:
+                                                        raise _MidCandleSkip()  # strong conflict — skip
+                                                    _btc_mc_mult = 0.60
+
                                         if REAL_TRADING:
                                             real_bal = get_real_usdt_balance(self.email, force=True)
                                             if real_bal is None:
                                                 self.log("MID_CANDLE REAL ORDER SKIPPED — could not fetch balance")
-                                                # skip to next sleep
                                                 raise _MidCandleSkip()
                                             equity_now = real_bal
                                             set_equity(self.email, real_bal)
@@ -4582,11 +4614,20 @@ class AutoRunner:
                                                 _dd_sm_mc  = (0.25 if _dd_now_mc >= 0.10 else
                                                               0.40 if _dd_now_mc >= 0.07 else
                                                               0.65 if _dd_now_mc >= 0.04 else 1.0)
-                                                size_pct  = float(c["size"]) * _vol_sm_mc * _dd_sm_mc
+                                                _mc_fund_mult = 1.0
+                                                _mc_fr = _get_funding_rate(self.email, self.symbol)
+                                                if _mc_fr is not None:
+                                                    _mc_fr_against = ((signal_side == "LONG"  and _mc_fr >  0.001) or
+                                                                      (signal_side == "SHORT" and _mc_fr < -0.001))
+                                                    if _mc_fr_against:
+                                                        _mc_fund_mult = 0.50 if abs(_mc_fr) >= 0.003 else 0.70
+                                                        self.log(f"MID_CANDLE funding {_mc_fr*100:.4f}%/8h against {signal_side} — size × {_mc_fund_mult:.2f}")
+                                                size_pct  = float(c["size"]) * _vol_sm_mc * _dd_sm_mc * _btc_mc_mult * _mc_fund_mult
                                                 usdt_size = equity_now * size_pct
                                                 self.log(
                                                     f"MID-CANDLE REAL ORDER SIZE: base={float(c['size'])*100:.0f}% "
                                                     f"× vol={_vol_sm_mc:.2f} × dd={_dd_sm_mc:.2f} "
+                                                    f"× btc={_btc_mc_mult:.2f} × fund={_mc_fund_mult:.2f} "
                                                     f"= {size_pct*100:.1f}% → ${usdt_size:.2f}"
                                                 )
                                                 if grade == "B":
@@ -4616,14 +4657,16 @@ class AutoRunner:
                                                 raise _MidCandleSkip()
 
                                         base_trade = {
-                                            "entry_price": entry_price,
-                                            "side":        signal_side,
-                                            "mode":        self.mode,
-                                            "signal":      self.last_signal,
-                                            "open_ts":     time.time(),
-                                            "sl_pct_open": sl_pct_open,
-                                            "tp_pct_open": tp_pct_open,
-                                            "mid_candle":  True,
+                                            "entry_price":    entry_price,
+                                            "side":           signal_side,
+                                            "mode":           self.mode,
+                                            "signal":         self.last_signal,
+                                            "open_ts":        time.time(),
+                                            "sl_pct_open":    sl_pct_open,
+                                            "tp_pct_open":    tp_pct_open,
+                                            "mid_candle":     True,
+                                            "usdt_size_base": usdt_size if REAL_TRADING else 0,
+                                            "leverage_used":  int(c["leverage"]),
                                         }
                                         if grade == "B" and REAL_TRADING:
                                             self.pending_trades = [
@@ -4960,6 +5003,22 @@ class AutoRunner:
                     # T16 reversal overrides SL/TP multipliers (1.5×ATR SL, 3×ATR TP)
                     _sl_atr = self.sl_atr_override if self.sl_atr_override else st["sl_atr"]
                     _tp_atr = self.tp_atr_override if self.tp_atr_override else st["tp_atr"]
+
+                    # ── BTC Correlation filter (all symbols except BTC itself) ───────
+                    _btc_mult = 1.0
+                    if "BTC" not in self.symbol.upper():
+                        _btc_move = _get_btc_momentum(self.tf)
+                        if _btc_move is not None:
+                            _btc_against = ((desired_side == "LONG"  and _btc_move < -0.02) or
+                                            (desired_side == "SHORT" and _btc_move >  0.02))
+                            if _btc_against:
+                                _btc_dir = f"BTC {_btc_move*100:.1f}% vs {desired_side}"
+                                if abs(_btc_move) >= 0.04:
+                                    self.log(f"BTC macro conflict: {_btc_dir} — strong headwind, trade skipped")
+                                    self.last_trade_ts = now_ts  # apply cooldown so we re-check next interval
+                                    continue
+                                _btc_mult = 0.60
+                                self.log(f"BTC macro conflict: {_btc_dir} — size reduced to 60%")
                     sl_pct_open = min(self.last_atr_pct * _sl_atr, st["sl_max"] / 100.0)
                     tp_pct_open = min(self.last_atr_pct * _tp_atr, st["tp_max"] / 100.0)
 
@@ -4996,11 +5055,22 @@ class AutoRunner:
                             _dd_sm  = (0.25 if _dd_now >= 0.10 else
                                        0.40 if _dd_now >= 0.07 else
                                        0.65 if _dd_now >= 0.04 else 1.0)
-                            size_pct  = float(c["size"]) * _mtf_sm * _vol_sm * _dd_sm
+                            # Funding rate check — reduce size if rate works against direction
+                            _fund_mult = 1.0
+                            _fr = _get_funding_rate(self.email, self.symbol)
+                            if _fr is not None:
+                                _fr_against = ((desired_side == "LONG"  and _fr >  0.001) or
+                                               (desired_side == "SHORT" and _fr < -0.001))
+                                if _fr_against:
+                                    _fr_abs   = abs(_fr)
+                                    _fund_mult = 0.50 if _fr_abs >= 0.003 else 0.70
+                                    self.log(f"Funding rate {_fr*100:.4f}%/8h against {desired_side} — size × {_fund_mult:.2f}")
+                            size_pct  = float(c["size"]) * _mtf_sm * _vol_sm * _dd_sm * _btc_mult * _fund_mult
                             usdt_size = equity_now * size_pct
                             self.log(
                                 f"REAL ORDER SIZE: base={float(c['size'])*100:.0f}% "
-                                f"× mtf={_mtf_sm:.2f} × vol={_vol_sm:.2f} × dd={_dd_sm:.2f} "
+                                f"× mtf={_mtf_sm:.2f} × vol={_vol_sm:.2f} × dd={_dd_sm:.2f}"
+                                f"× btc={_btc_mult:.2f} × fund={_fund_mult:.2f} "
                                 f"= {size_pct*100:.1f}% → ${usdt_size:.2f}"
                             )
                             if grade == "B":
@@ -5019,13 +5089,17 @@ class AutoRunner:
                                     f"T1@{real_b_result['t1_tp_price']:.4f} T2@{real_b_result['t2_tp_price']:.4f}"
                                 )
                             else:
+                                # T18: open at 70% so we can scale into winners
+                                _t18_active = self._scaling_enabled
+                                _open_usdt  = usdt_size * (0.70 if _t18_active else 1.00)
                                 _real_result = place_real_order(
                                     email=self.email, symbol=self.symbol, side=desired_side,
-                                    usdt_size=usdt_size, leverage=int(c["leverage"]),
+                                    usdt_size=_open_usdt, leverage=int(c["leverage"]),
                                     sl_pct=sl_pct_open, tp_pct=tp_pct_open,
                                 )
                                 real_order_id = _real_result.get("order_id")
-                                self.log(f"REAL ORDER PLACED | id={real_order_id} | {desired_side} {self.symbol} size=${usdt_size:.2f} lev={c['leverage']}×")
+                                _t18_lbl = f" (T18: 70% of ${usdt_size:.2f})" if _t18_active else ""
+                                self.log(f"REAL ORDER PLACED | id={real_order_id} | {desired_side} {self.symbol} size=${_open_usdt:.2f} lev={c['leverage']}×{_t18_lbl}")
                         except Exception as _re:
                             self.log(f"REAL ORDER FAILED — trade skipped: {_re}")
                             _tg_alert(
@@ -5045,27 +5119,42 @@ class AutoRunner:
                             "open_ts": time.time(),
                             "sl_pct_open": sl_pct_open,
                             "tp_pct_open": tp_pct_open,
+                            "usdt_size_base": usdt_size,
+                            "leverage_used":  int(c["leverage"]),
                         }
                         if grade == "B":
-                            # t1_sl_id / t2_sl_id start as None; filled in after SL placement below.
-                            # Stored here so _save_runner_state persists them before SL attempt.
                             self.pending_trades = [
                                 {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80,
                                  "is_primary": True,  "label": "T1",
                                  "order_id": real_b_result.get("order_id"),
                                  "t1_tp_id": real_b_result.get("t1_tp_id"),
-                                 "t1_sl_id": None},   # filled after _place_grade_b_stop_order
+                                 "t1_sl_id": None},
                                 {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00,
                                  "is_primary": False, "label": "T2", "breakeven_after_t1": True,
-                                 "t2_sl_id": None},   # filled after _place_grade_b_stop_order
+                                 "t2_sl_id": None},
                             ]
                             self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP T2 40%+100%TP+BE | score={self.last_score:.2f}")
                         else:
+                            _real_t18   = self._scaling_enabled
+                            _real_init_sm = round(0.70 * _mtf_sm if _real_t18 else 1.00 * _mtf_sm, 4)
+                            _scale_lbl  = " | T18: entry 70%" if _real_t18 else ""
                             self.pending_trades = [
-                                {**base_trade, "grade": "A", "size_mult": 1.00, "tp_mult": 1.00,
-                                 "is_primary": True, "order_id": real_order_id},
+                                {**base_trade, "grade": "A", "size_mult": _real_init_sm, "tp_mult": 1.00,
+                                 "is_primary": True, "order_id": real_order_id,
+                                 "scale1_done": False, "scale2_done": False,
+                                 "scaling_enabled": _real_t18},
                             ]
-                            self.log(f"TRADE OPENED Grade A REAL ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}")
+                            self.log(f"TRADE OPENED Grade A REAL ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f}{_scale_lbl}")
+                        _sl_px = entry_price * (1 + sl_pct_open) if desired_side == "SHORT" else entry_price * (1 - sl_pct_open)
+                        _tp_px = entry_price * (1 - tp_pct_open) if desired_side == "SHORT" else entry_price * (1 + tp_pct_open)
+                        try:
+                            email_trade_opened(
+                                to=self.email, symbol=self.symbol, side=desired_side, mode=self.mode,
+                                grade=grade, entry=entry_price, sl=_sl_px, tp=_tp_px,
+                                score=self.last_score, equity=equity_now,
+                            )
+                        except Exception:
+                            pass
                         self.last_trade_ts = now_ts
                         _save_runner_state(self)   # position logged to DB before SL attempt
 
@@ -5397,6 +5486,97 @@ def _resume_watchdog() -> None:
             print(f"[watchdog] {resumed} runner(s) started this attempt")
 
     print("[watchdog] max attempts reached — giving up (state preserved in DB)")
+
+
+# =========================
+# TRADING QUALITY HELPERS
+# =========================
+
+def _get_btc_momentum(tf: str) -> Optional[float]:
+    """BTC % change over last 3 closed candles on given timeframe.
+    Positive = rising, negative = falling. Returns None on error."""
+    try:
+        klines = _fetch_klines_sync("BTCUSDT", tf, limit=6)
+        if not klines or len(klines) < 3:
+            return None
+        old_close = float(klines[-3]["close"])
+        new_close = float(klines[-1]["close"])
+        return (new_close - old_close) / old_close
+    except Exception:
+        return None
+
+
+def _get_funding_rate(email: str, symbol: str) -> Optional[float]:
+    """Current funding rate for a perp future as a decimal (e.g. 0.0001 = 0.01%).
+    Positive = longs pay (costly for LONG). Negative = shorts pay (costly for SHORT).
+    Returns None on any error."""
+    try:
+        row = get_exchange(email)
+        if not row:
+            return None
+        ex = _make_ccxt_exchange(row)
+        if not ex.markets:
+            ex.load_markets()
+        result = _ccxt_call(ex.fetch_funding_rate, symbol, label=f"funding_{symbol}", retries=0)
+        if result:
+            return float(result.get("fundingRate") or 0.0)
+        return None
+    except Exception:
+        return None
+
+
+def _place_real_scalein(runner, symbol: str, side: str, add_usdt: float, leverage: int) -> bool:
+    """Add to an existing real position (T18 scale-in).
+    Places a market order in same direction — no TP/SL since position already has them.
+    Returns True on success."""
+    try:
+        row = get_exchange(runner.email)
+        if not row:
+            return False
+        ex = _make_ccxt_exchange(row)
+        if not ex.markets:
+            ex.load_markets()
+        ex_id  = (row.get("exchange") or "bybit").lower()
+        mkt    = ex.market(symbol)
+        _prec  = mkt.get("precision", {})
+        _lims  = mkt.get("limits", {})
+        qty_step = float(_prec.get("amount") or 0)
+        min_qty  = float((_lims.get("amount") or {}).get("min") or 0)
+
+        current_px = runner._fetch_price_sync(symbol)
+        qty_raw    = (add_usdt * leverage) / max(current_px, 1e-9)
+        qty = (round(int(qty_raw / qty_step) * qty_step, 8)
+               if qty_step > 0 else round(qty_raw, 3))
+        if qty < max(min_qty, 1e-9):
+            runner.log(f"SCALE-IN skipped — qty {qty:.4f} below exchange minimum {min_qty}")
+            return False
+
+        if ex_id == "bybit":
+            bybit_sym = mkt["id"]
+            _ccxt_call(
+                ex.privatePostV5OrderCreate,
+                {
+                    "category":    "linear",
+                    "symbol":      bybit_sym,
+                    "side":        "Buy" if side == "LONG" else "Sell",
+                    "orderType":   "Market",
+                    "qty":         str(qty),
+                    "positionIdx": 0,
+                },
+                label=f"scalein_{symbol}", retries=1,
+            )
+        else:
+            ccxt_side = "buy" if side == "LONG" else "sell"
+            _ccxt_call(
+                ex.create_order, symbol, "market", ccxt_side, qty, None,
+                {"reduceOnly": False},
+                label=f"scalein_{symbol}", retries=1,
+            )
+        runner.log(f"REAL SCALE-IN placed: {side} {symbol} +${add_usdt:.2f} qty={qty:.4f} lev={leverage}×")
+        return True
+    except Exception as e:
+        runner.log(f"REAL SCALE-IN failed — {e}")
+        return False
 
 
 # =========================
