@@ -35,8 +35,8 @@ from config import (
 from notifications import (
     tg_alert as _tg_alert,
     send_email, _email_base,
-    email_password_changed, email_ai_started, email_trade_closed,
-    email_ai_stopped, email_otp_reset, email_2fa_enabled,
+    email_password_changed, email_ai_started, email_trade_opened,
+    email_trade_closed, email_ai_stopped, email_otp_reset, email_2fa_enabled,
 )
 from indicators import (
     _ema, _rsi, _atr, _adx, _rsi_series,
@@ -4655,6 +4655,16 @@ class AutoRunner:
                                             f"@ {entry_price:.4f} | score={score:.2f} | "
                                             f"{abs_move*100:.1f}% price move triggered"
                                         )
+                                        _mc_sl_px = entry_price * (1 + sl_pct_open) if signal_side == "SHORT" else entry_price * (1 - sl_pct_open)
+                                        _mc_tp_px = entry_price * (1 - tp_pct_open) if signal_side == "SHORT" else entry_price * (1 + tp_pct_open)
+                                        try:
+                                            email_trade_opened(
+                                                to=self.email, symbol=self.symbol, side=signal_side, mode=self.mode,
+                                                grade=grade, entry=entry_price, sl=_mc_sl_px, tp=_mc_tp_px,
+                                                score=score, equity=equity_now,
+                                            )
+                                        except Exception:
+                                            pass
 
                                         # Place SL — Grade B: two separate stops; Grade A: position SL
                                         if REAL_TRADING:
@@ -5055,6 +5065,16 @@ class AutoRunner:
                                  "is_primary": True, "order_id": real_order_id},
                             ]
                             self.log(f"TRADE OPENED Grade A REAL ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}")
+                        _sl_px = entry_price * (1 + sl_pct_open) if desired_side == "SHORT" else entry_price * (1 - sl_pct_open)
+                        _tp_px = entry_price * (1 - tp_pct_open) if desired_side == "SHORT" else entry_price * (1 + tp_pct_open)
+                        try:
+                            email_trade_opened(
+                                to=self.email, symbol=self.symbol, side=desired_side, mode=self.mode,
+                                grade=grade, entry=entry_price, sl=_sl_px, tp=_tp_px,
+                                score=self.last_score, equity=equity_now,
+                            )
+                        except Exception:
+                            pass
                         self.last_trade_ts = now_ts
                         _save_runner_state(self)   # position logged to DB before SL attempt
 
@@ -5188,6 +5208,16 @@ class AutoRunner:
                                  "scaling_enabled": self._scaling_enabled},
                             ]
                             self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}{_mtf_label}{_scale_label}")
+                        _sl_px = entry_price * (1 + sl_pct_open) if desired_side == "SHORT" else entry_price * (1 - sl_pct_open)
+                        _tp_px = entry_price * (1 - tp_pct_open) if desired_side == "SHORT" else entry_price * (1 + tp_pct_open)
+                        try:
+                            email_trade_opened(
+                                to=self.email, symbol=self.symbol, side=desired_side, mode=self.mode,
+                                grade=grade, entry=entry_price, sl=_sl_px, tp=_tp_px,
+                                score=self.last_score, equity=equity_now,
+                            )
+                        except Exception:
+                            pass
                         self.last_trade_ts = now_ts
                         _save_runner_state(self)   # persist open position immediately
                 else:
