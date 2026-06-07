@@ -3297,6 +3297,8 @@ class AutoRunner:
         self.history: Deque[Dict[str, str]] = deque(maxlen=200)
         self.ai_session_id: Optional[int] = None  # DB row id for this AI run
         self.pending_trades: List[Dict] = []
+        self._pt_lock: threading.Lock = threading.Lock()
+        self._opening_trade: bool = False   # True while an order is being placed; prevents double-entry
         self.adaptive_strictness: float = 1.0
         self.strictness_day_key: str = dubai_day_key()  # tracks which Dubai day strictness belongs to
         self.last_breakdown: Dict = {}
@@ -4531,6 +4533,24 @@ class AutoRunner:
                                         else:
                                             equity_now = get_equity(self.email)
 
+                                        # Hard floor guard — mirrors _run_loop check.
+                                        # Must be here because stop_event.set() from _run_loop
+                                        # may not be seen until this thread's next iteration.
+                                        if equity_now < self.floor_equity:
+                                            self.log(
+                                                f"MID_CANDLE SKIPPED — equity ${equity_now:.2f} below "
+                                                f"floor ${self.floor_equity:.2f}. Hard floor protection."
+                                            )
+                                            raise _MidCandleSkip()
+
+                                        # Claim the trade slot atomically — prevents double-entry
+                                        # if _run_loop is simultaneously completing signal computation
+                                        # and both threads see pending_trades = [] at the same time.
+                                        with self._pt_lock:
+                                            if self.pending_trades or self._opening_trade:
+                                                raise _MidCandleSkip()
+                                            self._opening_trade = True
+
                                         real_order_id   = None
                                         real_b_result   = None
                                         _mc_real_result = None
@@ -4573,6 +4593,8 @@ class AutoRunner:
                                                     )
                                                     real_order_id = _mc_real_result.get("order_id")
                                             except Exception as _re:
+                                                with self._pt_lock:
+                                                    self._opening_trade = False
                                                 self.log(f"MID_CANDLE REAL ORDER FAILED — {_re}")
                                                 _tg_alert(
                                                     f"❌ <b>Real order failed (mid-candle)</b>\n"
@@ -4619,6 +4641,8 @@ class AutoRunner:
 
                                         # FIX 1: Log position BEFORE SL attempt
                                         self.last_trade_ts = time.time()
+                                        with self._pt_lock:
+                                            self._opening_trade = False   # slot claimed — pending_trades is set
                                         _save_runner_state(self)
 
                                         self.log(
@@ -4650,12 +4674,12 @@ class AutoRunner:
                                                     if not _mc_t1_sl or not _mc_t2_sl:
                                                         self.log(f"MID_CANDLE Grade B partial stop failed — position SL fallback")
                                                         _mc_sl_ok = _ensure_sl_or_close(self, _mc_b_ex, _mc_b_ex_id, self.symbol, signal_side, _mc_b_sl)
-                                                        if not _mc_sl_ok:
+                                                        if _mc_sl_ok is False:  # False=closed safely; None=still open, keep tracking
                                                             self.pending_trades = []
                                                             _save_runner_state(self)
                                                 else:
                                                     _mc_sl_ok = _ensure_sl_or_close(self, _mc_b_ex, _mc_b_ex_id, self.symbol, signal_side, _mc_b_sl)
-                                                    if not _mc_sl_ok:
+                                                    if _mc_sl_ok is False:  # False=closed safely; None=still open, keep tracking
                                                         self.pending_trades = []
                                                         _save_runner_state(self)
                                             else:
@@ -4663,13 +4687,20 @@ class AutoRunner:
                                                     self, _mc_real_result["ex"], _mc_real_result["ex_id"],
                                                     self.symbol, signal_side, _mc_real_result["sl_price"],
                                                 )
-                                                if not _mc_sl_ok:
+                                                if _mc_sl_ok is False:  # False=closed safely; None=still open, keep tracking
                                                     self.pending_trades = []
                                                     _save_runner_state(self)
 
             except _MidCandleSkip:
-                pass
+                # If _opening_trade was set before the skip, clear it so the next
+                # interval is not permanently blocked.
+                with self._pt_lock:
+                    if self._opening_trade:
+                        self._opening_trade = False
             except Exception as _mc_err:
+                with self._pt_lock:
+                    if self._opening_trade:
+                        self._opening_trade = False
                 self.log(f"MID_CANDLE monitor error: {_mc_err}")
 
             # Sleep in 10-second chunks so stop_event is respected quickly
@@ -4977,6 +5008,17 @@ class AutoRunner:
                     _mtf_sm = res.get("mtf_size_mult", 1.0)
                     if not res.get("mtf_confirmed", True):
                         self.log(f"15m not confirmed — size reduced to {_mtf_sm*100:.0f}% for lower conviction")
+
+                    # Final guard: claim the trade slot atomically before placing any order.
+                    # Mid-candle monitor may have opened a position during signal computation
+                    # (which takes 1-3s of API calls). Without this check a double position
+                    # could be placed — two market orders back-to-back for the same symbol.
+                    with self._pt_lock:
+                        if self.pending_trades or self._opening_trade:
+                            self.log("Trade skipped — mid-candle monitor already opened a position this interval.")
+                            continue
+                        self._opening_trade = True
+
                     if REAL_TRADING:
                         try:
                             # Apply vol and drawdown size adjustments to the real order —
@@ -5024,6 +5066,8 @@ class AutoRunner:
                                 real_order_id = _real_result.get("order_id")
                                 self.log(f"REAL ORDER PLACED | id={real_order_id} | {desired_side} {self.symbol} size=${usdt_size:.2f} lev={c['leverage']}×")
                         except Exception as _re:
+                            with self._pt_lock:
+                                self._opening_trade = False
                             self.log(f"REAL ORDER FAILED — trade skipped: {_re}")
                             _tg_alert(
                                 f"❌ <b>Real order failed</b>\n"
@@ -5064,6 +5108,8 @@ class AutoRunner:
                             ]
                             self.log(f"TRADE OPENED Grade A REAL ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}")
                         self.last_trade_ts = now_ts
+                        with self._pt_lock:
+                            self._opening_trade = False   # slot claimed — pending_trades is set
                         _save_runner_state(self)   # position logged to DB before SL attempt
 
                         # ── Place SL — Grade B: two separate stops (T1+T2 independent)
@@ -5090,7 +5136,7 @@ class AutoRunner:
                                     # Partial failure — apply position SL as fallback
                                     self.log(f"Grade B partial stop failed (T1={_t1_sl_id} T2={_t2_sl_id}) — applying position SL as fallback")
                                     _sl_ok = _ensure_sl_or_close(self, _b_ex, _b_ex_id, self.symbol, desired_side, _b_sl)
-                                    if not _sl_ok:
+                                    if _sl_ok is False:  # False=closed safely; None=still open, keep tracking
                                         self.pending_trades = []
                                         _save_runner_state(self)
                                     else:
@@ -5153,7 +5199,7 @@ class AutoRunner:
                             else:
                                 # OKX/Binance: position-level SL (no qty-specific conditional stops)
                                 _sl_ok = _ensure_sl_or_close(self, _b_ex, _b_ex_id, self.symbol, desired_side, _b_sl)
-                                if not _sl_ok:
+                                if _sl_ok is False:  # False=closed safely; None=still open, keep tracking
                                     self.pending_trades = []
                                     _save_runner_state(self)
                         else:
@@ -5161,7 +5207,7 @@ class AutoRunner:
                                 self, _real_result["ex"], _real_result["ex_id"],
                                 self.symbol, desired_side, _real_result["sl_price"],
                             )
-                            if not _sl_ok:
+                            if _sl_ok is False:  # False=closed safely; None=still open, keep tracking
                                 self.pending_trades = []
                                 _save_runner_state(self)
 
@@ -5197,6 +5243,8 @@ class AutoRunner:
                             ]
                             self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}{_mtf_label}{_scale_label}")
                         self.last_trade_ts = now_ts
+                        with self._pt_lock:
+                            self._opening_trade = False   # slot claimed — pending_trades is set
                         _save_runner_state(self)   # persist open position immediately
                 else:
                     wait_sec = int(effective_cooldown - (now_ts - self.last_trade_ts))
@@ -5593,12 +5641,13 @@ def _set_position_sl(ex, ex_id: str, symbol: str, side: str, sl_price: float) ->
 
 
 def _ensure_sl_or_close(runner: "AutoRunner", ex, ex_id: str,
-                         symbol: str, side: str, sl_price: float) -> bool:
+                         symbol: str, side: str, sl_price: float) -> Optional[bool]:
     """
     Set SL on open position, retry 3×. If all attempts fail: close position.
     Returns True  = SL placed successfully.
-    Returns False = SL failed, position closed for safety.
-    Never leaves a naked position.
+    Returns False = SL failed, position closed for safety (caller should clear pending_trades).
+    Returns None  = SL failed AND emergency close also failed — position may still be open.
+                    Caller must NOT clear pending_trades so the engine keeps monitoring it.
 
     Bug 3 pre-check: if price has already moved past the SL level, Bybit will
     reject the tradingStop with retCode 10001 on every retry (wastes 6+ seconds
@@ -5623,12 +5672,19 @@ def _ensure_sl_or_close(runner: "AutoRunner", ex, ex_id: str,
             try:
                 result = close_real_order(runner.email, symbol, side)
                 runner.log(f"Position closed for safety: {result}")
+                return False   # closed safely — caller should clear pending_trades
             except Exception as _ce:
                 runner.log(
                     f"CRITICAL: price past SL AND close failed: {_ce}. "
                     f"MANUAL ACTION REQUIRED on {ex_id} — open {side} {symbol}."
                 )
-            return False
+                _tg_alert(
+                    f"🚨 <b>CRITICAL — naked position</b>\n"
+                    f"{runner.email} | {symbol} {side}\n"
+                    f"SL past mark price AND close failed.\n"
+                    f"<b>MANUAL ACTION REQUIRED on {ex_id}.</b>"
+                )
+                return None   # position may still be open — caller must keep pending_trades
     except Exception as _pce:
         runner.log(f"SL pre-check note (non-fatal, will try setting SL): {_pce}")
 
@@ -5647,12 +5703,19 @@ def _ensure_sl_or_close(runner: "AutoRunner", ex, ex_id: str,
     try:
         result = close_real_order(runner.email, symbol, side)
         runner.log(f"Position closed for safety: {result}")
+        return False   # closed safely — caller should clear pending_trades
     except Exception as close_err:
         runner.log(
             f"CRITICAL: SL failed AND close failed: {close_err}. "
             f"MANUAL ACTION REQUIRED on {ex_id} — open {side} {symbol} with NO stop-loss."
         )
-    return False
+        _tg_alert(
+            f"🚨 <b>CRITICAL — naked position</b>\n"
+            f"{runner.email} | {symbol} {side}\n"
+            f"SL placement failed (3 attempts) AND emergency close failed.\n"
+            f"<b>MANUAL ACTION REQUIRED on {ex_id}.</b>"
+        )
+        return None   # position may still be open — caller must keep pending_trades
 
 
 def _place_grade_b_stop_order(
