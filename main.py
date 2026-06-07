@@ -4712,12 +4712,29 @@ class AutoRunner:
             live_pos = next((p for p in positions if _pos_match(p)), None)
 
             if live_pos and not self.pending_trades:
-                # Position exists on exchange but engine is blind — recover it
+                # Position exists on exchange but engine is blind — recover it.
+                # Use Bybit's actual stopLoss price if set — avoids widening a tight
+                # breakeven/trailing SL that was already protecting profit.
                 contracts  = abs(float(live_pos.get("contracts") or 0))
                 entry_px   = float(live_pos.get("entryPrice") or live_pos.get("averagePrice") or 0)
                 pos_side   = "LONG" if (live_pos.get("side") or "").lower() == "long" else "SHORT"
-                sl_pct_use = 0.015  # 1.5% default SL until we can recompute ATR
-                sl_price   = entry_px * (1 - sl_pct_use) if pos_side == "LONG" else entry_px * (1 + sl_pct_use)
+
+                # Try to read the exchange-side SL price from Bybit position data.
+                # Bybit returns it as info["stopLoss"] (string). Fall back to 1.5% default
+                # only if the exchange has no SL set at all.
+                _exch_sl_str = (live_pos.get("info") or {}).get("stopLoss") or ""
+                _exch_sl_px  = float(_exch_sl_str) if _exch_sl_str and float(_exch_sl_str) > 0 else 0.0
+                if _exch_sl_px > 0 and entry_px > 0:
+                    sl_pct_use = abs(_exch_sl_px - entry_px) / entry_px
+                    sl_price   = _exch_sl_px
+                    self.log(
+                        f"RECONCILE: Using existing exchange SL @ {sl_price:.4f} "
+                        f"({sl_pct_use*100:.2f}% from entry) — not overwriting."
+                    )
+                else:
+                    sl_pct_use = 0.015  # 1.5% default — no SL was set on exchange
+                    sl_price   = entry_px * (1 - sl_pct_use) if pos_side == "LONG" else entry_px * (1 + sl_pct_use)
+
                 self.log(
                     f"RECONCILE: Found untracked {pos_side} {self.symbol} "
                     f"{contracts} contracts @ {entry_px:.4f} on {ex_id}. "
@@ -4738,14 +4755,34 @@ class AutoRunner:
                     "recovered":    True,
                 }]
                 _save_runner_state(self)
-                _ensure_sl_or_close(self, ex, ex_id, self.symbol, pos_side, sl_price)
+                # Only call _ensure_sl_or_close if the exchange has no SL set.
+                # If _exch_sl_px > 0 the position is already protected — don't overwrite it.
+                if _exch_sl_px <= 0:
+                    _ensure_sl_or_close(self, ex, ex_id, self.symbol, pos_side, sl_price)
 
             elif not live_pos and self.pending_trades:
-                # Engine thinks a position is open but exchange has none — closed externally
+                # Engine thinks a position is open but exchange has none.
+                # Trade closed during downtime (restart/deploy gap) — SL or TP was hit on
+                # the exchange while the bot was offline. Sync real balance from Bybit so
+                # peak/floor equity calculations stay correct after the missed P&L.
                 self.log(
                     f"RECONCILE: Engine had {len(self.pending_trades)} pending trade(s) "
-                    f"but no open position on {ex_id} for {self.symbol}. Clearing stale state."
+                    f"but no open position on {ex_id} for {self.symbol}. "
+                    f"Trade likely closed during restart gap — syncing real balance."
                 )
+                try:
+                    real_bal  = _get_available_usdt(ex, ex_id)
+                    if real_bal > 0:
+                        old_eq = get_equity(self.email)
+                        set_equity(self.email, real_bal)
+                        self.equity = real_bal
+                        update_peak_ath(self.email, real_bal, real_bal)
+                        self.log(
+                            f"RECONCILE: Equity synced from {ex_id} → ${real_bal:.2f} USDT "
+                            f"(was ${old_eq:.2f} before sync)."
+                        )
+                except Exception as _bal_e:
+                    self.log(f"RECONCILE: Balance sync failed (non-fatal): {_bal_e}")
                 self.pending_trades = []
                 _save_runner_state(self)
 
