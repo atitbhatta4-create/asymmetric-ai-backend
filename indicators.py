@@ -600,9 +600,13 @@ def _compute_signal_layers(
 
     local_bull = ema21[-1] > ema50[-1]   # EMA21/50 cross — 4× faster than ema50/ema200
     ema9_aligned = (ema9[-1] > ema21[-1]) if desired_side == "LONG" else (ema9[-1] < ema21[-1])
-    # Signal label: HTF trend direction + local EMA9 momentum alignment
-    htf_label = "4h-BULL" if htf_bull else "4h-BEAR"
-    ema9_label = "EMA9↑" if ema9[-1] > ema21[-1] else "EMA9↓"
+    # Signal label: HTF trend + EMA9 slope (rising/falling over last 2 candles).
+    # Using slope rather than position (EMA9 vs EMA21) makes the label intuitive:
+    # EMA9↑ = momentum rising, EMA9↓ = momentum falling.
+    # For SHORT + EMA9↑ this correctly signals "counter-momentum trade" to the user.
+    htf_label  = "4h-BULL" if htf_bull else "4h-BEAR"
+    ema9_rising = len(ema9) >= 2 and ema9[-1] > ema9[-2]
+    ema9_label  = "EMA9↑" if ema9_rising else "EMA9↓"
     sig = f"{htf_label} {ema9_label}"
 
     # ── Layer 1: Regime — ADX strength + ATR volatility ──────────────────
