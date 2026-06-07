@@ -17,6 +17,7 @@ from collections import deque
 import httpx
 from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, field_validator
 
 from database import db, db_conn, USING_PG, column_exists, serial_pk
@@ -124,8 +125,9 @@ def _rate_limit(request: Request, limit: int, window: int = 60) -> None:
 # =========================
 # ENV / PROD SETTINGS
 # =========================
-# CORS
+# CORS + COMPRESSION
 # =========================
+app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,

@@ -124,6 +124,41 @@ def email_ai_started(to: str, symbol: str, mode: str, trade_style: str,
     send_email(to, f"AI started — {symbol} {mode}", _email_base(content))
 
 
+def email_trade_opened(to: str, symbol: str, side: str, mode: str,
+                       grade: str, entry: float, sl: float, tp: float,
+                       score: float, equity: float) -> None:
+    side_color = "#00ff9d" if side == "LONG" else "#ff5078"
+    grade_color = "#f1f5f9" if grade == "A" else "#f59e0b"
+    risk_pct   = abs(entry - sl) / entry * 100
+    reward_pct = abs(tp - entry) / entry * 100
+    content = f"""
+    <h2 style="margin:0 0 4px;font-size:20px;font-weight:900;color:#f1f5f9;">Trade Opened</h2>
+    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">{symbol} &nbsp;·&nbsp; {mode}</p>
+
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);
+                border-radius:14px;padding:20px;margin-bottom:14px;text-align:center;">
+      <div style="font-size:13px;color:#6b7280;margin-bottom:8px;">Direction</div>
+      <div style="font-size:32px;font-weight:900;color:{side_color};">{side}</div>
+      <div style="font-size:14px;color:{grade_color};margin-top:6px;font-weight:700;">
+        Grade {grade} &nbsp;·&nbsp; Score {score:.2f}
+      </div>
+    </div>
+
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);
+                border-radius:14px;padding:16px;">
+      <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        {''.join(f'<tr><td style="padding:6px 0;color:#6b7280;width:140px;">{k}</td><td style="padding:6px 0;font-weight:900;color:{c};">{v}</td></tr>' for k,v,c in [
+            ("Entry price",   f"${entry:,.4f}",                    "#f1f5f9"),
+            ("Stop loss",     f"${sl:,.4f}  (−{risk_pct:.2f}%)",  "#ff5078"),
+            ("Take profit",   f"${tp:,.4f}  (+{reward_pct:.2f}%)", "#00ff9d"),
+            ("Equity",        f"${equity:,.2f} USDT",              "#f1f5f9"),
+        ])}
+      </table>
+    </div>"""
+    subject = f"Trade opened — {side} {symbol} @ ${entry:,.4f}"
+    send_email(to, subject, _email_base(content))
+
+
 def email_trade_closed(to: str, symbol: str, side: str, mode: str,
                        entry: float, exit_price: float, outcome: str,
                        pnl_pct: float, pnl_value: float, equity_after: float) -> None:
