@@ -161,7 +161,10 @@ def email_trade_opened(to: str, symbol: str, side: str, mode: str,
 
 def email_trade_closed(to: str, symbol: str, side: str, mode: str,
                        entry: float, exit_price: float, outcome: str,
-                       pnl_pct: float, pnl_value: float, equity_after: float) -> None:
+                       pnl_pct: float, pnl_value: float, equity_after: float,
+                       label: str = "",
+                       session_trades: int = 0, session_wins: int = 0,
+                       session_losses: int = 0, session_pnl: float = 0.0) -> None:
     outcome_label = (
         "Take profit hit"    if outcome == "TP_HIT"
         else "Stop loss hit" if outcome == "SL_HIT"
@@ -173,8 +176,32 @@ def email_trade_closed(to: str, symbol: str, side: str, mode: str,
     side_color = "#00ff9d" if side == "LONG" else "#ff5078"
     sign       = "+" if win else ""
     outcome_icon = "✓" if win else "✗"
+
+    # Trade label for subject: "T1", "T2", or "Grade A"
+    trade_label = label if label else "Trade"
+    sess_sign   = "+" if session_pnl >= 0 else ""
+    sess_color  = "#00ff9d" if session_pnl >= 0 else "#ff5078"
+
+    # Session summary block — only shown when session data is provided
+    session_block = ""
+    if session_trades > 0:
+        session_block = f"""
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);
+                border-radius:14px;padding:16px;margin-top:14px;">
+      <div style="font-size:12px;color:#6b7280;margin-bottom:10px;text-transform:uppercase;
+                  letter-spacing:0.05em;">Today's Session</div>
+      <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        {''.join(f'<tr><td style="padding:5px 0;color:#6b7280;width:130px;">{k}</td><td style="padding:5px 0;font-weight:900;color:{c};">{v}</td></tr>' for k,v,c in [
+            ("Trades",    str(session_trades),                        "#f1f5f9"),
+            ("Wins",      str(session_wins),                          "#00ff9d"),
+            ("Losses",    str(session_losses),                        "#ff5078"),
+            ("Net P&L",   f"{sess_sign}${session_pnl:.2f}",          sess_color),
+        ])}
+      </table>
+    </div>"""
+
     content = f"""
-    <h2 style="margin:0 0 4px;font-size:20px;font-weight:900;color:#f1f5f9;">Trade Completed</h2>
+    <h2 style="margin:0 0 4px;font-size:20px;font-weight:900;color:#f1f5f9;">{trade_label} Closed</h2>
     <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">{symbol} &nbsp;·&nbsp; {mode}</p>
 
     <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);
@@ -196,8 +223,11 @@ def email_trade_closed(to: str, symbol: str, side: str, mode: str,
             ("Equity after", f"${equity_after:,.2f}", "#f1f5f9"),
         ])}
       </table>
-    </div>"""
-    subject = f"{'Win' if win else 'Loss'} {sign}{pnl_pct:.2f}% — {symbol} {side} closed"
+    </div>{session_block}"""
+
+    # Subject: "{trade_label} {+$pnl} | Today: {+$session_pnl}"
+    sess_summary = f" | Today: {sess_sign}${session_pnl:.2f}" if session_trades > 0 else ""
+    subject = f"{trade_label} {sign}${pnl_value:.2f} ({sign}{pnl_pct:.2f}%) — {symbol}{sess_summary}"
     send_email(to, subject, _email_base(content))
 
 
