@@ -3840,11 +3840,40 @@ class AutoRunner:
             f"trades={self.trades_today}/{mt}"
         )
 
+        # Build session summary for email — today's trades since Dubai midnight.
+        _sess_trades = _sess_wins = _sess_losses = 0
+        _sess_pnl = 0.0
+        try:
+            _dubai_mid = now_dubai().replace(hour=0, minute=0, second=0, microsecond=0)
+            _utc_mid   = _dubai_mid.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            _sid       = get_session_id(self.email)
+            with db_conn() as _sc:
+                _cur = _sc.cursor()
+                _cur.execute(
+                    "SELECT COUNT(*) as cnt, "
+                    "SUM(CASE WHEN unreal_pnl_value >= 0 THEN 1 ELSE 0 END) as wins, "
+                    "SUM(CASE WHEN unreal_pnl_value < 0 THEN 1 ELSE 0 END) as losses, "
+                    "SUM(unreal_pnl_value) as pnl "
+                    "FROM trades WHERE email = %s AND time >= %s AND session_id = %s",
+                    (self.email, _utc_mid, _sid),
+                )
+                _sr = _cur.fetchone()
+            if _sr:
+                _sess_trades  = int(_sr.get("cnt")    or 0)
+                _sess_wins    = int(_sr.get("wins")   or 0)
+                _sess_losses  = int(_sr.get("losses") or 0)
+                _sess_pnl     = float(_sr.get("pnl")  or 0.0)
+        except Exception:
+            pass
+
         email_trade_closed(
             to=self.email, symbol=self.symbol, side=side, mode=mode,
-            entry=entry, exit_price=exit_price, outcome=outcome,
+            entry=entry, exit_price=actual_exit, outcome=outcome,
             pnl_pct=pnl_pct_leveraged * 100.0,
             pnl_value=pnl_value, equity_after=equity_after,
+            label=label or pt.get("label", ""),
+            session_trades=_sess_trades, session_wins=_sess_wins,
+            session_losses=_sess_losses, session_pnl=_sess_pnl,
         )
 
         return equity_after
