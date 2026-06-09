@@ -3184,9 +3184,13 @@ class AutoRunner:
         )
 
     def _fetch_price_sync(self, symbol: str) -> float:
-        """Sync OKX price fetch for use inside runner thread. 1 retry on transient errors."""
-        inst = to_okx_inst(symbol)
-        last_err: Exception = RuntimeError("price fetch failed")
+        """Sync price fetch for use inside runner thread.
+        Tries OKX → MEXC → BinanceUS. On OKX 429, skips straight to MEXC."""
+        inst   = to_okx_inst(symbol)
+        sym_up = symbol.upper()
+        errors: list = []
+
+        # ── OKX ──────────────────────────────────────────────────────────────
         for _attempt in range(2):
             try:
                 r = httpx.get(
@@ -3195,17 +3199,53 @@ class AutoRunner:
                     timeout=8,
                     headers={"accept": "application/json"},
                 )
+                if r.status_code == 429:
+                    errors.append(f"OKX: 429 rate-limit")
+                    break                      # skip retry — go straight to fallbacks
                 if r.status_code != 200:
                     raise RuntimeError(f"OKX HTTP {r.status_code} for {inst}")
                 arr = (r.json() or {}).get("data") or []
                 if not arr:
-                    raise RuntimeError(f"No price data for {symbol}")
+                    raise RuntimeError(f"OKX: no price data for {symbol}")
                 return float(arr[0]["last"])
             except Exception as _pe:
-                last_err = _pe
+                errors.append(f"OKX: {_pe}")
                 if _attempt == 0:
                     time.sleep(2)
-        raise RuntimeError(f"Price fetch failed after 2 attempts: {last_err}")
+
+        # ── MEXC fallback ─────────────────────────────────────────────────────
+        try:
+            r = httpx.get(
+                "https://api.mexc.com/api/v3/ticker/price",
+                params={"symbol": sym_up},
+                timeout=8,
+                headers={"accept": "application/json"},
+            )
+            if r.status_code == 200:
+                price = r.json().get("price")
+                if price is not None:
+                    return float(price)
+            errors.append(f"MEXC: HTTP {r.status_code}")
+        except Exception as _me:
+            errors.append(f"MEXC: {_me}")
+
+        # ── BinanceUS fallback ────────────────────────────────────────────────
+        try:
+            r = httpx.get(
+                "https://api.binance.us/api/v3/ticker/price",
+                params={"symbol": sym_up},
+                timeout=8,
+                headers={"accept": "application/json"},
+            )
+            if r.status_code == 200:
+                price = r.json().get("price")
+                if price is not None:
+                    return float(price)
+            errors.append(f"BinanceUS: HTTP {r.status_code}")
+        except Exception as _be:
+            errors.append(f"BinanceUS: {_be}")
+
+        raise RuntimeError(f"Price fetch failed (all sources): {' | '.join(errors)}")
 
     def _close_one_trade(self, pt: Dict, exit_price: float, equity_before: float,
                          candle_high: float = 0.0, candle_low: float = 0.0) -> float:
