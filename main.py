@@ -5980,20 +5980,28 @@ def reset_sandbox(user=Depends(require_user)):
     sid = get_session_id(email)
     new_sid = sid + 1
     set_session_id(email, new_sid)
-    set_equity(email, START_EQUITY)
-    # Full demo reset — peak and floor both go back to the starting equity baseline.
-    # floor_equity column must also be reset, otherwise the stored floor from a
-    # previous profitable session would persist and confuse the new session's risk display.
-    _reset_floor = round(float(START_EQUITY) * 0.85, 2)
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE user_state SET peak_equity=%s, floor_equity=%s WHERE email=%s",
-            (START_EQUITY, _reset_floor, email),
-        )
-        conn.commit()
+    if not REAL_TRADING:
+        # Demo only: reset equity and floor back to starting baseline.
+        set_equity(email, START_EQUITY)
+        _reset_floor = round(float(START_EQUITY) * 0.85, 2)
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE user_state SET peak_equity=%s, floor_equity=%s WHERE email=%s",
+                (START_EQUITY, _reset_floor, email),
+            )
+            conn.commit()
+        equity_after = START_EQUITY
+    else:
+        # Real trading: preserve equity, peak_equity, and floor_equity unchanged.
+        # Reset only increments the session counter and clears the restart lock.
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT equity FROM user_state WHERE email=%s", (email,))
+            row = cur.fetchone()
+        equity_after = float((row or {}).get("equity") or START_EQUITY)
     set_ai_restart_lock(email, 0)
-    return {"ok": True, "equity": START_EQUITY, "new_session_id": new_sid}
+    return {"ok": True, "equity": equity_after, "new_session_id": new_sid}
 
 
 @app.get("/auto/status")
@@ -6058,10 +6066,25 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
                 (email, session_id, int(limit)),
             )
         else:
+            # No open session — find the latest session (even if ended) so we
+            # never bleed logs from multiple sessions into the current view.
             cur.execute(
-                "SELECT t, msg FROM ai_logs WHERE email=%s ORDER BY id DESC LIMIT %s",
-                (email, int(limit)),
+                "SELECT id FROM ai_sessions WHERE email=%s ORDER BY id DESC LIMIT 1",
+                (email,),
             )
+            latest = cur.fetchone()
+            if latest:
+                session_id = latest["id"]
+                cur.execute(
+                    "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
+                    "ORDER BY id DESC LIMIT %s",
+                    (email, session_id, int(limit)),
+                )
+            else:
+                cur.execute(
+                    "SELECT t, msg FROM ai_logs WHERE email=%s ORDER BY id DESC LIMIT %s",
+                    (email, int(limit)),
+                )
         rows = cur.fetchall()
     return {
         "ok": True,
