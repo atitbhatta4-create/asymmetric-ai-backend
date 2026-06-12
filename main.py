@@ -5870,6 +5870,30 @@ def place_real_grade_b_order(
             f"Deposit more USDT to your exchange account."
         )
 
+    # ── Enforce exchange minimum qty before touching the exchange ─────────────
+    # Bybit rejects orders below per-coin minimums (e.g. BTC min=0.001).
+    # With heavy drawdown multipliers on small equity this triggers silently.
+    import math as _math
+    try:
+        _mkt      = ex.market(symbol)
+        _prec     = _mkt.get("precision") or {}
+        _lims     = _mkt.get("limits")    or {}
+        _qty_step = float(_prec.get("amount") or 0)
+        _min_qty  = float((_lims.get("amount") or {}).get("min") or 0)
+        if _qty_step > 0:
+            qty = _math.floor(qty / _qty_step) * _qty_step
+            qty = round(qty, 8)
+        if _min_qty > 0 and qty < _min_qty:
+            raise ValueError(
+                f"BELOW_MIN_QTY: qty {qty:.6f} {symbol} below exchange minimum {_min_qty} "
+                f"— position ${usdt_size:.2f} too small for {symbol} at ${price:.2f}. "
+                f"Reduce leverage, switch to a lower-priced coin, or deposit more funds."
+            )
+    except ValueError:
+        raise
+    except Exception as _mkt_e:
+        pass  # market info unavailable — let exchange reject if needed
+
     sl_price    = round(price * sl_mult, 4)
     t1_tp_price = round(price * t1_mult, 4)
     t2_tp_price = round(price * t2_mult, 4)
