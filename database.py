@@ -19,6 +19,14 @@ if DATABASE_URL:
     if _url.startswith("postgres://"):
         _url = _url.replace("postgres://", "postgresql://", 1)
 
+    # Add TCP keepalives so idle pool connections survive Render's network
+    # timeouts without dropping the SSL session unexpectedly.
+    # keepalives_idle=30: send keepalive probe after 30s idle
+    # keepalives_interval=10: retry probe every 10s
+    # keepalives_count=5: declare dead after 5 missed probes (~80s total)
+    _ka = "keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5&connect_timeout=10"
+    _url = _url + ("&" if "?" in _url else "?") + _ka
+
     USING_PG = True
 
     # Connection pool — sized for ~100 concurrent active engines.

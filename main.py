@@ -4963,9 +4963,17 @@ class AutoRunner:
                         f"{self.email} | {self.symbol}\n"
                         f"<code>{_err_str[:300]}</code>"
                     )
+                elif any(x in _err_str for x in ("SSL", "consuming input", "connection", "OperationalError")):
+                    # DB/network blip — engine auto-retries next interval, no action needed
+                    _tg_alert(
+                        f"⚠️ <b>DB connection blip — auto-retrying</b>\n"
+                        f"{self.email} | {self.symbol}\n"
+                        f"Engine continues normally next interval.\n"
+                        f"<code>{_err_str[:200]}</code>"
+                    )
                 else:
                     _tg_alert(
-                        f"🔴 <b>Engine crash</b>\n"
+                        f"🔴 <b>Engine error — auto-retrying</b>\n"
                         f"{self.email} | {self.symbol}\n"
                         f"<code>{_err_str[:300]}</code>"
                     )
