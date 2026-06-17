@@ -3635,7 +3635,6 @@ class AutoRunner:
         )
         grade_label = pt.get("grade", "A")
         style_label = self.trade_style.replace("_", " ").title()
-        tp_display = tp_pct * 100 / tp_mult   # show full ATR TP in display
         reason_text = "\n".join([
             f"{mode}  •  AI Trade  •  {style_label} ({self.tf})",
             f"Grade {grade_label}{' — ' + label if label else ''}",
@@ -4245,7 +4244,7 @@ class AutoRunner:
                                         if grade == "B" and REAL_TRADING:
                                             self.pending_trades = [
                                                 {**base_trade, "grade": "B", "size_mult": 0.60,
-                                                 "tp_mult": 0.80, "is_primary": True, "label": "T1",
+                                                 "tp_mult": 1.00, "is_primary": True, "label": "T1",
                                                  "order_id": real_b_result.get("order_id"),
                                                  "t1_tp_id": real_b_result.get("t1_tp_id"),
                                                  "t1_sl_id": None},   # filled after stop placement
@@ -4256,7 +4255,7 @@ class AutoRunner:
                                         elif grade == "B":
                                             self.pending_trades = [
                                                 {**base_trade, "grade": "B", "size_mult": 0.60,
-                                                 "tp_mult": 0.80, "is_primary": True, "label": "T1"},
+                                                 "tp_mult": 1.00, "is_primary": True, "label": "T1"},
                                                 {**base_trade, "grade": "B", "size_mult": 0.40,
                                                  "tp_mult": 1.00, "is_primary": False, "label": "T2",
                                                  "breakeven_after_t1": True},
@@ -4767,7 +4766,7 @@ class AutoRunner:
                         }
                         if grade == "B":
                             self.pending_trades = [
-                                {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80,
+                                {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 1.00,
                                  "is_primary": True,  "label": "T1",
                                  "order_id": real_b_result.get("order_id"),
                                  "t1_tp_id": real_b_result.get("t1_tp_id"),
@@ -4776,7 +4775,7 @@ class AutoRunner:
                                  "is_primary": False, "label": "T2", "breakeven_after_t1": True,
                                  "t2_sl_id": None},
                             ]
-                            self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP T2 40%+100%TP+BE | score={self.last_score:.2f}")
+                            self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP T2 40%+100%TP+BE | score={self.last_score:.2f}")
                         else:
                             _real_t18   = self._scaling_enabled
                             _real_init_sm = round(0.70 * _mtf_sm if _real_t18 else 1.00 * _mtf_sm, 4)
@@ -4916,12 +4915,12 @@ class AutoRunner:
                         _mtf_label = "" if res.get("mtf_confirmed", True) else f" | 15m unconfirmed→size {_mtf_sm*100:.0f}%"
                         if grade == "B":
                             self.pending_trades = [
-                                {**base_trade, "grade": "B", "size_mult": round(0.60 * _mtf_sm, 4), "tp_mult": 0.80,
+                                {**base_trade, "grade": "B", "size_mult": round(0.60 * _mtf_sm, 4), "tp_mult": 1.00,
                                  "is_primary": True,  "label": "T1"},
                                 {**base_trade, "grade": "B", "size_mult": round(0.40 * _mtf_sm, 4), "tp_mult": 1.00,
                                  "is_primary": False, "label": "T2", "breakeven_after_t1": True},
                             ]
-                            self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}{_mtf_label}")
+                            self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}{_mtf_label}")
                         else:
                             # Scaling enabled: open at 70% to allow scale-ins. Builds to 100% on winners.
                             _grade_a_sm = round((0.70 if self._scaling_enabled else 1.00) * _mtf_sm, 4)
