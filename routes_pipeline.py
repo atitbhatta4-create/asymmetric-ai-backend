@@ -13,7 +13,7 @@ import time
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 from adaptive_pipeline import (
@@ -21,6 +21,7 @@ from adaptive_pipeline import (
     DEFAULT_MODE,
     DEFAULT_STYLE,
     generate_html_report,
+    generate_pdf_report,
     get_pipeline_results,
     get_pipeline_status,
     list_pipeline_runs,
@@ -125,12 +126,29 @@ def pipeline_results(run_id: str, admin: str = Depends(_require_admin)):
 
 @pipeline_router.get("/report/{run_id}", response_class=HTMLResponse)
 def pipeline_report(run_id: str, admin: str = Depends(_require_admin)):
-    """
-    Serve the HTML report for this run. Open in browser and Ctrl+P → Save as PDF.
-    Returns full HTML page (printable, no external dependencies).
-    """
+    """HTML report — open in browser and Ctrl+P → Save as PDF."""
     html = generate_html_report(run_id)
     return HTMLResponse(content=html)
+
+
+@pipeline_router.get("/report/{run_id}/pdf")
+def pipeline_report_pdf(run_id: str, admin: str = Depends(_require_admin)):
+    """
+    Download the pipeline report as a real PDF file.
+    Opens a Save dialog in the browser automatically.
+    """
+    pdf_bytes = generate_pdf_report(run_id)
+    if not pdf_bytes:
+        raise HTTPException(
+            status_code=503,
+            detail="PDF generation unavailable — fpdf2 not installed on this server. Use /report/{run_id} (HTML) instead.",
+        )
+    filename = f"pipeline_report_{run_id}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @pipeline_router.get("/history")

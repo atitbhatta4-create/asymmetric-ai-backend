@@ -943,6 +943,190 @@ def start_monthly_scheduler() -> None:
     print("[pipeline] Monthly scheduler started")
 
 
+# ── PDF report ────────────────────────────────────────────────────────────────
+
+def generate_pdf_report(run_id: str) -> bytes:
+    """
+    Generate a PDF report using fpdf2. Returns raw PDF bytes.
+    Falls back to empty bytes if fpdf2 is unavailable.
+    """
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        return b""
+
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM pipeline_runs WHERE run_id=%s", (run_id,))
+            run = cur.fetchone()
+            cur.execute(
+                "SELECT * FROM pipeline_coin_results WHERE run_id=%s ORDER BY id",
+                (run_id,),
+            )
+            rows = cur.fetchall()
+    except Exception:
+        return b""
+
+    if not run:
+        return b""
+
+    def _fv(v, dec=2):
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):.{dec}f}"
+        except Exception:
+            return str(v)
+
+    passes       = sum(1 for r in rows if r.get("verdict") == "PASS")
+    needs_review = sum(1 for r in rows if r.get("verdict") == "NEEDS_REVIEW")
+
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.add_page()
+    pdf.set_margins(12, 12, 12)
+
+    # Title
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "Asymmetric AI - Walk-Forward Validation Report", ln=True)
+
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(100, 100, 100)
+    pdf.cell(0, 5, f"Run: {run_id}  |  Mode: {run.get('mode')}  |  Style: {run.get('style')}  |  Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", ln=True)
+    pdf.cell(0, 5, f"Train: {run.get('train_from')} to {run.get('train_to')}  (params optimised here)", ln=True)
+    pdf.cell(0, 5, f"Test:  {run.get('test_from')} to {run.get('test_to')}  (out-of-sample, params unchanged)", ln=True)
+    pdf.ln(3)
+
+    # Summary bar
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_fill_color(230, 255, 240)
+    pdf.cell(45, 8, f"PASS: {passes}", border=1, fill=True)
+    pdf.set_fill_color(255, 248, 220)
+    pdf.cell(55, 8, f"NEEDS REVIEW: {needs_review}", border=1, fill=True)
+    pdf.cell(55, 8, f"TOTAL COINS: {len(rows)}", border=1)
+    pdf.ln(10)
+
+    # Table header — two rows
+    COL = [16, 16, 14, 16, 14, 14,   16, 14, 16, 14, 14,   20, 22]
+    HEADS1 = ["", "TRAIN (optimised)", "", "", "", "",
+               "TEST (out-of-sample)", "", "", "", "", "", ""]
+    HEADS2 = ["Coin",
+              "Trades","WR%","Return%","MaxDD%","Sharpe",
+              "Trades","WR%","Return%","MaxDD%","Sharpe",
+              "Sharpe Degrade","Verdict"]
+
+    pdf.set_font("Helvetica", "B", 7.5)
+    pdf.set_fill_color(220, 235, 255)
+    # Row 1 — group headers (spans)
+    pdf.cell(COL[0], 6, "", border=1, fill=True)
+    # Train group
+    train_w = sum(COL[1:6])
+    pdf.set_fill_color(220, 235, 255)
+    pdf.cell(train_w, 6, "TRAIN (optimised)", border=1, align="C", fill=True)
+    # Test group
+    test_w = sum(COL[6:11])
+    pdf.set_fill_color(210, 245, 220)
+    pdf.cell(test_w, 6, "TEST (out-of-sample)", border=1, align="C", fill=True)
+    pdf.cell(COL[11], 6, "", border=1, fill=False)
+    pdf.cell(COL[12], 6, "", border=1, fill=False)
+    pdf.ln()
+
+    # Row 2 — column names
+    pdf.set_fill_color(240, 244, 255)
+    for i, (h, w) in enumerate(zip(HEADS2, COL)):
+        if i in (1, 2, 3, 4, 5):
+            pdf.set_fill_color(235, 242, 255)
+        elif i in (6, 7, 8, 9, 10):
+            pdf.set_fill_color(230, 248, 235)
+        else:
+            pdf.set_fill_color(245, 245, 245)
+        pdf.cell(w, 6, h, border=1, align="C", fill=True)
+    pdf.ln()
+
+    # Data rows
+    pdf.set_font("Helvetica", "", 8)
+    for r in rows:
+        verdict = r.get("verdict") or "?"
+        dd = float(r.get("degrade_sharpe") or 0)
+
+        # Row background
+        if verdict == "PASS":
+            pdf.set_fill_color(245, 255, 248)
+        elif verdict == "NEEDS_REVIEW":
+            pdf.set_fill_color(255, 252, 235)
+        else:
+            pdf.set_fill_color(255, 245, 245)
+
+        sym = (r.get("symbol") or "?").replace("USDT", "")
+        vals = [
+            sym,
+            _fv(r.get("train_trades"), 0),
+            _fv(r.get("train_win_rate")),
+            _fv(r.get("train_return")),
+            _fv(r.get("train_max_dd")),
+            _fv(r.get("train_sharpe")),
+            _fv(r.get("test_trades"), 0),
+            _fv(r.get("test_win_rate")),
+            _fv(r.get("test_return")),
+            _fv(r.get("test_max_dd")),
+            _fv(r.get("test_sharpe")),
+            f"{dd:.1f}%" if dd else "—",
+            verdict,
+        ]
+
+        for i, (v, w) in enumerate(zip(vals, COL)):
+            if i == 11:  # degrade col — colour by severity
+                if dd > 25:
+                    pdf.set_text_color(200, 0, 0)
+                elif dd > 10:
+                    pdf.set_text_color(180, 100, 0)
+                else:
+                    pdf.set_text_color(0, 140, 60)
+            elif i == 12:  # verdict
+                if verdict == "PASS":
+                    pdf.set_text_color(0, 140, 60)
+                elif verdict == "NEEDS_REVIEW":
+                    pdf.set_text_color(180, 100, 0)
+                else:
+                    pdf.set_text_color(200, 0, 0)
+            else:
+                pdf.set_text_color(0, 0, 0)
+            pdf.cell(w, 6, str(v), border=1, align="C" if i > 0 else "L", fill=(i == 0))
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln()
+
+    # Best params section
+    pdf.ln(5)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(0, 6, "Best Parameters (from train period - used unchanged on test)", ln=True)
+    pdf.set_font("Helvetica", "", 8.5)
+    for r in rows:
+        bp_raw = r.get("best_params") or "{}"
+        try:
+            bp = json.loads(bp_raw) if isinstance(bp_raw, str) else bp_raw
+            sym = (r.get("symbol") or "?").replace("USDT", "")
+            line = (f"{sym:6s}  ADX≥{bp.get('adx_min',0):.0f}  "
+                    f"min_score={bp.get('min_score',0):.3f}  "
+                    f"SL×{bp.get('sl_mult',0):.1f}  TP×{bp.get('tp_mult',0):.1f}")
+            pdf.cell(0, 5, line, ln=True)
+        except Exception:
+            pass
+
+    # Footer note
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "I", 7.5)
+    pdf.set_text_color(120, 120, 120)
+    pdf.multi_cell(0, 4,
+        "PASS = test Sharpe > 0.5, WR >= 30%, Sharpe degradation < 25%.  "
+        "NEEDS REVIEW = Sharpe degraded >25% between train and test - investigate before live use.  "
+        "Parameters were optimised ONLY on the train period. Test period was never seen during optimisation."
+    )
+
+    return bytes(pdf.output())
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _ms_subtract_years(ts_ms: int, years: int) -> int:

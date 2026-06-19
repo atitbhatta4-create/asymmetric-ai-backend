@@ -51,3 +51,4 @@ psycopg-pool==3.2.6
 bcrypt==4.2.1
 pyotp==2.9.0
 qrcode==8.2
+fpdf2==2.8.3
