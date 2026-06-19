@@ -19,7 +19,7 @@ from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query, Re
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
-from database import db, db_conn, USING_PG, column_exists, serial_pk
+from database import db, db_conn, USING_PG, column_exists, serial_pk, log_trade_outcome, init_outcome_log_table
 from config import (
     ENV, IS_PROD, REAL_TRADING, FRONTEND_ORIGINS,
     SMTP_USER, SMTP_PASS, SMTP_HOST, SMTP_PORT,
@@ -513,6 +513,7 @@ def init_db() -> None:
 init_db()
 from backtester import init_backtest_tables; init_backtest_tables()
 from optimizer import init_optimizer_tables; init_optimizer_tables()
+init_outcome_log_table()
 
 # Runners are resumed after all AutoRunner code is defined — see bottom of file.
 
@@ -596,6 +597,15 @@ def set_equity(email: str, equity: float) -> None:
         conn.commit()
 
 
+def _compute_floor(peak: float, start_capital: float) -> float:
+    """R1 Hybrid floor: flat 15% from peak until equity doubles start capital,
+    then ratchet tightens to 10% from peak (locks in compounded gains).
+    Flat while proving edge, ratchet only after 2× growth."""
+    if start_capital > 0 and peak >= 2.0 * start_capital:
+        return round(max(start_capital * 0.85, peak * 0.90), 2)
+    return round(peak * 0.85, 2)
+
+
 def update_peak_ath(email: str, peak: float, equity_after: float) -> None:
     """Update peak_equity, all_time_high, and floor_equity in user_state after each trade.
     All three columns only ever increase — never decrease — so the floor survives runner
@@ -603,16 +613,17 @@ def update_peak_ath(email: str, peak: float, equity_after: float) -> None:
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT peak_equity, all_time_high, floor_equity FROM user_state WHERE email = %s",
+            "SELECT peak_equity, all_time_high, floor_equity, starting_capital FROM user_state WHERE email = %s",
             (email,),
         )
         row = cur.fetchone()
         if row:
             new_peak = max(float(row["peak_equity"] or 0), peak)
             new_ath = max(float(row["all_time_high"] or 0), equity_after)
-            # Floor is 85% of the running peak — but only ever moves UP.
+            _sc = float(row["starting_capital"] or 0)
+            # R1 hybrid floor: only ever moves UP.
             # Stored here so it persists even after ai_runner_state is deleted on stop.
-            new_floor = max(float(row["floor_equity"] or 0), round(new_peak * 0.85, 2))
+            new_floor = max(float(row["floor_equity"] or 0), _compute_floor(new_peak, _sc))
             cur.execute(
                 "UPDATE user_state SET peak_equity=%s, all_time_high=%s, floor_equity=%s "
                 "WHERE email=%s",
@@ -1930,7 +1941,8 @@ def balance(user=Depends(require_user)):
             if _trade_peak > 0:
                 _db_peak = _trade_peak
                 # Persist so next call is instant
-                _new_floor = round(_db_peak * 0.85, 2)
+                _sc_fb = float((state_row or {}).get("starting_capital") or 0)
+                _new_floor = _compute_floor(_db_peak, _sc_fb)
                 cur.execute(
                     "UPDATE user_state SET peak_equity=%s, floor_equity=%s WHERE email=%s",
                     (_db_peak, _new_floor, email),
@@ -2839,18 +2851,24 @@ class AutoRunner:
         # AI stop/restart (ai_runner_state is deleted on stop, user_state is permanent).
         # This prevents floor from drifting down when equity dips between sessions.
         _saved_peak = 0.0
+        _saved_sc = 0.0
         try:
             with db_conn() as conn:
                 _pcur = conn.cursor()
-                _pcur.execute("SELECT peak_equity FROM user_state WHERE email = %s", (email,))
+                _pcur.execute(
+                    "SELECT peak_equity, starting_capital FROM user_state WHERE email = %s",
+                    (email,),
+                )
                 _prow = _pcur.fetchone()
                 _saved_peak = float(_prow["peak_equity"] or 0) if _prow else 0.0
+                _saved_sc   = float(_prow["starting_capital"] or 0) if _prow else 0.0
         except Exception:
             _saved_peak = 0.0
-        self.peak_equity: float = max(get_equity(email), _saved_peak)
+        self.peak_equity: float   = max(get_equity(email), _saved_peak)
+        self.start_capital: float = _saved_sc  # first-ever balance — used for R1 hybrid floor
         self.consecutive_wins: int = 0    # reset strictness after 3 wins in a row
-        # Hard floor = 85% of peak equity — trails UP with new highs, never decreases.
-        self.floor_equity: float = self.peak_equity * 0.85
+        # R1 Hybrid floor: flat 85% until 2× start capital, then tightens to 90% from peak.
+        self.floor_equity: float = _compute_floor(self.peak_equity, self.start_capital)
         # Persist the correct peak immediately so /balance endpoint shows the right floor
         # even before the first trade is recorded.
         update_peak_ath(email, self.peak_equity, self.peak_equity)
@@ -2926,7 +2944,7 @@ class AutoRunner:
             # ai_runner_state may have been saved with a lower value if equity had dipped.
             if row.get("peak_equity") and float(row["peak_equity"]) > 0:
                 self.peak_equity = max(self.peak_equity, float(row["peak_equity"]))
-                self.floor_equity = self.peak_equity * 0.85
+                self.floor_equity = _compute_floor(self.peak_equity, self.start_capital)
             if row.get("floor_equity") and float(row["floor_equity"]) > 0:
                 self.floor_equity = max(self.floor_equity, float(row["floor_equity"]))
             # ── Hard floor persistence fix ─────────────────────────────────────
@@ -3360,7 +3378,7 @@ class AutoRunner:
         # At -15% from peak: full stop. Hard floor (85% of session start) is a second wall.
         if equity_before > self.peak_equity:
             self.peak_equity = equity_before
-            self.floor_equity = round(self.peak_equity * 0.85, 2)  # trail floor up with every new high
+            self.floor_equity = _compute_floor(self.peak_equity, self.start_capital)  # trail floor up with every new high
             # Persist immediately — called on every candle evaluation (holding or closing)
             # so the DB always has the latest peak/floor even between trade closes.
             # This ensures the balance endpoint shows the correct floor when runner is stopped.
@@ -3913,6 +3931,34 @@ class AutoRunner:
             session_losses=_sess_losses, session_pnl=_sess_pnl,
         )
 
+        # ── Outcome log — analytics only, never blocks engine ────────────────
+        _open_ts   = pt.get("open_ts", 0.0)
+        _candles_open = int((time.time() - _open_ts) / self.interval_sec) if _open_ts and self.interval_sec > 0 else 0
+        _opened_at = datetime.utcfromtimestamp(_open_ts).strftime("%Y-%m-%dT%H:%M:%SZ") if _open_ts else ""
+        _closed_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        log_trade_outcome(
+            email=self.email, symbol=self.symbol, side=side, mode=mode,
+            trade_style=self.trade_style, grade=grade_label,
+            label=label or pt.get("label", ""),
+            signal=pt.get("signal", self.last_signal) or "-",
+            score=pt.get("score_open", self.last_score),
+            regime=pt.get("regime_open", self.market_regime),
+            outcome=outcome, entry_price=entry, exit_price=actual_exit,
+            sl_pct=sl_pct, tp_pct=tp_pct,
+            atr_pct=pt.get("atr_pct_open", self.last_atr_pct),
+            effective_size=effective_size, leverage=int(c["leverage"]),
+            pnl_pct=pnl_pct_leveraged, pnl_value=pnl_value,
+            equity_before=equity_before, equity_after=equity_after,
+            peak_equity=self.peak_equity,
+            t18_scale1=bool(pt.get("scale1_done")),
+            t18_scale2=bool(pt.get("scale2_done")),
+            trailing_used=trailing_activated,
+            vol_adj=vol_size_mult, dd_adj=dd_size_mult,
+            candles_open=_candles_open,
+            opened_at=_opened_at, closed_at=_closed_at,
+            consecutive_wins_before=self.consecutive_wins,
+        )
+
         return equity_after
 
     def _close_pending_trades(self) -> None:
@@ -4240,6 +4286,9 @@ class AutoRunner:
                                             "mid_candle":     True,
                                             "usdt_size_base": usdt_size if REAL_TRADING else 0,
                                             "leverage_used":  int(c["leverage"]),
+                                            "score_open":     self.last_score,
+                                            "regime_open":    self.market_regime,
+                                            "atr_pct_open":   self.last_atr_pct,
                                         }
                                         if grade == "B" and REAL_TRADING:
                                             self.pending_trades = [
@@ -4763,6 +4812,9 @@ class AutoRunner:
                             "tp_pct_open": tp_pct_open,
                             "usdt_size_base": usdt_size,
                             "leverage_used":  int(c["leverage"]),
+                            "score_open":     self.last_score,
+                            "regime_open":    self.market_regime,
+                            "atr_pct_open":   self.last_atr_pct,
                         }
                         if grade == "B":
                             self.pending_trades = [
@@ -4911,6 +4963,9 @@ class AutoRunner:
                             "open_ts": time.time(),
                             "sl_pct_open": sl_pct_open,
                             "tp_pct_open": tp_pct_open,
+                            "score_open":  self.last_score,
+                            "regime_open": self.market_regime,
+                            "atr_pct_open": self.last_atr_pct,
                         }
                         _mtf_label = "" if res.get("mtf_confirmed", True) else f" | 15m unconfirmed→size {_mtf_sm*100:.0f}%"
                         if grade == "B":

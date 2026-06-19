@@ -141,3 +141,103 @@ else:
         cols = [r["name"] for r in raw_cur.fetchall()]
         raw_cur.close()
         return col in cols
+
+
+def init_outcome_log_table() -> None:
+    """Create trade_outcomes table if it doesn't exist. Safe to call on every startup."""
+    pk = serial_pk()
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(f"""
+            CREATE TABLE IF NOT EXISTS trade_outcomes (
+                id             {pk},
+                email          TEXT    NOT NULL,
+                symbol         TEXT    NOT NULL,
+                side           TEXT    NOT NULL,
+                mode           TEXT    NOT NULL,
+                trade_style    TEXT    NOT NULL,
+                grade          TEXT    NOT NULL,
+                label          TEXT,
+                signal         TEXT,
+                score          REAL,
+                regime         TEXT,
+                outcome        TEXT    NOT NULL,
+                entry_price    REAL,
+                exit_price     REAL,
+                sl_pct         REAL,
+                tp_pct         REAL,
+                atr_pct        REAL,
+                effective_size REAL,
+                leverage       INTEGER,
+                pnl_pct        REAL,
+                pnl_value      REAL,
+                equity_before  REAL,
+                equity_after   REAL,
+                peak_equity    REAL,
+                t18_scale1     INTEGER DEFAULT 0,
+                t18_scale2     INTEGER DEFAULT 0,
+                trailing_used  INTEGER DEFAULT 0,
+                vol_adj        REAL,
+                dd_adj         REAL,
+                candles_open   INTEGER,
+                opened_at      TEXT,
+                closed_at      TEXT    NOT NULL,
+                consecutive_wins_before INTEGER DEFAULT 0
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outcomes_email_closed"
+            " ON trade_outcomes(email, closed_at)"
+        )
+        conn.commit()
+
+
+def log_trade_outcome(
+    email: str, symbol: str, side: str, mode: str, trade_style: str,
+    grade: str, label: str, signal: str, score: float, regime: str,
+    outcome: str, entry_price: float, exit_price: float,
+    sl_pct: float, tp_pct: float, atr_pct: float,
+    effective_size: float, leverage: int,
+    pnl_pct: float, pnl_value: float,
+    equity_before: float, equity_after: float, peak_equity: float,
+    t18_scale1: bool, t18_scale2: bool, trailing_used: bool,
+    vol_adj: float, dd_adj: float,
+    candles_open: int, opened_at: str, closed_at: str,
+    consecutive_wins_before: int,
+) -> None:
+    """Insert one row into trade_outcomes. Never raises — failures are silent."""
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO trade_outcomes"
+                "(email,symbol,side,mode,trade_style,grade,label,signal,score,regime,"
+                "outcome,entry_price,exit_price,sl_pct,tp_pct,atr_pct,"
+                "effective_size,leverage,pnl_pct,pnl_value,equity_before,equity_after,"
+                "peak_equity,t18_scale1,t18_scale2,trailing_used,vol_adj,dd_adj,"
+                "candles_open,opened_at,closed_at,consecutive_wins_before)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                "%s,%s,%s,%s,%s,%s,"
+                "%s,%s,%s,%s,%s,%s,"
+                "%s,%s,%s,%s,%s,%s,"
+                "%s,%s,%s,%s)",
+                (
+                    email, symbol, side, mode, trade_style, grade, label or "",
+                    signal or "-", round(score or 0.0, 4), regime or "-",
+                    outcome, round(entry_price or 0.0, 6), round(exit_price or 0.0, 6),
+                    round(sl_pct or 0.0, 6), round(tp_pct or 0.0, 6), round(atr_pct or 0.0, 6),
+                    round(effective_size or 0.0, 4), int(leverage or 1),
+                    round(pnl_pct or 0.0, 6), round(pnl_value or 0.0, 4),
+                    round(equity_before or 0.0, 4), round(equity_after or 0.0, 4),
+                    round(peak_equity or 0.0, 4),
+                    1 if t18_scale1 else 0,
+                    1 if t18_scale2 else 0,
+                    1 if trailing_used else 0,
+                    round(vol_adj or 1.0, 4), round(dd_adj or 1.0, 4),
+                    int(candles_open or 0), opened_at or "", closed_at,
+                    int(consecutive_wins_before or 0),
+                ),
+            )
+            conn.commit()
+    except Exception:
+        pass  # outcome log is analytics-only — never block the engine

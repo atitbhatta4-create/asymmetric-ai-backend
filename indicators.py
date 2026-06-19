@@ -688,7 +688,6 @@ def _compute_signal_layers(
     pattern_name, pattern_score = _candle_pattern(klines, desired_side)
 
     # RSI: closer to center of the range = better entry quality
-    print(f"RSI check: value={rsi:.1f} zone={p['rsi_min']}-{p['rsi_max']} mode={mode} style={trade_style} direction={desired_side}", flush=True)
     rsi_in_range = rsi is not None and p["rsi_min"] <= rsi <= p["rsi_max"]
     if rsi is not None and rsi_in_range:
         mid  = (p["rsi_min"] + p["rsi_max"]) / 2.0
