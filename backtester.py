@@ -349,7 +349,7 @@ def _sim_check_exit(trade: Dict, candle: Dict, exchange: str) -> Optional[Dict]:
     tp_price = entry * (1 + tp_pct) if side == "LONG" else entry * (1 - tp_pct)
 
     if grade == "B":
-        t1_tp_pct   = tp_pct * 0.80
+        t1_tp_pct   = tp_pct  # T1 exits at full ATR TP (tp_mult=1.00, same as live engine)
         t1_tp_price = entry * (1 + t1_tp_pct) if side == "LONG" else entry * (1 - t1_tp_pct)
 
         t1_just_closed = False

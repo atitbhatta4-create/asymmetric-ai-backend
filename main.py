@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, field_validator
 
-from database import db, db_conn, USING_PG, column_exists, serial_pk
+from database import db, db_conn, USING_PG, column_exists, serial_pk, log_trade_outcome, init_outcome_log_table
 from config import (
     ENV, IS_PROD, REAL_TRADING, FRONTEND_ORIGINS,
     SMTP_USER, SMTP_PASS, SMTP_HOST, SMTP_PORT,
@@ -515,6 +515,7 @@ def init_db() -> None:
 init_db()
 from backtester import init_backtest_tables; init_backtest_tables()
 from optimizer import init_optimizer_tables; init_optimizer_tables()
+init_outcome_log_table()
 
 # Runners are resumed after all AutoRunner code is defined — see bottom of file.
 
@@ -598,6 +599,15 @@ def set_equity(email: str, equity: float) -> None:
         conn.commit()
 
 
+def _compute_floor(peak: float, start_capital: float) -> float:
+    """R1 Hybrid floor: flat 15% from peak until equity doubles start capital,
+    then ratchet tightens to 10% from peak (locks in compounded gains).
+    Flat while proving edge, ratchet only after 2× growth."""
+    if start_capital > 0 and peak >= 2.0 * start_capital:
+        return round(max(start_capital * 0.85, peak * 0.90), 2)
+    return round(peak * 0.85, 2)
+
+
 def update_peak_ath(email: str, peak: float, equity_after: float) -> None:
     """Update peak_equity, all_time_high, and floor_equity in user_state after each trade.
     All three columns only ever increase — never decrease — so the floor survives runner
@@ -605,16 +615,17 @@ def update_peak_ath(email: str, peak: float, equity_after: float) -> None:
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT peak_equity, all_time_high, floor_equity FROM user_state WHERE email = %s",
+            "SELECT peak_equity, all_time_high, floor_equity, starting_capital FROM user_state WHERE email = %s",
             (email,),
         )
         row = cur.fetchone()
         if row:
             new_peak = max(float(row["peak_equity"] or 0), peak)
             new_ath = max(float(row["all_time_high"] or 0), equity_after)
-            # Floor is 85% of the running peak — but only ever moves UP.
+            _sc = float(row["starting_capital"] or 0)
+            # R1 hybrid floor: only ever moves UP.
             # Stored here so it persists even after ai_runner_state is deleted on stop.
-            new_floor = max(float(row["floor_equity"] or 0), round(new_peak * 0.85, 2))
+            new_floor = max(float(row["floor_equity"] or 0), _compute_floor(new_peak, _sc))
             cur.execute(
                 "UPDATE user_state SET peak_equity=%s, all_time_high=%s, floor_equity=%s "
                 "WHERE email=%s",
@@ -1932,7 +1943,8 @@ def balance(user=Depends(require_user)):
             if _trade_peak > 0:
                 _db_peak = _trade_peak
                 # Persist so next call is instant
-                _new_floor = round(_db_peak * 0.85, 2)
+                _sc_fb = float((state_row or {}).get("starting_capital") or 0)
+                _new_floor = _compute_floor(_db_peak, _sc_fb)
                 cur.execute(
                     "UPDATE user_state SET peak_equity=%s, floor_equity=%s WHERE email=%s",
                     (_db_peak, _new_floor, email),
@@ -2841,18 +2853,24 @@ class AutoRunner:
         # AI stop/restart (ai_runner_state is deleted on stop, user_state is permanent).
         # This prevents floor from drifting down when equity dips between sessions.
         _saved_peak = 0.0
+        _saved_sc = 0.0
         try:
             with db_conn() as conn:
                 _pcur = conn.cursor()
-                _pcur.execute("SELECT peak_equity FROM user_state WHERE email = %s", (email,))
+                _pcur.execute(
+                    "SELECT peak_equity, starting_capital FROM user_state WHERE email = %s",
+                    (email,),
+                )
                 _prow = _pcur.fetchone()
                 _saved_peak = float(_prow["peak_equity"] or 0) if _prow else 0.0
+                _saved_sc   = float(_prow["starting_capital"] or 0) if _prow else 0.0
         except Exception:
             _saved_peak = 0.0
-        self.peak_equity: float = max(get_equity(email), _saved_peak)
+        self.peak_equity: float   = max(get_equity(email), _saved_peak)
+        self.start_capital: float = _saved_sc  # first-ever balance — used for R1 hybrid floor
         self.consecutive_wins: int = 0    # reset strictness after 3 wins in a row
-        # Hard floor = 85% of peak equity — trails UP with new highs, never decreases.
-        self.floor_equity: float = self.peak_equity * 0.85
+        # R1 Hybrid floor: flat 85% until 2× start capital, then tightens to 90% from peak.
+        self.floor_equity: float = _compute_floor(self.peak_equity, self.start_capital)
         # Persist the correct peak immediately so /balance endpoint shows the right floor
         # even before the first trade is recorded.
         update_peak_ath(email, self.peak_equity, self.peak_equity)
@@ -2928,7 +2946,7 @@ class AutoRunner:
             # ai_runner_state may have been saved with a lower value if equity had dipped.
             if row.get("peak_equity") and float(row["peak_equity"]) > 0:
                 self.peak_equity = max(self.peak_equity, float(row["peak_equity"]))
-                self.floor_equity = self.peak_equity * 0.85
+                self.floor_equity = _compute_floor(self.peak_equity, self.start_capital)
             if row.get("floor_equity") and float(row["floor_equity"]) > 0:
                 self.floor_equity = max(self.floor_equity, float(row["floor_equity"]))
             # ── Hard floor persistence fix ─────────────────────────────────────
@@ -3186,9 +3204,13 @@ class AutoRunner:
         )
 
     def _fetch_price_sync(self, symbol: str) -> float:
-        """Sync OKX price fetch for use inside runner thread. 1 retry on transient errors."""
-        inst = to_okx_inst(symbol)
-        last_err: Exception = RuntimeError("price fetch failed")
+        """Sync price fetch for use inside runner thread.
+        Tries OKX → MEXC → BinanceUS. On OKX 429, skips straight to MEXC."""
+        inst   = to_okx_inst(symbol)
+        sym_up = symbol.upper()
+        errors: list = []
+
+        # ── OKX ──────────────────────────────────────────────────────────────
         for _attempt in range(2):
             try:
                 r = httpx.get(
@@ -3197,17 +3219,53 @@ class AutoRunner:
                     timeout=8,
                     headers={"accept": "application/json"},
                 )
+                if r.status_code == 429:
+                    errors.append(f"OKX: 429 rate-limit")
+                    break                      # skip retry — go straight to fallbacks
                 if r.status_code != 200:
                     raise RuntimeError(f"OKX HTTP {r.status_code} for {inst}")
                 arr = (r.json() or {}).get("data") or []
                 if not arr:
-                    raise RuntimeError(f"No price data for {symbol}")
+                    raise RuntimeError(f"OKX: no price data for {symbol}")
                 return float(arr[0]["last"])
             except Exception as _pe:
-                last_err = _pe
+                errors.append(f"OKX: {_pe}")
                 if _attempt == 0:
                     time.sleep(2)
-        raise RuntimeError(f"Price fetch failed after 2 attempts: {last_err}")
+
+        # ── MEXC fallback ─────────────────────────────────────────────────────
+        try:
+            r = httpx.get(
+                "https://api.mexc.com/api/v3/ticker/price",
+                params={"symbol": sym_up},
+                timeout=8,
+                headers={"accept": "application/json"},
+            )
+            if r.status_code == 200:
+                price = r.json().get("price")
+                if price is not None:
+                    return float(price)
+            errors.append(f"MEXC: HTTP {r.status_code}")
+        except Exception as _me:
+            errors.append(f"MEXC: {_me}")
+
+        # ── BinanceUS fallback ────────────────────────────────────────────────
+        try:
+            r = httpx.get(
+                "https://api.binance.us/api/v3/ticker/price",
+                params={"symbol": sym_up},
+                timeout=8,
+                headers={"accept": "application/json"},
+            )
+            if r.status_code == 200:
+                price = r.json().get("price")
+                if price is not None:
+                    return float(price)
+            errors.append(f"BinanceUS: HTTP {r.status_code}")
+        except Exception as _be:
+            errors.append(f"BinanceUS: {_be}")
+
+        raise RuntimeError(f"Price fetch failed (all sources): {' | '.join(errors)}")
 
     def _close_one_trade(self, pt: Dict, exit_price: float, equity_before: float,
                          candle_high: float = 0.0, candle_low: float = 0.0) -> float:
@@ -3322,7 +3380,7 @@ class AutoRunner:
         # At -15% from peak: full stop. Hard floor (85% of session start) is a second wall.
         if equity_before > self.peak_equity:
             self.peak_equity = equity_before
-            self.floor_equity = round(self.peak_equity * 0.85, 2)  # trail floor up with every new high
+            self.floor_equity = _compute_floor(self.peak_equity, self.start_capital)  # trail floor up with every new high
             # Persist immediately — called on every candle evaluation (holding or closing)
             # so the DB always has the latest peak/floor even between trade closes.
             # This ensures the balance endpoint shows the correct floor when runner is stopped.
@@ -3597,7 +3655,6 @@ class AutoRunner:
         )
         grade_label = pt.get("grade", "A")
         style_label = self.trade_style.replace("_", " ").title()
-        tp_display = tp_pct * 100 / tp_mult   # show full ATR TP in display
         reason_text = "\n".join([
             f"{mode}  •  AI Trade  •  {style_label} ({self.tf})",
             f"Grade {grade_label}{' — ' + label if label else ''}",
@@ -3874,6 +3931,34 @@ class AutoRunner:
             label=label or pt.get("label", ""),
             session_trades=_sess_trades, session_wins=_sess_wins,
             session_losses=_sess_losses, session_pnl=_sess_pnl,
+        )
+
+        # ── Outcome log — analytics only, never blocks engine ────────────────
+        _open_ts   = pt.get("open_ts", 0.0)
+        _candles_open = int((time.time() - _open_ts) / self.interval_sec) if _open_ts and self.interval_sec > 0 else 0
+        _opened_at = datetime.utcfromtimestamp(_open_ts).strftime("%Y-%m-%dT%H:%M:%SZ") if _open_ts else ""
+        _closed_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        log_trade_outcome(
+            email=self.email, symbol=self.symbol, side=side, mode=mode,
+            trade_style=self.trade_style, grade=grade_label,
+            label=label or pt.get("label", ""),
+            signal=pt.get("signal", self.last_signal) or "-",
+            score=pt.get("score_open", self.last_score),
+            regime=pt.get("regime_open", self.market_regime),
+            outcome=outcome, entry_price=entry, exit_price=actual_exit,
+            sl_pct=sl_pct, tp_pct=tp_pct,
+            atr_pct=pt.get("atr_pct_open", self.last_atr_pct),
+            effective_size=effective_size, leverage=int(c["leverage"]),
+            pnl_pct=pnl_pct_leveraged, pnl_value=pnl_value,
+            equity_before=equity_before, equity_after=equity_after,
+            peak_equity=self.peak_equity,
+            t18_scale1=bool(pt.get("scale1_done")),
+            t18_scale2=bool(pt.get("scale2_done")),
+            trailing_used=trailing_activated,
+            vol_adj=vol_size_mult, dd_adj=dd_size_mult,
+            candles_open=_candles_open,
+            opened_at=_opened_at, closed_at=_closed_at,
+            consecutive_wins_before=self.consecutive_wins,
         )
 
         return equity_after
@@ -4203,11 +4288,14 @@ class AutoRunner:
                                             "mid_candle":     True,
                                             "usdt_size_base": usdt_size if REAL_TRADING else 0,
                                             "leverage_used":  int(c["leverage"]),
+                                            "score_open":     self.last_score,
+                                            "regime_open":    self.market_regime,
+                                            "atr_pct_open":   self.last_atr_pct,
                                         }
                                         if grade == "B" and REAL_TRADING:
                                             self.pending_trades = [
                                                 {**base_trade, "grade": "B", "size_mult": 0.60,
-                                                 "tp_mult": 0.80, "is_primary": True, "label": "T1",
+                                                 "tp_mult": 1.00, "is_primary": True, "label": "T1",
                                                  "order_id": real_b_result.get("order_id"),
                                                  "t1_tp_id": real_b_result.get("t1_tp_id"),
                                                  "t1_sl_id": None},   # filled after stop placement
@@ -4218,7 +4306,7 @@ class AutoRunner:
                                         elif grade == "B":
                                             self.pending_trades = [
                                                 {**base_trade, "grade": "B", "size_mult": 0.60,
-                                                 "tp_mult": 0.80, "is_primary": True, "label": "T1"},
+                                                 "tp_mult": 1.00, "is_primary": True, "label": "T1"},
                                                 {**base_trade, "grade": "B", "size_mult": 0.40,
                                                  "tp_mult": 1.00, "is_primary": False, "label": "T2",
                                                  "breakeven_after_t1": True},
@@ -4241,6 +4329,16 @@ class AutoRunner:
                                             f"@ {entry_price:.4f} | score={score:.2f} | "
                                             f"{abs_move*100:.1f}% price move triggered"
                                         )
+                                        _mc_sl_px = entry_price * (1 + sl_pct_open) if signal_side == "SHORT" else entry_price * (1 - sl_pct_open)
+                                        _mc_tp_px = entry_price * (1 - tp_pct_open) if signal_side == "SHORT" else entry_price * (1 + tp_pct_open)
+                                        try:
+                                            email_trade_opened(
+                                                to=self.email, symbol=self.symbol, side=signal_side, mode=self.mode,
+                                                grade=grade, entry=entry_price, sl=_mc_sl_px, tp=_mc_tp_px,
+                                                score=score, equity=equity_now,
+                                            )
+                                        except Exception:
+                                            pass
 
                                         # Place SL — Grade B: two separate stops; Grade A: position SL
                                         if REAL_TRADING:
@@ -4716,10 +4814,13 @@ class AutoRunner:
                             "tp_pct_open": tp_pct_open,
                             "usdt_size_base": usdt_size,
                             "leverage_used":  int(c["leverage"]),
+                            "score_open":     self.last_score,
+                            "regime_open":    self.market_regime,
+                            "atr_pct_open":   self.last_atr_pct,
                         }
                         if grade == "B":
                             self.pending_trades = [
-                                {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80,
+                                {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 1.00,
                                  "is_primary": True,  "label": "T1",
                                  "order_id": real_b_result.get("order_id"),
                                  "t1_tp_id": real_b_result.get("t1_tp_id"),
@@ -4728,7 +4829,7 @@ class AutoRunner:
                                  "is_primary": False, "label": "T2", "breakeven_after_t1": True,
                                  "t2_sl_id": None},
                             ]
-                            self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP T2 40%+100%TP+BE | score={self.last_score:.2f}")
+                            self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP T2 40%+100%TP+BE | score={self.last_score:.2f}")
                         else:
                             _real_t18   = self._scaling_enabled
                             _real_init_sm = round(0.70 * _mtf_sm if _real_t18 else 1.00 * _mtf_sm, 4)
@@ -4864,16 +4965,19 @@ class AutoRunner:
                             "open_ts": time.time(),
                             "sl_pct_open": sl_pct_open,
                             "tp_pct_open": tp_pct_open,
+                            "score_open":  self.last_score,
+                            "regime_open": self.market_regime,
+                            "atr_pct_open": self.last_atr_pct,
                         }
                         _mtf_label = "" if res.get("mtf_confirmed", True) else f" | 15m unconfirmed→size {_mtf_sm*100:.0f}%"
                         if grade == "B":
                             self.pending_trades = [
-                                {**base_trade, "grade": "B", "size_mult": round(0.60 * _mtf_sm, 4), "tp_mult": 0.80,
+                                {**base_trade, "grade": "B", "size_mult": round(0.60 * _mtf_sm, 4), "tp_mult": 1.00,
                                  "is_primary": True,  "label": "T1"},
                                 {**base_trade, "grade": "B", "size_mult": round(0.40 * _mtf_sm, 4), "tp_mult": 1.00,
                                  "is_primary": False, "label": "T2", "breakeven_after_t1": True},
                             ]
-                            self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}{_mtf_label}")
+                            self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}{_mtf_label}")
                         else:
                             # Scaling enabled: open at 70% to allow scale-ins. Builds to 100% on winners.
                             _grade_a_sm = round((0.70 if self._scaling_enabled else 1.00) * _mtf_sm, 4)
@@ -4885,6 +4989,16 @@ class AutoRunner:
                                  "scaling_enabled": self._scaling_enabled},
                             ]
                             self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}{_mtf_label}{_scale_label}")
+                        _sl_px = entry_price * (1 + sl_pct_open) if desired_side == "SHORT" else entry_price * (1 - sl_pct_open)
+                        _tp_px = entry_price * (1 - tp_pct_open) if desired_side == "SHORT" else entry_price * (1 + tp_pct_open)
+                        try:
+                            email_trade_opened(
+                                to=self.email, symbol=self.symbol, side=desired_side, mode=self.mode,
+                                grade=grade, entry=entry_price, sl=_sl_px, tp=_tp_px,
+                                score=self.last_score, equity=equity_now,
+                            )
+                        except Exception:
+                            pass
                         self.last_trade_ts = now_ts
                         with self._pt_lock:
                             self._opening_trade = False   # slot claimed — pending_trades is set
@@ -4905,9 +5019,17 @@ class AutoRunner:
                         f"{self.email} | {self.symbol}\n"
                         f"<code>{_err_str[:300]}</code>"
                     )
+                elif any(x in _err_str for x in ("SSL", "consuming input", "connection", "OperationalError")):
+                    # DB/network blip — engine auto-retries next interval, no action needed
+                    _tg_alert(
+                        f"⚠️ <b>DB connection blip — auto-retrying</b>\n"
+                        f"{self.email} | {self.symbol}\n"
+                        f"Engine continues normally next interval.\n"
+                        f"<code>{_err_str[:200]}</code>"
+                    )
                 else:
                     _tg_alert(
-                        f"🔴 <b>Engine crash</b>\n"
+                        f"🔴 <b>Engine error — auto-retrying</b>\n"
                         f"{self.email} | {self.symbol}\n"
                         f"<code>{_err_str[:300]}</code>"
                     )
@@ -5812,6 +5934,30 @@ def place_real_grade_b_order(
             f"Deposit more USDT to your exchange account."
         )
 
+    # ── Enforce exchange minimum qty before touching the exchange ─────────────
+    # Bybit rejects orders below per-coin minimums (e.g. BTC min=0.001).
+    # With heavy drawdown multipliers on small equity this triggers silently.
+    import math as _math
+    try:
+        _mkt      = ex.market(symbol)
+        _prec     = _mkt.get("precision") or {}
+        _lims     = _mkt.get("limits")    or {}
+        _qty_step = float(_prec.get("amount") or 0)
+        _min_qty  = float((_lims.get("amount") or {}).get("min") or 0)
+        if _qty_step > 0:
+            qty = _math.floor(qty / _qty_step) * _qty_step
+            qty = round(qty, 8)
+        if _min_qty > 0 and qty < _min_qty:
+            raise ValueError(
+                f"BELOW_MIN_QTY: qty {qty:.6f} {symbol} below exchange minimum {_min_qty} "
+                f"— position ${usdt_size:.2f} too small for {symbol} at ${price:.2f}. "
+                f"Reduce leverage, switch to a lower-priced coin, or deposit more funds."
+            )
+    except ValueError:
+        raise
+    except Exception as _mkt_e:
+        pass  # market info unavailable — let exchange reject if needed
+
     sl_price    = round(price * sl_mult, 4)
     t1_tp_price = round(price * t1_mult, 4)
     t2_tp_price = round(price * t2_mult, 4)
@@ -5898,20 +6044,28 @@ def reset_sandbox(user=Depends(require_user)):
     sid = get_session_id(email)
     new_sid = sid + 1
     set_session_id(email, new_sid)
-    set_equity(email, START_EQUITY)
-    # Full demo reset — peak and floor both go back to the starting equity baseline.
-    # floor_equity column must also be reset, otherwise the stored floor from a
-    # previous profitable session would persist and confuse the new session's risk display.
-    _reset_floor = round(float(START_EQUITY) * 0.85, 2)
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE user_state SET peak_equity=%s, floor_equity=%s WHERE email=%s",
-            (START_EQUITY, _reset_floor, email),
-        )
-        conn.commit()
+    if not REAL_TRADING:
+        # Demo only: reset equity and floor back to starting baseline.
+        set_equity(email, START_EQUITY)
+        _reset_floor = round(float(START_EQUITY) * 0.85, 2)
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE user_state SET peak_equity=%s, floor_equity=%s WHERE email=%s",
+                (START_EQUITY, _reset_floor, email),
+            )
+            conn.commit()
+        equity_after = START_EQUITY
+    else:
+        # Real trading: preserve equity, peak_equity, and floor_equity unchanged.
+        # Reset only increments the session counter and clears the restart lock.
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT equity FROM user_state WHERE email=%s", (email,))
+            row = cur.fetchone()
+        equity_after = float((row or {}).get("equity") or START_EQUITY)
     set_ai_restart_lock(email, 0)
-    return {"ok": True, "equity": START_EQUITY, "new_session_id": new_sid}
+    return {"ok": True, "equity": equity_after, "new_session_id": new_sid}
 
 
 @app.get("/auto/status")
@@ -5976,10 +6130,25 @@ def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1
                 (email, session_id, int(limit)),
             )
         else:
+            # No open session — find the latest session (even if ended) so we
+            # never bleed logs from multiple sessions into the current view.
             cur.execute(
-                "SELECT t, msg FROM ai_logs WHERE email=%s ORDER BY id DESC LIMIT %s",
-                (email, int(limit)),
+                "SELECT id FROM ai_sessions WHERE email=%s ORDER BY id DESC LIMIT 1",
+                (email,),
             )
+            latest = cur.fetchone()
+            if latest:
+                session_id = latest["id"]
+                cur.execute(
+                    "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
+                    "ORDER BY id DESC LIMIT %s",
+                    (email, session_id, int(limit)),
+                )
+            else:
+                cur.execute(
+                    "SELECT t, msg FROM ai_logs WHERE email=%s ORDER BY id DESC LIMIT %s",
+                    (email, int(limit)),
+                )
         rows = cur.fetchall()
     return {
         "ok": True,
