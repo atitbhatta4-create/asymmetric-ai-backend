@@ -57,23 +57,6 @@ if _SENTRY_DSN:
             StarletteIntegration(transaction_style="endpoint"),
             FastApiIntegration(transaction_style="endpoint"),
         ],
-        traces_sample_rate=0.05,
-        environment=os.getenv("RENDER_SERVICE_NAME", "local"),
-        release=os.getenv("RENDER_GIT_COMMIT", "unknown"),
-    )
-
-import sentry_sdk
-from sentry_sdk.integrations.fastapi import FastApiIntegration
-from sentry_sdk.integrations.starlette import StarletteIntegration
-
-_SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
-if _SENTRY_DSN:
-    sentry_sdk.init(
-        dsn=_SENTRY_DSN,
-        integrations=[
-            StarletteIntegration(transaction_style="endpoint"),
-            FastApiIntegration(transaction_style="endpoint"),
-        ],
         traces_sample_rate=0.05,  # 5% of requests — stays within free tier
         environment=os.getenv("RENDER_SERVICE_NAME", "local"),
         release=os.getenv("RENDER_GIT_COMMIT", "unknown"),
