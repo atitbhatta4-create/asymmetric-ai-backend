@@ -41,6 +41,7 @@ from indicators import (
 )
 from routes_backtest import backtest_router
 from routes_optimizer import optimizer_router
+from routes_pipeline import pipeline_router
 from routes_support import support_router
 from routes_auth import auth_router, hash_pw
 from routes_admin import admin_router
@@ -137,6 +138,7 @@ app.add_middleware(
 )
 app.include_router(backtest_router)
 app.include_router(optimizer_router)
+app.include_router(pipeline_router)
 app.include_router(support_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
@@ -516,6 +518,9 @@ init_db()
 from backtester import init_backtest_tables; init_backtest_tables()
 from optimizer import init_optimizer_tables; init_optimizer_tables()
 init_outcome_log_table()
+from adaptive_pipeline import init_pipeline_tables, start_monthly_scheduler
+init_pipeline_tables()
+start_monthly_scheduler()
 
 # Runners are resumed after all AutoRunner code is defined — see bottom of file.
 
