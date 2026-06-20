@@ -32,6 +32,7 @@ from notifications import (
     tg_alert as _tg_alert,
     email_ai_started, email_trade_opened,
     email_trade_closed, email_ai_stopped,
+    email_first_trade,
 )
 from indicators import (
     _ema, _rsi, _atr, _adx, _rsi_series,
@@ -583,6 +584,26 @@ def set_equity(email: str, equity: float) -> None:
         cur = conn.cursor()
         cur.execute("UPDATE user_state SET equity = %s WHERE email = %s", (float(equity), email))
         conn.commit()
+
+
+_FIRST_TRADE_SENT: set = set()
+
+def _check_first_trade_email(email: str, symbol: str, side: str, grade: str, equity: float) -> None:
+    """Send first-trade milestone email once per user lifetime. Uses in-memory set + DB count."""
+    if email in _FIRST_TRADE_SENT:
+        return
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) AS n FROM trade_outcomes WHERE email=%s", (email,))
+            row = cur.fetchone()
+            total = int(row["n"] if row else 0)
+        if total <= 1:
+            from notifications import email_first_trade
+            email_first_trade(email, symbol, side, grade, equity)
+        _FIRST_TRADE_SENT.add(email)
+    except Exception:
+        pass
 
 
 def _compute_floor(peak: float, start_capital: float) -> float:
@@ -4323,6 +4344,7 @@ class AutoRunner:
                                                 grade=grade, entry=entry_price, sl=_mc_sl_px, tp=_mc_tp_px,
                                                 score=score, equity=equity_now,
                                             )
+                                            _check_first_trade_email(self.email, self.symbol, signal_side, grade, equity_now)
                                         except Exception:
                                             pass
 
@@ -4835,6 +4857,7 @@ class AutoRunner:
                                 grade=grade, entry=entry_price, sl=_sl_px, tp=_tp_px,
                                 score=self.last_score, equity=equity_now,
                             )
+                            _check_first_trade_email(self.email, self.symbol, desired_side, grade, equity_now)
                         except Exception:
                             pass
                         self.last_trade_ts = now_ts

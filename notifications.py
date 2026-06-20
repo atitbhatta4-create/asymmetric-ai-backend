@@ -41,7 +41,7 @@ def tg_alert(text: str) -> None:
 
 # ── Email helpers ─────────────────────────────────────────────────────────────
 
-def _email_base(content: str) -> str:
+def _email_base(content: str, footer: str = "Automated trading involves risk. Never trade more than you can afford to lose.") -> str:
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#050814;font-family:system-ui,-apple-system,sans-serif;color:#e5e7eb;">
@@ -52,7 +52,7 @@ def _email_base(content: str) -> str:
       </div>
       <div style="padding:24px;">{content}</div>
       <div style="padding:14px 24px;border-top:1px solid rgba(255,255,255,0.06);font-size:12px;color:#4b5563;">
-        Demo mode &nbsp;·&nbsp; No real funds &nbsp;·&nbsp; Educational only
+        {footer}
       </div>
     </div>
   </div>
@@ -306,3 +306,126 @@ def email_2fa_enabled(to: str) -> None:
       If you did not enable this, contact support immediately and change your password.
     </div>"""
     send_email(to, "2FA enabled on your Asymmetric AI account", _email_base(content))
+
+
+# ── Onboarding emails ─────────────────────────────────────────────────────────
+
+def email_welcome(to: str) -> None:
+    content = f"""
+    <h2 style="margin:0 0 6px;font-size:22px;font-weight:900;color:#f1f5f9;">Welcome to Asymmetric AI</h2>
+    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">Your account is ready. Here is how to get started.</p>
+
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:16px;">
+      <div style="display:flex;align-items:flex-start;margin-bottom:14px;">
+        <div style="min-width:28px;height:28px;background:#00ffe0;border-radius:50%;display:flex;align-items:center;
+                    justify-content:center;font-weight:900;font-size:13px;color:#050814;margin-right:12px;flex-shrink:0;">1</div>
+        <div>
+          <div style="font-weight:700;color:#f1f5f9;margin-bottom:4px;">Connect your exchange API keys</div>
+          <div style="font-size:13px;color:#6b7280;">Go to Settings and add your Bybit or OKX API keys (trade-only, no withdrawal permission needed).</div>
+        </div>
+      </div>
+      <div style="display:flex;align-items:flex-start;margin-bottom:14px;">
+        <div style="min-width:28px;height:28px;background:#00ffe0;border-radius:50%;display:flex;align-items:center;
+                    justify-content:center;font-weight:900;font-size:13px;color:#050814;margin-right:12px;flex-shrink:0;">2</div>
+        <div>
+          <div style="font-weight:700;color:#f1f5f9;margin-bottom:4px;">Choose your mode and coin</div>
+          <div style="font-size:13px;color:#6b7280;">Start with SAFE or MINI_ASYM mode with DAY_TRADE style. We recommend BTCUSDT or ETHUSDT to begin.</div>
+        </div>
+      </div>
+      <div style="display:flex;align-items:flex-start;">
+        <div style="min-width:28px;height:28px;background:#00ffe0;border-radius:50%;display:flex;align-items:center;
+                    justify-content:center;font-weight:900;font-size:13px;color:#050814;margin-right:12px;flex-shrink:0;">3</div>
+        <div>
+          <div style="font-weight:700;color:#f1f5f9;margin-bottom:4px;">Start the AI</div>
+          <div style="font-size:13px;color:#6b7280;">Press Start AI on the dashboard. The engine monitors the market every hour and only enters trades when all 4 signal layers align.</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="background:rgba(0,255,224,0.06);border:1px solid rgba(0,255,224,0.18);
+                border-radius:12px;padding:14px 16px;font-size:13px;color:#a7f3d0;line-height:1.6;">
+      <b>How the engine protects you:</b> It uses 4 signal layers (regime, direction, entry, momentum),
+      a hard drawdown floor, and position sizing based on volatility. It stops automatically if your
+      account drops below the floor to protect your capital.
+    </div>"""
+    send_email(
+        to,
+        "Welcome to Asymmetric AI — Get started in 3 steps",
+        _email_base(content, footer="You are in control. The AI only trades with your API keys on your exchange account."),
+    )
+
+
+def email_api_key_guide(to: str, exchange: str = "Bybit") -> None:
+    bybit_steps = [
+        ("Log in to Bybit", "Go to bybit.com and sign in to your account."),
+        ("Open API Management", "Click your profile icon (top right) then 'API Management'."),
+        ("Create new API key", "Click 'Create New Key' and choose 'System-generated API Keys'."),
+        ("Set permissions", "Enable: Read, Trade. Leave EVERYTHING else OFF especially Withdrawal."),
+        ("Set IP restriction", "Leave IP restriction blank (or add your Render server IP for extra security)."),
+        ("Copy your keys", "Copy the API Key and Secret — the Secret is only shown once. Paste both into Asymmetric AI Settings."),
+    ]
+    okx_steps = [
+        ("Log in to OKX", "Go to okx.com and sign in to your account."),
+        ("Open API Management", "Click profile icon then 'API' from the dropdown menu."),
+        ("Create new API key", "Click 'Create V5 API Key'."),
+        ("Set permissions", "Enable: Read, Trade. Do NOT enable Withdrawal or Transfer."),
+        ("Set passphrase", "Create a passphrase — you will need this along with your API Key and Secret."),
+        ("Copy your keys", "Copy the API Key, Secret, and Passphrase. Paste all 3 into Asymmetric AI Settings."),
+    ]
+    steps = bybit_steps if exchange.lower() == "bybit" else okx_steps
+    rows = "".join(
+        f"""<div style="display:flex;align-items:flex-start;margin-bottom:12px;">
+          <div style="min-width:22px;height:22px;background:rgba(0,255,224,0.15);border:1px solid rgba(0,255,224,0.3);
+                      border-radius:50%;display:flex;align-items:center;justify-content:center;
+                      font-weight:900;font-size:11px;color:#00ffe0;margin-right:10px;flex-shrink:0;">{i+1}</div>
+          <div><div style="font-weight:700;color:#f1f5f9;font-size:13px;margin-bottom:2px;">{title}</div>
+          <div style="font-size:12px;color:#6b7280;">{desc}</div></div></div>"""
+        for i, (title, desc) in enumerate(steps)
+    )
+    content = f"""
+    <h2 style="margin:0 0 6px;font-size:20px;font-weight:900;color:#f1f5f9;">How to connect your {exchange} API</h2>
+    <p style="margin:0 0 18px;font-size:13px;color:#6b7280;">Follow these steps to create a trade-only API key and connect it to Asymmetric AI.</p>
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:16px;">
+      {rows}
+    </div>
+    <div style="background:rgba(220,38,38,0.08);border:1px solid rgba(248,113,113,0.25);
+                border-radius:12px;padding:12px 16px;font-size:12px;color:#fecaca;line-height:1.6;">
+      <b>Security reminder:</b> Never enable Withdrawal permission on your API key.
+      Asymmetric AI only needs Read + Trade access. We never ask for withdrawal permissions.
+    </div>"""
+    send_email(
+        to,
+        f"Asymmetric AI — How to connect your {exchange} API key",
+        _email_base(content, footer="Your API keys are AES-128 encrypted and stored securely. We never have access to your funds directly."),
+    )
+
+
+def email_first_trade(to: str, symbol: str, side: str, grade: str, equity: float) -> None:
+    side_color = "#00ff9d" if side == "LONG" else "#ff5078"
+    content = f"""
+    <h2 style="margin:0 0 6px;font-size:20px;font-weight:900;color:#f1f5f9;">Your first trade just fired</h2>
+    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">
+      The AI found a high-quality setup and entered your first position.
+    </p>
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:16px;">
+      <table style="width:100%;border-collapse:collapse;font-size:14px;">
+        <tr><td style="padding:7px 0;color:#6b7280;width:120px;">Coin</td>
+            <td style="padding:7px 0;font-weight:900;color:#f1f5f9;">{symbol}</td></tr>
+        <tr><td style="padding:7px 0;color:#6b7280;">Direction</td>
+            <td style="padding:7px 0;font-weight:900;color:{side_color};">{side}</td></tr>
+        <tr><td style="padding:7px 0;color:#6b7280;">Signal grade</td>
+            <td style="padding:7px 0;font-weight:900;color:#00ffe0;">Grade {grade}</td></tr>
+        <tr><td style="padding:7px 0;color:#6b7280;">Account equity</td>
+            <td style="padding:7px 0;font-weight:900;color:#f1f5f9;">${equity:,.2f}</td></tr>
+      </table>
+    </div>
+    <div style="background:rgba(0,255,224,0.06);border:1px solid rgba(0,255,224,0.18);
+                border-radius:12px;padding:14px 16px;font-size:13px;color:#a7f3d0;line-height:1.6;">
+      The AI is managing this trade automatically. It will send you another email when the trade closes
+      with the full result. You can monitor progress on your dashboard anytime.
+    </div>"""
+    send_email(
+        to,
+        f"Your first Asymmetric AI trade is live — {symbol} {side}",
+        _email_base(content, footer="The AI manages risk automatically. Your hard floor protects your capital."),
+    )
