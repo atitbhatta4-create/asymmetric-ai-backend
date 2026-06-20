@@ -212,6 +212,11 @@ def signup(request: Request, payload: SignupIn):
             (email, hash_pw(payload.password), _now_utc_str()),
         )
         conn.commit()
+
+    from notifications import email_welcome, email_api_key_guide
+    email_welcome(email)
+    email_api_key_guide(email, exchange="Bybit")
+
     return {"ok": True}
 
 
