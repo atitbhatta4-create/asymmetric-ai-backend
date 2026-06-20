@@ -427,6 +427,7 @@ def _compute_signal_layers(
     mtf_klines: Optional[List[Dict]] = None,
     param_overrides: Optional[Dict] = None,
     enable_t16: bool = True,
+    enable_s4: bool = False,
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -773,15 +774,30 @@ def _compute_signal_layers(
     # sess_score scales the total: 1.0 = full, 0.60 = needs 67% stronger signal
     # This means a news spike (high ATR, high ADX, high volume) can still
     # fire at 3am — but a mediocre setup in thin hours gets filtered out.
+
+    # S4 — Dynamic weights by regime (enable_s4=True, backtest-gated before live deploy)
+    # TRENDING: regime carries less new info (already high); direction+entry matter most.
+    # MARGINAL: regime score reveals HOW borderline the market is — high predictive value.
+    #           Momentum confirmation becomes critical to justify trading near the edge.
+    # Fixed weights remain default until backtester confirms improvement over baseline.
+    _regime_type = regime_class["regime"]
+    if enable_s4 and _regime_type == "TRENDING":
+        _w = {"regime": 0.15, "direction": 0.35, "entry": 0.35, "momentum": 0.15}
+    elif enable_s4 and _regime_type == "MARGINAL":
+        _w = {"regime": 0.30, "direction": 0.25, "entry": 0.25, "momentum": 0.20}
+    else:
+        _w = {"regime": 0.25, "direction": 0.30, "entry": 0.30, "momentum": 0.15}
+
     raw_score = (
-        regime_score    * 0.25 +
-        direction_score * 0.30 +
-        entry_score     * 0.30 +
-        momentum_score  * 0.15
+        regime_score    * _w["regime"] +
+        direction_score * _w["direction"] +
+        entry_score     * _w["entry"] +
+        momentum_score  * _w["momentum"]
     )
     total_score = round(raw_score * sess_score, 3)
     min_score = p.get("min_score", 0.62)
     breakdown["session"] = {"label": sess_label, "quality": round(sess_score, 2), "raw_score": round(raw_score, 3), "ok": True, "reason": ""}
+    breakdown["weights"] = {**_w, "s4_active": enable_s4, "regime_type": _regime_type}
 
     # Market grade for trades that FIRE (ok=True path only):
     # A = high conviction (≥0.78) → full position
