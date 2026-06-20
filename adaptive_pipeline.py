@@ -899,6 +899,7 @@ def _monthly_scheduler_loop() -> None:
     """
     last_pipeline_month = None  # track which month we last ran the pipeline
     last_degrade_check  = 0.0
+    last_backup_day     = None
 
     while not _scheduler_stop.is_set():
         now = datetime.utcnow()
@@ -923,6 +924,16 @@ def _monthly_scheduler_loop() -> None:
             except Exception as exc:
                 print(f"[pipeline] Degradation check error: {exc}")
             last_degrade_check = time.time()
+
+        # Daily R2 backup at 02:00 UTC
+        today_key = (now.year, now.month, now.day)
+        if now.hour == 2 and today_key != last_backup_day:
+            try:
+                from backup_r2 import run_backup_safe
+                run_backup_safe()
+            except Exception as exc:
+                print(f"[pipeline] Backup error: {exc}")
+            last_backup_day = today_key
 
         # Sleep in 1h chunks (check once per hour is plenty)
         _scheduler_stop.wait(timeout=3600)
