@@ -575,6 +575,7 @@ def _run_worker(
     start_equity: float,
     enable_t16: bool = True,
     enable_t18: bool = True,
+    enable_s4: bool = False,
 ) -> None:
     _last_db_write = [0.0]  # throttle DB progress writes
 
@@ -711,7 +712,7 @@ def _run_worker(
                     continue  # SCALP dead-zone block
 
                 sig = _compute_signal_layers(klines, mode, 1.0, higher_slice, style, mtf_slice,
-                                            enable_t16=enable_t16)
+                                            enable_t16=enable_t16, enable_s4=enable_s4)
 
                 if sig.get("ok"):
                     side          = sig["side"]
@@ -812,6 +813,7 @@ def start_backtest(
     start_equity: float,
     enable_t16: bool = True,
     enable_t18: bool = True,
+    enable_s4: bool = False,
 ) -> str:
     """Validate inputs, create DB record, start background thread, return run_id."""
     from datetime import datetime
@@ -864,7 +866,7 @@ def start_backtest(
     t = threading.Thread(
         target=_run_worker,
         args=(run_id, email, symbol.upper(), tf, mode, style, exchange,
-              start_ms, end_ms, start_equity, enable_t16, enable_t18),
+              start_ms, end_ms, start_equity, enable_t16, enable_t18, enable_s4),
         daemon=True,
     )
     t.start()
