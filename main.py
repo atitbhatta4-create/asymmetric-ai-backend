@@ -3590,7 +3590,7 @@ class AutoRunner:
                             if _si_usdt > 0:
                                 _si_ok = _place_real_scalein(self, self.symbol, side, _si_usdt, _si_lev)
                                 if _si_ok:
-                                    _move_real_sl_to_breakeven(self.email, self.symbol, entry)
+                                    _move_real_sl_to_breakeven(self.email, self.symbol, entry)  # Grade A: no T2
                         self.log(
                             f"SCALE IN 1: +20% added at +{best_move*100:.2f}% "
                             f"(threshold 1.5×ATR={1.5*_atr_now*100:.2f}%). "
@@ -4029,9 +4029,17 @@ class AutoRunner:
                         pt["breakeven_next"] = True
                         if REAL_TRADING and t1_entry_price:
                             try:
-                                ok = _move_real_sl_to_breakeven(self.email, self.symbol, t1_entry_price)
+                                ok, new_t2_sl_id = _move_real_sl_to_breakeven(
+                                    self.email, self.symbol, t1_entry_price,
+                                    t2_sl_id=pt.get("t2_sl_id"),
+                                    t2_qty=pt.get("t2_qty"),
+                                    side=pt.get("side"),
+                                )
                                 if ok:
                                     self.log(f"REAL T2 SL→BREAKEVEN @ {t1_entry_price:.4f}")
+                                    if new_t2_sl_id:
+                                        pt["t2_sl_id"] = new_t2_sl_id
+                                        _save_runner_state(self)
                                 else:
                                     self.log("REAL T2 SL breakeven move failed — T2 continues with original SL")
                             except Exception as _slm:
@@ -4305,10 +4313,11 @@ class AutoRunner:
                                                  "tp_mult": 1.00, "is_primary": True, "label": "T1",
                                                  "order_id": real_b_result.get("order_id"),
                                                  "t1_tp_id": real_b_result.get("t1_tp_id"),
-                                                 "t1_sl_id": None},   # filled after stop placement
+                                                 "t1_sl_id": None},
                                                 {**base_trade, "grade": "B", "size_mult": 0.40,
                                                  "tp_mult": 1.00, "is_primary": False, "label": "T2",
-                                                 "breakeven_after_t1": True, "t2_sl_id": None},
+                                                 "breakeven_after_t1": True, "t2_sl_id": None,
+                                                 "t2_qty": real_b_result.get("t2_qty")},
                                             ]
                                         elif grade == "B":
                                             self.pending_trades = [
@@ -4354,29 +4363,24 @@ class AutoRunner:
                                                 _mc_b_ex    = real_b_result["ex"]
                                                 _mc_b_ex_id = real_b_result["ex_id"]
                                                 _mc_b_sl    = real_b_result["sl_price"]
-                                                if _mc_b_ex_id == "bybit":
-                                                    _mc_t1_sl = _place_grade_b_stop_order(
-                                                        self, _mc_b_ex, _mc_b_ex_id, self.symbol,
-                                                        signal_side, _mc_b_sl,
-                                                        real_b_result["t1_qty"], "T1_SL",
-                                                    )
-                                                    _mc_t2_sl = _place_grade_b_stop_order(
-                                                        self, _mc_b_ex, _mc_b_ex_id, self.symbol,
-                                                        signal_side, _mc_b_sl,
-                                                        real_b_result["t2_qty"], "T2_SL",
-                                                    )
-                                                    self.pending_trades[0]["t1_sl_id"] = _mc_t1_sl
-                                                    self.pending_trades[1]["t2_sl_id"] = _mc_t2_sl
-                                                    _save_runner_state(self)
-                                                    if not _mc_t1_sl or not _mc_t2_sl:
-                                                        self.log(f"MID_CANDLE Grade B partial stop failed — position SL fallback")
-                                                        _mc_sl_ok = _ensure_sl_or_close(self, _mc_b_ex, _mc_b_ex_id, self.symbol, signal_side, _mc_b_sl)
-                                                        if _mc_sl_ok is False:  # False=closed safely; None=still open, keep tracking
-                                                            self.pending_trades = []
-                                                            _save_runner_state(self)
-                                                else:
+                                                # Independent T1 + T2 stops on all exchanges
+                                                _mc_t1_sl = _place_grade_b_stop_order(
+                                                    self, _mc_b_ex, _mc_b_ex_id, self.symbol,
+                                                    signal_side, _mc_b_sl,
+                                                    real_b_result["t1_qty"], "T1_SL",
+                                                )
+                                                _mc_t2_sl = _place_grade_b_stop_order(
+                                                    self, _mc_b_ex, _mc_b_ex_id, self.symbol,
+                                                    signal_side, _mc_b_sl,
+                                                    real_b_result["t2_qty"], "T2_SL",
+                                                )
+                                                self.pending_trades[0]["t1_sl_id"] = _mc_t1_sl
+                                                self.pending_trades[1]["t2_sl_id"] = _mc_t2_sl
+                                                _save_runner_state(self)
+                                                if not _mc_t1_sl or not _mc_t2_sl:
+                                                    self.log(f"MID_CANDLE Grade B partial stop failed — position SL fallback")
                                                     _mc_sl_ok = _ensure_sl_or_close(self, _mc_b_ex, _mc_b_ex_id, self.symbol, signal_side, _mc_b_sl)
-                                                    if _mc_sl_ok is False:  # False=closed safely; None=still open, keep tracking
+                                                    if _mc_sl_ok is False:
                                                         self.pending_trades = []
                                                         _save_runner_state(self)
                                             else:
@@ -4835,7 +4839,8 @@ class AutoRunner:
                                  "t1_sl_id": None},
                                 {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00,
                                  "is_primary": False, "label": "T2", "breakeven_after_t1": True,
-                                 "t2_sl_id": None},
+                                 "t2_sl_id": None,
+                                 "t2_qty": real_b_result.get("t2_qty")},
                             ]
                             self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP T2 40%+100%TP+BE | score={self.last_score:.2f}")
                         else:
@@ -4871,21 +4876,20 @@ class AutoRunner:
                             _b_ex    = real_b_result["ex"]
                             _b_ex_id = real_b_result["ex_id"]
                             _b_sl    = real_b_result["sl_price"]
-                            if _b_ex_id == "bybit":
-                                # Each stop covers only its own portion.
-                                # When T1 SL fires (60% closes), T2 SL stays active.
-                                _t1_sl_id = _place_grade_b_stop_order(
-                                    self, _b_ex, _b_ex_id, self.symbol, desired_side,
-                                    _b_sl, real_b_result["t1_qty"], "T1_SL",
-                                )
-                                _t2_sl_id = _place_grade_b_stop_order(
-                                    self, _b_ex, _b_ex_id, self.symbol, desired_side,
-                                    _b_sl, real_b_result["t2_qty"], "T2_SL",
-                                )
-                                self.pending_trades[0]["t1_sl_id"] = _t1_sl_id
-                                self.pending_trades[1]["t2_sl_id"] = _t2_sl_id
-                                _save_runner_state(self)
-                                if not _t1_sl_id or not _t2_sl_id:
+                            # Place independent T1 and T2 stops on all exchanges.
+                            # Each stop covers only its own tranche — T1 SL firing does NOT cancel T2 SL.
+                            _t1_sl_id = _place_grade_b_stop_order(
+                                self, _b_ex, _b_ex_id, self.symbol, desired_side,
+                                _b_sl, real_b_result["t1_qty"], "T1_SL",
+                            )
+                            _t2_sl_id = _place_grade_b_stop_order(
+                                self, _b_ex, _b_ex_id, self.symbol, desired_side,
+                                _b_sl, real_b_result["t2_qty"], "T2_SL",
+                            )
+                            self.pending_trades[0]["t1_sl_id"] = _t1_sl_id
+                            self.pending_trades[1]["t2_sl_id"] = _t2_sl_id
+                            _save_runner_state(self)
+                            if not _t1_sl_id or not _t2_sl_id:
                                     # Partial failure — apply position SL as fallback
                                     self.log(f"Grade B partial stop failed (T1={_t1_sl_id} T2={_t2_sl_id}) — applying position SL as fallback")
                                     _sl_ok = _ensure_sl_or_close(self, _b_ex, _b_ex_id, self.symbol, desired_side, _b_sl)
@@ -4949,12 +4953,6 @@ class AutoRunner:
                                                     self.log("TP orders verified active after fallback SL placement ✓")
                                             except Exception as _tpv_err:
                                                 self.log(f"TP verify after fallback SL: non-fatal error: {_tpv_err}")
-                            else:
-                                # OKX/Binance: position-level SL (no qty-specific conditional stops)
-                                _sl_ok = _ensure_sl_or_close(self, _b_ex, _b_ex_id, self.symbol, desired_side, _b_sl)
-                                if _sl_ok is False:  # False=closed safely; None=still open, keep tracking
-                                    self.pending_trades = []
-                                    _save_runner_state(self)
                         else:
                             _sl_ok = _ensure_sl_or_close(
                                 self, _real_result["ex"], _real_result["ex_id"],
@@ -5594,29 +5592,56 @@ def _place_grade_b_stop_order(
     label: str,
 ) -> Optional[str]:
     """
-    Place a qty-specific conditional stop-market order on Bybit for Grade B T1 or T2.
+    Place a qty-specific independent stop-market order for Grade B T1 or T2.
+    Supported on Bybit, OKX, and Binance — each uses their native stop order API.
 
-    Why this is needed (Grade B T2 SL bug — confirmed May 23 NEAR trade):
-    ─────────────────────────────────────────────────────────────────────
-    The old approach used a single position-level SL via tradingStop (covers the
-    full remaining position at trigger time). When T1 closes at SL, that single
-    SL order is consumed. T2 continues running but has NO stop protection.
-    Result: T2 loss was $2.00 instead of the expected $0.36.
-
-    This function places ONE partial stop order for the given qty (T1=60% or T2=40%).
-    The two stops are independent — T1's stop firing does NOT cancel T2's stop.
-
-    Bybit-only: OKX and Binance do not support reduceOnly conditional orders with
-    specific quantities easily. Callers fall back to _ensure_sl_or_close on those.
+    Why independent stops matter (confirmed May 23 NEAR trade):
+    When T1 closes at SL, a single position-level SL is consumed — T2 runs unprotected.
+    This function places ONE stop per tranche. T1's stop firing does NOT cancel T2's stop.
 
     Parameters:
         label: "T1_SL" or "T2_SL" — used in log messages for traceability.
     Returns:
-        Bybit orderId string on success, None on failure.
+        Order ID string on success, None on failure (caller falls back to position SL).
     """
-    if ex_id != "bybit":
-        # Only Bybit supports this pattern cleanly — caller uses position-level SL fallback
-        return None
+    close_side_str_lower = "sell" if side == "LONG" else "buy"
+
+    if ex_id == "okx":
+        try:
+            order = _ccxt_call(
+                ex.create_order, symbol, "market", close_side_str_lower, qty, None,
+                params={
+                    "tdMode":       "cross",
+                    "slTriggerPx":  str(round(sl_price, 4)),
+                    "slOrdPx":      "-1",   # market fill on trigger
+                    "reduceOnly":   True,
+                },
+                label=f"grade_b {label} okx",
+            )
+            order_id = (order or {}).get("id")
+            runner.log(f"Grade B {label} stop placed (OKX): order={order_id} @ {sl_price:.4f} qty={qty}")
+            return order_id
+        except Exception as e:
+            runner.log(f"WARN: Grade B {label} OKX stop failed: {e}")
+            return None
+
+    if ex_id == "binance":
+        try:
+            order = _ccxt_call(
+                ex.create_order, symbol, "STOP_MARKET", close_side_str_lower, qty, None,
+                params={
+                    "stopPrice":     round(sl_price, 4),
+                    "reduceOnly":    True,
+                    "closePosition": False,   # specific qty, not full position
+                },
+                label=f"grade_b {label} binance",
+            )
+            order_id = (order or {}).get("id")
+            runner.log(f"Grade B {label} stop placed (Binance): order={order_id} @ {sl_price:.4f} qty={qty}")
+            return order_id
+        except Exception as e:
+            runner.log(f"WARN: Grade B {label} Binance stop failed: {e}")
+            return None
 
     close_side_str = "Sell" if side == "LONG" else "Buy"
     # triggerDirection: 2 = fire when price falls BELOW trigger (LONG stop-loss)
@@ -5806,63 +5831,103 @@ def _cancel_all_real_orders(email: str, symbol: str) -> None:
         pass
 
 
-def _move_real_sl_to_breakeven(email: str, symbol: str, entry_price: float) -> bool:
+def _move_real_sl_to_breakeven(
+    email: str,
+    symbol: str,
+    entry_price: float,
+    t2_sl_id: Optional[str] = None,
+    t2_qty: Optional[float] = None,
+    side: Optional[str] = None,
+) -> tuple:
     """
-    Move position-level SL to entry price (breakeven) when T1 hits TP.
-    Uses Bybit's /v5/position/trading-stop — one atomic call, zero gap.
-    Safer than cancel+replace because the position is never unprotected.
-    Returns True on success.
+    Move T2 stop-loss to entry price (breakeven) when T1 hits TP.
+    Returns (success: bool, new_t2_sl_id: Optional[str]).
+
+    Bybit:   atomic position trading-stop API — zero gap, no cancel needed.
+    OKX:     cancel existing T2 SL order + place new qty-specific stop at entry.
+    Binance: cancel existing T2 STOP_MARKET + place new qty-specific stop at entry.
+
+    new_t2_sl_id is set for OKX/Binance so caller can update pending_trades[T2]["t2_sl_id"].
     """
     try:
         row = get_exchange(email)
         if not row:
-            return False
+            return False, None
         ex = _make_ccxt_exchange(row)
-        mkt = ex.market(symbol)
-        bybit_sym = mkt["id"]   # "BTC/USDT:USDT" → "BTCUSDT"
-        _ccxt_call(
-            ex.privatePostV5PositionTradingStop,
-            {
-                "category":    "linear",
-                "symbol":      bybit_sym,
-                "stopLoss":    str(round(entry_price, 4)),
-                "slTriggerBy": "MarkPrice",
-                "positionIdx": 0,
-            },
-            label="move_sl_breakeven", retries=1,
+        ex_id = (row.get("exchange") or "bybit").lower()
+
+        if ex_id == "bybit":
+            mkt = ex.market(symbol)
+            bybit_sym = mkt["id"]
+            _ccxt_call(
+                ex.privatePostV5PositionTradingStop,
+                {
+                    "category":    "linear",
+                    "symbol":      bybit_sym,
+                    "stopLoss":    str(round(entry_price, 4)),
+                    "slTriggerBy": "MarkPrice",
+                    "positionIdx": 0,
+                },
+                label="move_sl_breakeven_bybit", retries=1,
+            )
+            return True, None
+
+        # OKX / Binance — cancel old T2 SL, place new one at entry_price
+        if t2_sl_id:
+            try:
+                _ccxt_call(ex.cancel_order, t2_sl_id, symbol,
+                           label=f"cancel_t2_sl_breakeven {ex_id}", retries=0)
+            except Exception as _ce:
+                pass  # already filled or expired — safe to continue placing new stop
+
+        if not t2_qty or not side:
+            # Fallback: use position-level SL if we don't have qty/side info
+            _set_position_sl(ex, ex_id, symbol, side or "LONG", entry_price)
+            return True, None
+
+        # Place new qty-specific stop at entry_price
+        runner_stub = type("_R", (), {"log": lambda self, m: print(f"[breakeven] {m}")})()
+        new_id = _place_grade_b_stop_order(
+            runner_stub, ex, ex_id, symbol, side, entry_price, t2_qty, "T2_SL_BE"
         )
-        return True
+        if new_id:
+            return True, new_id
+        # Fallback if stop placement failed
+        try:
+            _set_position_sl(ex, ex_id, symbol, side, entry_price)
+            return True, None
+        except Exception:
+            return False, None
+
     except Exception:
-        return False
+        return False, None
 
 
-def _check_bybit_order_filled(email: str, order_id: str, symbol: str) -> bool:
+def _check_order_filled(email: str, order_id: str, symbol: str) -> bool:
     """
-    Return True if the Bybit order is confirmed fully filled.
+    Return True if an exchange order is confirmed fully filled.
+    Works on Bybit, OKX, and Binance via ccxt unified fetch_order.
     Returns False on any error or if order is still open / canceled / unknown.
     Used to verify T1 TP hit on real Grade B trades before moving T2 SL to breakeven.
-
-    Bug 3 fix: previous version created a fresh exchange with no markets loaded.
-    ccxt Bybit's fetch_order requires markets to resolve the symbol category (linear/spot),
-    so it silently failed and returned False even when T1_TP was actually filled.
-    Fix: load markets before fetch_order, and accept both "closed" and "filled" statuses.
     """
     try:
         row = get_exchange(email)
         if not row:
             return False
         ex = _make_ccxt_exchange(row)
-        # Load markets if this is a fresh exchange instance — required for symbol resolution
         if not ex.markets:
             try:
                 ex.load_markets()
             except Exception:
-                pass  # non-fatal: fetch_order may still work without full market map
+                pass
         order = _ccxt_call(ex.fetch_order, order_id, symbol, label="fetch_order T1_check", retries=1)
-        # ccxt normalises Bybit "Filled" → "closed"; accept both defensively
+        # ccxt normalises all exchange statuses → "closed" or "filled"
         return order.get("status") in ("closed", "filled")
     except Exception:
         return False
+
+# backward-compat alias — remove after confirming all call sites updated
+_check_bybit_order_filled = _check_order_filled
 
 
 def place_real_grade_b_order(
