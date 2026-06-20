@@ -5713,7 +5713,7 @@ def _verify_and_restore_t2_sl(
     t2_sl_price: float,
 ) -> None:
     """
-    After T1 exits at SL (not TP), verify T2's stop order is still active on Bybit.
+    After T1 exits at SL (not TP), verify T2's stop order is still active.
     Re-places the SL immediately if the stop order is missing or was consumed.
 
     Why this is needed:
@@ -5723,19 +5723,37 @@ def _verify_and_restore_t2_sl(
     - The stop order gets cancelled by the exchange for any reason.
     This verification ensures T2 always has protection within one engine cycle.
 
+    Exchange behaviour:
+    - Bybit:   stop-limit orders appear in fetch_open_orders → full verification possible.
+    - Binance: STOP_MARKET conditional orders appear in fetch_open_orders → full verification.
+    - OKX:     algo stop orders live at /trade/orders-algo-pending, NOT the regular open
+               orders endpoint. fetch_open_orders returns [] for algo orders → always looks
+               missing even when active → would cause a spurious second position-level SL.
+               For OKX we skip the check and assume the algo stop is still active. If it
+               was genuinely consumed (price gap), OKX will auto-liquidate or the next
+               engine cycle picks it up via position monitoring.
+
     Logs: "T2 SL verified after T1 exit" OR "T2 SL missing — placed new SL"
     """
+    # OKX algo orders are not visible via fetch_open_orders — assume active to avoid
+    # placing a duplicate position-level SL on top of the existing algo stop.
+    if ex_id == "okx":
+        runner.log(
+            f"T2 SL assumed active (OKX algo order {t2_sl_id}) — "
+            "skipping fetch_open_orders (algo endpoint not queried)"
+        )
+        return
+
     t2_active = False
 
     if t2_sl_id:
-        # Check if the T2 stop order is still in Bybit's open/untriggered orders
         try:
             open_orders = _ccxt_call(
                 ex.fetch_open_orders, symbol,
                 label=f"verify_t2_sl open_orders {ex_id}", retries=0,
             )
             for o in open_orders:
-                # Match by ccxt id or by native Bybit orderId in info dict
+                # Match by ccxt unified id or by native exchange orderId in info dict
                 if (o.get("id") == t2_sl_id or
                         (o.get("info") or {}).get("orderId") == t2_sl_id):
                     t2_active = True
