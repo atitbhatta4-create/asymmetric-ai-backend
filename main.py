@@ -45,6 +45,7 @@ from routes_pipeline import pipeline_router
 from routes_support import support_router
 from routes_auth import auth_router, hash_pw
 from routes_admin import admin_router
+from routes_report import report_router
 
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
@@ -124,6 +125,7 @@ app.include_router(pipeline_router)
 app.include_router(support_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
+app.include_router(report_router)
 
 # Strip /api prefix forwarded by Vercel
 @app.middleware("http")
