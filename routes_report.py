@@ -77,6 +77,7 @@ def _run_bg():
 
 def _upload_r2(pdf_bytes: bytes) -> str:
     import boto3
+    import httpx
     from botocore.config import Config
 
     key_id  = os.getenv("R2_ACCESS_KEY_ID", "")
@@ -98,7 +99,16 @@ def _upload_r2(pdf_bytes: bytes) -> str:
 
     ts  = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
     key = f"reports/comprehensive_{ts}.pdf"
-    client.put_object(Bucket=bucket, Key=key, Body=pdf_bytes, ContentType="application/pdf")
+
+    # Use presigned URL + httpx to bypass boto3/urllib3 SSL issues on Render
+    presigned = client.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": bucket, "Key": key, "ContentType": "application/pdf"},
+        ExpiresIn=600,
+    )
+    resp = httpx.put(presigned, content=pdf_bytes,
+                     headers={"Content-Type": "application/pdf"}, timeout=300)
+    resp.raise_for_status()
     print(f"[report] PDF uploaded → r2://{bucket}/{key}  ({len(pdf_bytes)//1024} KB)")
     return key
 

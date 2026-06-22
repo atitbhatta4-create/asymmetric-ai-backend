@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timezone
 
 import boto3
+import httpx
 from botocore.config import Config
 
 from database import db_conn
@@ -100,15 +101,16 @@ def run_backup() -> str:
     size_kb = len(compressed) / 1024
     print(f"[backup] Compressed size: {size_kb:.1f} KB")
 
-    # Upload to R2
+    # Upload to R2 — use presigned URL + httpx to bypass boto3/urllib3 SSL issues
     client = _get_r2_client()
-    client.put_object(
-        Bucket=R2_BUCKET,
-        Key=key,
-        Body=compressed,
-        ContentType="application/gzip",
-        ContentEncoding="gzip",
+    presigned = client.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": R2_BUCKET, "Key": key, "ContentType": "application/gzip"},
+        ExpiresIn=600,
     )
+    resp = httpx.put(presigned, content=compressed,
+                     headers={"Content-Type": "application/gzip"}, timeout=120)
+    resp.raise_for_status()
     elapsed = time.time() - t0
     print(f"[backup] Uploaded {key} in {elapsed:.1f}s")
 
