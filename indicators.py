@@ -797,7 +797,7 @@ def _compute_signal_layers(
     total_score = round(raw_score * sess_score, 3)
     min_score = p.get("min_score", 0.62)
     breakdown["session"] = {"label": sess_label, "quality": round(sess_score, 2), "raw_score": round(raw_score, 3), "ok": True, "reason": ""}
-    breakdown["weights"] = {**_w, "s4_active": enable_s4, "regime_type": _regime_type}
+    breakdown["weights"] = {**_w, "s4_active": enable_s4, "regime_type": _regime_type, "ok": True}
 
     # Market grade for trades that FIRE (ok=True path only):
     # A = high conviction (≥0.78) → full position
