@@ -1,64 +1,78 @@
 """
 migrate_encryption_key.py — rotate ENCRYPTION_KEY safely.
+Handles ALL exchanges: Bybit, OKX, Binance (all stored in exchange_keys table).
 
-Run from Render shell ONCE:
-  NEW_KEY=<new_fernet_key> python3 migrate_encryption_key.py
+Run from Render shell ONCE after deploy:
+  python3 migrate_encryption_key.py
 
 Steps:
-  1. Decrypts all stored API keys with old key (fallback or current ENCRYPTION_KEY)
-  2. Re-encrypts with NEW_KEY
+  1. Decrypts all stored API keys/secrets/passphrases with current key (or fallback)
+  2. Re-encrypts with a freshly generated NEW key
   3. Updates DB
-  4. Prints: set ENCRYPTION_KEY=<NEW_KEY> on Render then redeploy
+  4. Prints the new key — copy it and set as ENCRYPTION_KEY on Render, then redeploy
 """
-import base64, hashlib, os, sys
+import base64, hashlib, os
 from cryptography.fernet import Fernet
 
-# ── Old key (whatever is currently in use) ────────────────────────────────────
+# ── Old key (whatever the server is currently using) ──────────────────────────
 old_raw = os.getenv("ENCRYPTION_KEY", "")
 if old_raw:
     old_fernet = Fernet(old_raw.encode())
-    print(f"[migrate] Old key: from ENCRYPTION_KEY env var")
+    print("[migrate] Old key: from ENCRYPTION_KEY env var")
 else:
     _fallback = base64.urlsafe_b64encode(hashlib.sha256(b"asym-dev-key").digest())
     old_fernet = Fernet(_fallback)
-    print(f"[migrate] Old key: dev fallback (sha256 of 'asym-dev-key')")
+    print("[migrate] Old key: dev fallback (sha256 of 'asym-dev-key')")
 
-# ── New key ───────────────────────────────────────────────────────────────────
-new_raw = os.getenv("NEW_KEY", "")
-if not new_raw:
-    new_raw = Fernet.generate_key().decode()
-    print(f"[migrate] Generated new key: {new_raw}")
-    print(f"[migrate] ⚠️  Copy this key now — set it as ENCRYPTION_KEY on Render after migration")
-else:
-    print(f"[migrate] New key: from NEW_KEY env var")
+# ── Generate new key ──────────────────────────────────────────────────────────
+new_raw = Fernet.generate_key().decode()
 new_fernet = Fernet(new_raw.encode())
+print("[migrate] New key generated")
 
-# ── Migrate ───────────────────────────────────────────────────────────────────
+# ── Migrate all exchange keys (Bybit + OKX + Binance) ────────────────────────
 from database import db_conn
 
 with db_conn() as conn:
     cur = conn.cursor()
-    cur.execute("SELECT email, bybit_api_key, bybit_api_secret FROM users WHERE bybit_api_key IS NOT NULL AND bybit_api_key != ''")
+    cur.execute("SELECT email, exchange, api_key, api_secret, passphrase FROM exchange_keys")
     rows = cur.fetchall()
-    print(f"[migrate] Found {len(rows)} users with API keys")
+    print(f"[migrate] Found {len(rows)} exchange key records")
 
     migrated = 0
     for row in rows:
-        email = row["email"]
+        email    = row["email"]
+        exchange = row["exchange"]
         try:
             # Decrypt with old key
-            old_key    = old_fernet.decrypt(row["bybit_api_key"].encode()).decode()
-            old_secret = old_fernet.decrypt(row["bybit_api_secret"].encode()).decode()
+            plain_key    = old_fernet.decrypt(row["api_key"].encode()).decode()
+            plain_secret = old_fernet.decrypt(row["api_secret"].encode()).decode()
+            plain_pass   = ""
+            if row.get("passphrase"):
+                try:
+                    plain_pass = old_fernet.decrypt(row["passphrase"].encode()).decode()
+                except Exception:
+                    plain_pass = ""
+
             # Re-encrypt with new key
-            new_key    = new_fernet.encrypt(old_key.encode()).decode()
-            new_secret = new_fernet.encrypt(old_secret.encode()).decode()
-            cur.execute("UPDATE users SET bybit_api_key=%s, bybit_api_secret=%s WHERE email=%s",
-                        (new_key, new_secret, email))
-            print(f"[migrate]   ✓ {email}")
+            new_key    = new_fernet.encrypt(plain_key.encode()).decode()
+            new_secret = new_fernet.encrypt(plain_secret.encode()).decode()
+            new_pass   = new_fernet.encrypt(plain_pass.encode()).decode() if plain_pass else None
+
+            cur.execute(
+                "UPDATE exchange_keys SET api_key=%s, api_secret=%s, passphrase=%s WHERE email=%s",
+                (new_key, new_secret, new_pass, email)
+            )
+            print(f"[migrate]   ✓ {email} ({exchange})")
             migrated += 1
         except Exception as e:
-            print(f"[migrate]   ✗ {email} — {e} (skipped)")
+            print(f"[migrate]   ✗ {email} ({exchange}) — {e}")
 
     conn.commit()
-    print(f"\n[migrate] Done — {migrated}/{len(rows)} keys migrated")
-    print(f"\n[migrate] Next step: set ENCRYPTION_KEY={new_raw} in Render env vars → redeploy")
+
+print(f"\n[migrate] Done — {migrated}/{len(rows)} keys migrated")
+print(f"\n{'='*60}")
+print(f"  COPY THIS KEY AND SET IT ON RENDER:")
+print(f"  ENCRYPTION_KEY={new_raw}")
+print(f"{'='*60}")
+print(f"\n  Render → Environment → ENCRYPTION_KEY → paste above → Save → Redeploy")
+print(f"  Do NOT share this key with anyone.")
