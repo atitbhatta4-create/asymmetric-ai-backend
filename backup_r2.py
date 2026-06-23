@@ -109,7 +109,8 @@ def run_backup() -> str:
         ExpiresIn=600,
     )
     resp = httpx.put(presigned, content=compressed,
-                     headers={"Content-Type": "application/gzip"}, timeout=120)
+                     headers={"Content-Type": "application/gzip"}, timeout=120,
+                     verify=False)
     resp.raise_for_status()
     elapsed = time.time() - t0
     print(f"[backup] Uploaded {key} in {elapsed:.1f}s")

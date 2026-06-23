@@ -107,7 +107,8 @@ def _upload_r2(pdf_bytes: bytes) -> str:
         ExpiresIn=600,
     )
     resp = httpx.put(presigned, content=pdf_bytes,
-                     headers={"Content-Type": "application/pdf"}, timeout=300)
+                     headers={"Content-Type": "application/pdf"}, timeout=300,
+                     verify=False)
     resp.raise_for_status()
     print(f"[report] PDF uploaded → r2://{bucket}/{key}  ({len(pdf_bytes)//1024} KB)")
     return key
