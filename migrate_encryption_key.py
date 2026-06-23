@@ -15,12 +15,17 @@ import base64, hashlib, os
 from cryptography.fernet import Fernet
 
 # ── Old key (whatever the server is currently using) ──────────────────────────
-old_raw = os.getenv("ENCRYPTION_KEY", "")
+_fallback = base64.urlsafe_b64encode(hashlib.sha256(b"asym-dev-key").digest())
+old_raw = os.getenv("ENCRYPTION_KEY", "").strip()
 if old_raw:
-    old_fernet = Fernet(old_raw.encode())
-    print("[migrate] Old key: from ENCRYPTION_KEY env var")
+    try:
+        old_fernet = Fernet(old_raw.encode())
+        print("[migrate] Old key: from ENCRYPTION_KEY env var")
+    except Exception as e:
+        print(f"[migrate] WARNING: ENCRYPTION_KEY env var invalid ({e}) — falling back to dev key")
+        old_fernet = Fernet(_fallback)
+        print("[migrate] Old key: dev fallback (sha256 of 'asym-dev-key')")
 else:
-    _fallback = base64.urlsafe_b64encode(hashlib.sha256(b"asym-dev-key").digest())
     old_fernet = Fernet(_fallback)
     print("[migrate] Old key: dev fallback (sha256 of 'asym-dev-key')")
 
