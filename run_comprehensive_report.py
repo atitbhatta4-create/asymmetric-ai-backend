@@ -896,19 +896,24 @@ def main():
                 else:
                     print("    BT: SKIP")
 
-                print(f"    OPT ...",end="",flush=True)
-                t0=time.time()
-                opt=None
-                try:
-                    opt=run_optimizer(sym,mode,style,mc,hc)
-                except Exception as e:
-                    print(f" ERROR — {e}")
-                bp=opt["best"] if opt and opt.get("best") else None
-                if bp:
-                    print(f" Sh={bp['sharpe_ratio']:.3f}  Ret={bp['total_return']:+.1f}%  ({time.time()-t0:.0f}s) "
-                          f" ADX:{bp['adx_delta']:+d} Sc:{bp['score_delta']:+.2f} SL:{bp['sl_mult']:.1f}× TP:{bp['tp_mult']:.1f}×")
+                bt_trades = bt["total_trades"] if bt else 0
+                if bt_trades < 5:
+                    print(f"    OPT SKIP (only {bt_trades} trades — optimizer would find nothing)")
+                    opt = None
                 else:
-                    print(f" no valid combo ({time.time()-t0:.0f}s)")
+                    print(f"    OPT ...",end="",flush=True)
+                    opt_t0=time.time()
+                    opt=None
+                    try:
+                        opt=run_optimizer(sym,mode,style,mc,hc)
+                    except Exception as e:
+                        print(f" ERROR — {e}")
+                    bp=opt["best"] if opt and opt.get("best") else None
+                    if bp:
+                        print(f" Sh={bp['sharpe_ratio']:.3f}  Ret={bp['total_return']:+.1f}%  ({time.time()-opt_t0:.0f}s)"
+                              f"  ADX:{bp['adx_delta']:+d} Sc:{bp['score_delta']:+.2f} SL:{bp['sl_mult']:.1f}× TP:{bp['tp_mult']:.1f}×")
+                    else:
+                        print(f" no valid combo ({time.time()-opt_t0:.0f}s)")
 
                 results[style][mode][sym]={"bt":bt,"opt":opt}
 
@@ -938,9 +943,45 @@ def main():
     elapsed=(time.time()-grand_t0)/60
     print(f"\n{'='*72}\n  Completed in {elapsed:.1f} minutes\n{'='*72}")
 
-    build_pdf(results)
-    print(f"\n✓ Comprehensive PDF → {PDF_OUT}")
-    os.system(f"open '{PDF_OUT}'")
+    pdf_bytes = build_pdf(results)
+
+    # Upload to R2 if credentials are available (cloud runs)
+    r2_key = None
+    r2_access = os.getenv("R2_ACCESS_KEY_ID","")
+    r2_secret = os.getenv("R2_SECRET_ACCESS_KEY","")
+    r2_endpoint = os.getenv("R2_ENDPOINT","")
+    r2_bucket = os.getenv("R2_BUCKET","asymmetric-ai-backups")
+    if all([r2_access, r2_secret, r2_endpoint]):
+        try:
+            import boto3, httpx
+            from botocore.config import Config as _Cfg
+            client = boto3.client("s3", endpoint_url=r2_endpoint,
+                                  aws_access_key_id=r2_access,
+                                  aws_secret_access_key=r2_secret,
+                                  config=_Cfg(signature_version="s3v4"), region_name="auto")
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+            r2_key = f"reports/comprehensive_{ts}.pdf"
+            presigned = client.generate_presigned_url("put_object",
+                Params={"Bucket":r2_bucket,"Key":r2_key,"ContentType":"application/pdf"},
+                ExpiresIn=600)
+            httpx.put(presigned, content=pdf_bytes,
+                      headers={"Content-Type":"application/pdf"}, timeout=300, verify=False).raise_for_status()
+            print(f"[R2] PDF uploaded → {r2_key}  ({len(pdf_bytes)//1024} KB)")
+        except Exception as e:
+            print(f"[R2] Upload failed: {e}")
+
+    # Telegram alert when done
+    try:
+        from notifications import tg_alert
+        msg = (f"✅ Comprehensive Report DONE in {elapsed:.0f} min\n"
+               f"100 backtests + optimizers complete.\n"
+               + (f"PDF in R2 → {r2_key}" if r2_key else f"PDF saved locally → {PDF_OUT}"))
+        tg_alert(msg)
+    except Exception:
+        pass
+
+    if not r2_key:
+        os.system(f"open '{PDF_OUT}'")
 
 if __name__=="__main__":
     main()
