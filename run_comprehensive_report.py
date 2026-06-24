@@ -18,7 +18,7 @@ PDF sections:
   6.  Optimizer master table (all 100 combos, best params)
 """
 from __future__ import annotations
-import itertools, os, sys, time, statistics, math, json
+import gc, itertools, os, sys, time, statistics, math, json
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -67,9 +67,10 @@ DATE_TO      = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 START_MS     = int(datetime(2020,1,1,tzinfo=timezone.utc).timestamp()*1000)
 END_MS       = int(datetime.now(timezone.utc).timestamp()*1000)
 ALL_YEARS    = [str(y) for y in range(2020, datetime.now().year+1)]
-PDF_OUT      = os.path.join(os.path.dirname(__file__),"asymmetric_ai_comprehensive_report.pdf")
-RESULTS_JSON = os.path.join(os.path.dirname(__file__),"comprehensive_results.json")
-CACHE_FILE   = os.path.join(os.path.dirname(__file__),"candle_cache.json")
+PDF_OUT        = os.path.join(os.path.dirname(__file__),"asymmetric_ai_comprehensive_report.pdf")
+RESULTS_JSON   = os.path.join(os.path.dirname(__file__),"comprehensive_results.json")
+CACHE_FILE     = os.path.join(os.path.dirname(__file__),"candle_cache.json")
+COIN_CACHE_DIR = os.path.join(os.path.dirname(__file__),"coin_caches")
 ATR_BASELINE = {"15m":0.0040,"1h":0.0090,"4h":0.0180,"1d":0.0350}
 MODE_PRESETS = {
     "ULTRA_SAFE":{"size":0.30,"leverage":2},
@@ -135,11 +136,51 @@ def load_cache()->Dict:
 def save_cache(cache:Dict):
     with open(CACHE_FILE,"w") as f: json.dump(cache,f)
 
+def _coin_cache_path(sym:str)->str:
+    os.makedirs(COIN_CACHE_DIR, exist_ok=True)
+    return os.path.join(COIN_CACHE_DIR, f"{sym}.json")
+
+def load_coin_data(sym:str)->Dict:
+    """Load candles for one coin only — keeps memory low."""
+    path=_coin_cache_path(sym)
+    if os.path.exists(path):
+        try:
+            with open(path) as f: return json.load(f)
+        except: pass
+    # Fall back to monolithic cache (backward compat)
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE) as f: full=json.load(f)
+            coin_data={k:v for k,v in full.items() if k.startswith(sym+"_")}
+            if coin_data:
+                with open(path,"w") as f: json.dump(coin_data,f)
+                return coin_data
+        except: pass
+    return {}
+
+def save_coin_data(sym:str, data:Dict):
+    with open(_coin_cache_path(sym),"w") as f: json.dump(data,f)
+
 def get_candles(sym:str, tf:str, cache:Dict)->List[Dict]:
     key=f"{sym}_{tf}"
     if key in cache:
         print(f"    {sym} {tf}: cached ({len(cache[key]):,})"); return cache[key]
     data=_fetch(sym,TF_BN[tf],START_MS,END_MS); cache[key]=data; save_cache(cache); return data
+
+def fetch_and_cache_coin(sym:str)->None:
+    """Fetch all TFs for one coin, save to per-coin file, keep nothing in RAM."""
+    coin_data=load_coin_data(sym)
+    changed=False
+    for tf in ["1h","4h","1d"]:
+        key=f"{sym}_{tf}"
+        if key not in coin_data:
+            coin_data[key]=_fetch(sym,TF_BN[tf],START_MS,END_MS)
+            changed=True
+        else:
+            print(f"    {sym} {tf}: cached ({len(coin_data[key]):,})")
+    if changed: save_coin_data(sym,coin_data)
+    total=sum(len(v) for v in coin_data.values())
+    print(f"    {sym}: {total:,} candles ready")
 
 def aligned_slice(candles:List[Dict], before_ts:int, n:int)->List[Dict]:
     lo,hi,idx=0,len(candles)-1,-1
@@ -800,11 +841,12 @@ def run_full(progress_cb=None) -> bytes:
     """
     Run all backtests + optimizers, build PDF, return raw PDF bytes.
     progress_cb(msg: str, done: int) is called after each coin if provided.
+    Processes one coin at a time to keep memory usage low.
     """
-    cache=load_cache()
+    print("[run_full] Phase 1: caching candle data per coin...")
     for sym in COINS:
-        for tf in ["1h","4h","1d"]:
-            get_candles(sym,tf,cache)
+        fetch_and_cache_coin(sym)
+        gc.collect()
 
     results:Dict[str,Dict[str,Dict[str,Dict]]]={s:{m:{} for m in MODES} for s in STYLES}
     done=0; total=len(STYLES)*len(MODES)*len(COINS)
@@ -815,23 +857,32 @@ def run_full(progress_cb=None) -> bytes:
         if isinstance(obj,(int,float,str,bool)) or obj is None: return obj
         return str(obj)
 
-    for style,scfg in STYLE_CFG.items():
-        main_tf=scfg["main_tf"]; higher_tf=scfg["higher_tf"]
-        for mode in MODES:
-            for sym in COINS:
-                done+=1; label=COIN_LABELS[sym]
+    print("[run_full] Phase 2: backtesting (coin-by-coin)...")
+    for sym in COINS:
+        label=COIN_LABELS[sym]
+        coin_data=load_coin_data(sym)
+
+        for style,scfg in STYLE_CFG.items():
+            main_tf=scfg["main_tf"]; higher_tf=scfg["higher_tf"]
+            mc=coin_data.get(f"{sym}_{main_tf}",[]); hc=coin_data.get(f"{sym}_{higher_tf}",[])
+
+            for mode in MODES:
+                done+=1
                 print(f"  [{done}/{total}] {label} | {mode} | {style}")
-                mc=cache.get(f"{sym}_{main_tf}",[]); hc=cache.get(f"{sym}_{higher_tf}",[])
                 bt=None
                 try:
                     bt=run_backtest(sym,label,mode,style,mc,hc)
                 except Exception as e:
                     print(f"    BT ERROR: {e}")
                 opt=None
-                try:
-                    opt=run_optimizer(sym,mode,style,mc,hc)
-                except Exception as e:
-                    print(f"    OPT ERROR: {e}")
+                bt_trades=bt["total_trades"] if bt else 0
+                if bt_trades>=5:
+                    try:
+                        opt=run_optimizer(sym,mode,style,mc,hc)
+                    except Exception as e:
+                        print(f"    OPT ERROR: {e}")
+                else:
+                    print(f"    OPT SKIP ({bt_trades} trades)")
                 results[style][mode][sym]={"bt":bt,"opt":opt}
                 if progress_cb:
                     try: progress_cb(f"{done}/{total} — {label} {mode} {style}", done)
@@ -839,6 +890,9 @@ def run_full(progress_cb=None) -> bytes:
                 try:
                     with open(RESULTS_JSON,"w") as f: json.dump(_serial(results),f)
                 except Exception: pass
+
+        del coin_data, mc, hc
+        gc.collect()
 
     return build_pdf(results)
 
@@ -858,31 +912,38 @@ def main():
     print(f"  Total  : {n} backtests + {n*135:,} optimizer runs")
     print("="*72)
 
-    cache=load_cache()
-
-    # Pre-fetch all needed candle data
+    # ── Phase 1: fetch & cache all candles to disk, one coin at a time ──────────
     print("\n[DATA] Verifying candle data...")
     for sym in COINS:
-        for tf in ["1h","4h","1d"]:
-            get_candles(sym,tf,cache)
-    print("[DATA] All candles ready.\n")
+        fetch_and_cache_coin(sym)
+        gc.collect()
+    print("[DATA] All candles cached to disk.\n")
 
     results:Dict[str,Dict[str,Dict[str,Dict]]]={s:{m:{} for m in MODES} for s in STYLES}
     grand_t0=time.time(); done=0; total=len(STYLES)*len(MODES)*len(COINS)
 
-    for style,scfg in STYLE_CFG.items():
-        main_tf=scfg["main_tf"]; higher_tf=scfg["higher_tf"]
-        print(f"\n{'='*72}")
-        print(f"  STYLE: {style}  (main={main_tf}, higher={higher_tf})")
-        print(f"{'='*72}")
-        for mode in MODES:
-            print(f"\n  ── MODE: {mode} ──")
-            for sym in COINS:
-                done+=1; label=COIN_LABELS[sym]
-                print(f"\n  [{done}/{total}] {label} | {mode} | {style}")
-                mc=cache.get(f"{sym}_{main_tf}",[]); hc=cache.get(f"{sym}_{higher_tf}",[])
+    def _serial(obj):
+        if isinstance(obj,dict): return {k:_serial(v) for k,v in obj.items()}
+        if isinstance(obj,list): return [_serial(i) for i in obj]
+        if isinstance(obj,(int,float,str,bool)) or obj is None: return obj
+        return str(obj)
 
-                t0=time.time()
+    # ── Phase 2: process one coin at a time (coin-outer loop saves ~10× memory) ─
+    for sym in COINS:
+        label=COIN_LABELS[sym]
+        print(f"\n{'='*72}\n  COIN: {label}\n{'='*72}")
+
+        coin_data=load_coin_data(sym)
+
+        for style,scfg in STYLE_CFG.items():
+            main_tf=scfg["main_tf"]; higher_tf=scfg["higher_tf"]
+            mc=coin_data.get(f"{sym}_{main_tf}",[]); hc=coin_data.get(f"{sym}_{higher_tf}",[])
+            print(f"\n  ── STYLE: {style} ──")
+
+            for mode in MODES:
+                done+=1
+                print(f"\n  [{done}/{total}] {label} | {mode} | {style}")
+
                 bt=None
                 try:
                     bt=run_backtest(sym,label,mode,style,mc,hc)
@@ -896,14 +957,13 @@ def main():
                 else:
                     print("    BT: SKIP")
 
-                bt_trades = bt["total_trades"] if bt else 0
-                if bt_trades < 5:
-                    print(f"    OPT SKIP (only {bt_trades} trades — optimizer would find nothing)")
-                    opt = None
+                bt_trades=bt["total_trades"] if bt else 0
+                opt=None
+                if bt_trades<5:
+                    print(f"    OPT SKIP (only {bt_trades} trades)")
                 else:
                     print(f"    OPT ...",end="",flush=True)
                     opt_t0=time.time()
-                    opt=None
                     try:
                         opt=run_optimizer(sym,mode,style,mc,hc)
                     except Exception as e:
@@ -916,16 +976,14 @@ def main():
                         print(f" no valid combo ({time.time()-opt_t0:.0f}s)")
 
                 results[style][mode][sym]={"bt":bt,"opt":opt}
-
-                # Incremental save after each coin
                 try:
-                    def _serial(obj):
-                        if isinstance(obj,dict): return {k:_serial(v) for k,v in obj.items()}
-                        if isinstance(obj,list): return [_serial(i) for i in obj]
-                        if isinstance(obj,(int,float,str,bool)) or obj is None: return obj
-                        return str(obj)
                     with open(RESULTS_JSON,"w") as f: json.dump(_serial(results),f)
                 except Exception: pass
+
+        # Free this coin's candles before loading the next one
+        del coin_data, mc, hc
+        gc.collect()
+        print(f"[MEM] {label} candles freed")
 
     # Save results to JSON for recovery
     print("\n[SAVE] Writing final results to JSON...")
