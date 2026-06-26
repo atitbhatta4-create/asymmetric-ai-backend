@@ -3446,6 +3446,7 @@ class AutoRunner:
         # ── Intrabar SL/TP detection ──────────────────────────────────────
         # Use candle high/low to check if SL or TP was touched DURING the
         # interval, not just at close. This is more realistic for paper trading.
+        sl_pct_orig = sl_pct   # save before trail stop may overwrite it (used in display)
         sl_price = entry * (1 - sl_pct) if side == "LONG" else entry * (1 + sl_pct)
         tp_price = entry * (1 + tp_pct) if side == "LONG" else entry * (1 - tp_pct)
 
@@ -3497,10 +3498,11 @@ class AutoRunner:
         if candle_high > 0 and not intrabar_tp and not _t2_waiting:
             if best_move >= tp_pct * 0.70:
                 # Deep in profit — trail SL to lock in half the SL distance as profit
-                trail_locked_pct  = sl_pct * 0.50
+                trail_locked_pct  = sl_pct_orig * 0.50
                 trailing_activated = True
-            elif best_move >= tp_pct * 0.40:
-                # At break-even trigger — SL moves to entry
+            elif best_move >= tp_pct * 0.40 and best_move >= atr * 0.50:
+                # Breakeven trigger — only activate if price moved at least 0.5× ATR
+                # in profit direction. Prevents trail firing on noise below ATR floor.
                 trail_locked_pct  = 0.0
                 trailing_activated = True
 
@@ -3675,9 +3677,11 @@ class AutoRunner:
             f"Fees+Slip    -${fee_cost:.2f}  ({ex_id})",
             "",
             "Position (ATR-based)",
-            f"  Size:        {effective_size * 100:.1f}% of equity  →  ${size_dollar:.2f}",
+            f"  Size:        {effective_size * 100:.1f}% of equity  →  ${size_dollar:.2f}"
+            + (f"  (total position: {effective_size / pt.get('size_mult', 1.0) * 100:.1f}% → ${size_dollar / pt.get('size_mult', 1.0):.2f})"
+               if pt.get("grade") == "B" and pt.get("size_mult", 1.0) < 1.0 else ""),
             f"  Leverage:    {c['leverage']:.0f}×",
-            f"  SL (1×ATR):  {sl_pct * 100:.3f}%   |   TP ({tp_mult:.1f}×ATR): {tp_pct * 100:.3f}%",
+            f"  SL (1×ATR):  {sl_pct_orig * 100:.3f}%   |   TP ({tp_mult:.1f}×ATR): {tp_pct * 100:.3f}%",
             f"  ATR:         {atr * 100:.3f}%",
             f"  Trailing:    {'activated — locked ' + f'{trail_locked_pct*100:.2f}%' if trailing_activated else 'not triggered'}",
             f"  Vol adj:     {vol_size_mult*100:.0f}%  |  DD adj: {dd_size_mult*100:.0f}%",
@@ -6032,6 +6036,8 @@ def place_real_grade_b_order(
     # Bybit rejects orders below per-coin minimums (e.g. BTC min=0.001).
     # With heavy drawdown multipliers on small equity this triggers silently.
     import math as _math
+    _qty_step = 0.0
+    _min_qty  = 0.0
     try:
         _mkt      = ex.market(symbol)
         _prec     = _mkt.get("precision") or {}
@@ -6057,6 +6063,19 @@ def place_real_grade_b_order(
     t2_tp_price = round(price * t2_mult, 4)
     t1_qty = round(qty * 0.60, 6)
     t2_qty = round(qty * 0.40, 6)
+
+    # Fix: check if T2 qty would be below exchange minimum after step enforcement.
+    # If so, T1 takes the full position (no split) to avoid T2 SL qty=0 bug.
+    if _qty_step > 0 and _min_qty > 0:
+        t2_stepped = _math.floor(t2_qty / _qty_step) * _qty_step
+        if t2_stepped < _min_qty:
+            print(
+                f"[grade-b] T2 qty {t2_stepped:.6f} < min {_min_qty} after step enforcement "
+                f"— T1 takes full position (no T1/T2 split for this trade size)",
+                flush=True,
+            )
+            t1_qty = qty
+            t2_qty = 0.0
 
     # ── Entry order — clean, no SL in params (FIX 1) ──────────────────────────
     # SL is set SEPARATELY after entry via _ensure_sl_or_close() so that:
@@ -6096,14 +6115,15 @@ def place_real_grade_b_order(
     except RuntimeError as e:
         print(f"[WARN] Grade B T1 TP placement failed (entry placed): {e} — SL will protect.", flush=True)
 
-    try:
-        t2_order = _ccxt_call(
-            ex.create_order, symbol, "limit", close_side, t2_qty, t2_tp_price,
-            params=reduce_params, label=f"grade_b T2_TP {ex_id}",
-        )
-        t2_order_id = t2_order.get("id")
-    except RuntimeError as e:
-        print(f"[WARN] Grade B T2 TP placement failed (entry placed): {e} — SL will protect.", flush=True)
+    if t2_qty > 0:
+        try:
+            t2_order = _ccxt_call(
+                ex.create_order, symbol, "limit", close_side, t2_qty, t2_tp_price,
+                params=reduce_params, label=f"grade_b T2_TP {ex_id}",
+            )
+            t2_order_id = t2_order.get("id")
+        except RuntimeError as e:
+            print(f"[WARN] Grade B T2 TP placement failed (entry placed): {e} — SL will protect.", flush=True)
 
     return {
         "order_id":    entry_order.get("id"),
