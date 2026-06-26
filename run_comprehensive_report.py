@@ -466,7 +466,8 @@ def build_pdf(results:Dict, output_path:str=None) -> bytes:
     story=[]
 
     def fig2img(fig,wc=17,hc=5):
-        buf=io.BytesIO(); fig.savefig(buf,format="png",dpi=150,bbox_inches="tight",facecolor=fig.get_facecolor()); buf.seek(0); plt.close(fig)
+        buf=io.BytesIO(); fig.savefig(buf,format="png",dpi=120,bbox_inches="tight",facecolor=fig.get_facecolor()); buf.seek(0)
+        plt.close(fig); plt.close("all"); gc.collect()
         return Image(buf,width=wc*cm,height=hc*cm)
 
     def T(data,cw,ex=[]):
