@@ -1356,43 +1356,48 @@ _KLINES_CACHE_TTL = 55  # seconds — refresh just under 1 minute
 
 
 def _fetch_klines_raw(symbol: str, tf: str, limit: int) -> List[Dict[str, Any]]:
-    """Direct OKX fetch — no cache."""
+    """Fetch candles with fallback: OKX → Bybit. Returns [] only if both fail."""
+    # ── Source 1: OKX ────────────────────────────────────────────────────────
     inst = to_okx_inst(symbol)
     bar = OKX_TF_MAP.get(str(tf))
-    if not bar:
-        print(f"[klines] unknown tf={tf!r} for {symbol}")
-        return []
-    try:
-        r = httpx.get(
-            f"{OKX_BASE}/api/v5/market/candles",
-            params={"instId": inst, "bar": bar, "limit": int(limit)},
-            timeout=12,
-            headers={"accept": "application/json"},
-        )
-        if r.status_code == 429:
-            print(f"[klines] OKX 429 rate-limit for {inst}/{bar} — sleeping 60s")
-            time.sleep(60)
-            return []
-        if r.status_code != 200:
-            print(f"[klines] OKX HTTP {r.status_code} for {inst}/{bar}: {r.text[:120]}")
-            return []
-        rows = (r.json() or {}).get("data") or []
-        if not rows:
-            print(f"[klines] OKX returned empty data for {inst}/{bar} limit={limit}")
-            return []
-        out: List[Dict[str, Any]] = []
-        for k in rows:
-            out.append({"t": int(k[0]), "open": float(k[1]), "high": float(k[2]),
-                        "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])})
-        out.reverse()
-        return out
-    except Exception as e:
-        print(f"[klines] exception fetching {inst}/{bar}: {e}")
-        return []
+    if bar:
+        try:
+            r = httpx.get(
+                f"{OKX_BASE}/api/v5/market/candles",
+                params={"instId": inst, "bar": bar, "limit": int(limit)},
+                timeout=12,
+                headers={"accept": "application/json"},
+            )
+            if r.status_code == 429:
+                print(f"[klines] OKX 429 rate-limit for {inst}/{bar} — trying Bybit")
+            elif r.status_code != 200:
+                print(f"[klines] OKX HTTP {r.status_code} for {inst}/{bar} — trying Bybit")
+            else:
+                rows = (r.json() or {}).get("data") or []
+                if rows:
+                    out: List[Dict[str, Any]] = []
+                    for k in rows:
+                        out.append({"t": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                                    "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])})
+                    out.reverse()
+                    return out
+                print(f"[klines] OKX empty for {inst}/{bar} — trying Bybit")
+        except Exception as e:
+            print(f"[klines] OKX exception for {inst}/{bar}: {e} — trying Bybit")
+    else:
+        print(f"[klines] unknown tf={tf!r} for OKX — trying Bybit")
+
+    # ── Source 2: Bybit fallback ──────────────────────────────────────────────
+    result = _fetch_klines_bybit_sync(symbol, tf, limit=limit)
+    if result:
+        print(f"[klines] Bybit fallback OK for {symbol}/{tf} ({len(result)} candles)")
+    else:
+        print(f"[klines] Both OKX and Bybit failed for {symbol}/{tf}")
+    return result
 
 
 def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
-    """Cached OKX fetch — all users sharing same symbol+tf get the same data."""
+    """Cached candle fetch (OKX → Bybit fallback) — all users sharing same symbol+tf share one fetch."""
     key = (symbol.upper(), tf)
     now = time.time()
     with _KLINES_CACHE_LOCK:
@@ -2856,6 +2861,11 @@ class AutoRunner:
         self._last_drawdown_log_ts: float = 0.0  # throttle repeated drawdown tier logs
         self._last_dd_tier: int = 0              # 0=none 1=65% 2=40% 3=25% 4=stop
         self._last_mc_log_ts: float = 0.0        # throttle mid-candle noise logs
+        # Session-end-with-open-trade: defer engine stop until trade closes naturally
+        self.waiting_for_trade_close: bool = False
+        self._delayed_stop_reason: Optional[str] = None
+        self._waiting_since_ts: float = 0.0
+        self._last_waiting_log_ts: float = 0.0
         # Momentum scaling (pyramiding) — tracks scale-in state per active trade
         # Allowed modes: MINI_ASYM, NORMAL, AGGRESSIVE only
         self._scaling_enabled: bool = mode in ("MINI_ASYM", "NORMAL", "AGGRESSIVE")
@@ -3154,6 +3164,23 @@ class AutoRunner:
         threading.Thread(target=self._run_mid_candle_monitor, daemon=True).start()
 
     def stop(self, reason="Stopped by user."):
+        if self.pending_trades and not self.waiting_for_trade_close:
+            # First stop call with an open trade — defer until it closes naturally
+            self.waiting_for_trade_close = True
+            self._delayed_stop_reason = reason
+            self._waiting_since_ts = time.time()
+            self._last_waiting_log_ts = 0.0
+            self.log(f"Stop requested ({reason}) — open trade detected. Deferring stop until trade closes.")
+            _tg_alert(
+                f"⏳ <b>AI stop deferred — open trade</b>\n"
+                f"{self.email} | {self.symbol}\n"
+                f"Reason: {reason}\n"
+                f"Engine will stop once the trade closes naturally."
+            )
+            return
+        if self.waiting_for_trade_close and self.pending_trades:
+            # Second stop call while already waiting — force-abandon the trade
+            self.log(f"Forced stop while waiting for trade close. Trade abandoned. ({reason})")
         self.log(reason)
         self._close_ai_session(reason)
         self.stop_event.set()
@@ -4544,19 +4571,35 @@ class AutoRunner:
                     )
                 self.last_run_ts = time.time()
 
+                # Periodic 15-min log when deferring stop for an open trade
+                if self.waiting_for_trade_close and time.time() - self._last_waiting_log_ts >= 900:
+                    waited_min = (time.time() - self._waiting_since_ts) / 60
+                    self.log(f"⏳ Waiting for open trade to close before stopping ({waited_min:.1f} min elapsed). Reason: {self._delayed_stop_reason}")
+                    self._last_waiting_log_ts = time.time()
+
                 # FIX 3: Reconcile exchange positions every hour
                 if REAL_TRADING and (time.time() - _last_reconcile_ts) >= 3600:
                     self._reconcile_exchange_positions()
                     _last_reconcile_ts = time.time()
 
-                if self.end_at_ts and time.time() >= self.end_at_ts:
+                if self.end_at_ts and time.time() >= self.end_at_ts and not self.waiting_for_trade_close:
                     self.blocked_reason = "DURATION_ENDED"
                     if self.pending_trades:
-                        self._close_pending_trades()
-                    self.log("Session complete — duration ended. AI stopped.")
-                    self.stop_event.set()
-                    email_ai_stopped(self.email, self.symbol, "DURATION_END", get_equity(self.email))
-                    break
+                        self.waiting_for_trade_close = True
+                        self._delayed_stop_reason = "DURATION_END"
+                        self._waiting_since_ts = time.time()
+                        self._last_waiting_log_ts = 0.0
+                        self.log("Session duration ended — open trade detected. Waiting for trade to close before stopping.")
+                        _tg_alert(
+                            f"⏳ <b>Duration ended — waiting for trade</b>\n"
+                            f"{self.email} | {self.symbol}\n"
+                            f"AI has an open trade. Will stop once it closes naturally."
+                        )
+                    else:
+                        self.log("Session complete — duration ended. AI stopped.")
+                        self.stop_event.set()
+                        email_ai_stopped(self.email, self.symbol, "DURATION_END", get_equity(self.email))
+                        break
 
                 if not get_exchange(self.email):
                     self.blocked_reason = "EXCHANGE_NOT_CONNECTED"
@@ -4567,6 +4610,19 @@ class AutoRunner:
                 # ── Step 1: Close any pending trades first (real exit after one interval) ──
                 if self.pending_trades:
                     self._close_pending_trades()
+                    if not self.pending_trades and self.waiting_for_trade_close:
+                        waited_min = (time.time() - self._waiting_since_ts) / 60
+                        stop_reason = self._delayed_stop_reason or "Session ended"
+                        self.log(f"Trade closed. Delayed stop executing now (waited {waited_min:.1f} min). Reason: {stop_reason}")
+                        _tg_alert(
+                            f"✅ <b>Delayed stop — trade closed</b>\n"
+                            f"{self.email} | {self.symbol}\n"
+                            f"Trade closed after {waited_min:.1f} min delay. AI stopping now.\n"
+                            f"Reason: {stop_reason}"
+                        )
+                        self.waiting_for_trade_close = False
+                        self.stop(stop_reason)
+                        break
                     continue
 
                 # ── Step 2a: Hard floor + max drawdown guard ─────────────────────────────
@@ -4607,6 +4663,15 @@ class AutoRunner:
                             f"{self.email} | {self.symbol}\n"
                             f"<code>{str(_hfl_db_err)[:200]}</code>"
                         )
+                    # Close open trade at market — hard floor is an emergency, no waiting
+                    if REAL_TRADING and self.pending_trades:
+                        try:
+                            _pt = self.pending_trades[0]
+                            close_real_order(self.email, self.symbol, _pt.get("side", "LONG"))
+                            self.log("HARD_FLOOR: emergency market close executed for open trade.")
+                        except Exception as _hf_ce:
+                            self.log(f"HARD_FLOOR: market close failed — {_hf_ce}. Trade may still be open on exchange.")
+                        self.pending_trades = []
                     break
 
                 if self.peak_equity > 0:
@@ -4627,10 +4692,22 @@ class AutoRunner:
                     self.last_signal = "BLOCKED: MAX_TRADES_DAY"
                     if self.duration_days > 0:
                         self._sleep_until_dubai_midnight()
-                    else:
-                        self.log(f"Max trades/day reached ({self.trades_today}/{self.max_trades_per_day}). Stopping.")
-                        self.stop_event.set()
-                        break
+                    elif not self.waiting_for_trade_close:
+                        if self.pending_trades:
+                            self.waiting_for_trade_close = True
+                            self._delayed_stop_reason = "MAX_TRADES_DAY"
+                            self._waiting_since_ts = time.time()
+                            self._last_waiting_log_ts = 0.0
+                            self.log(f"Max trades/day reached ({self.trades_today}/{self.max_trades_per_day}) — open trade detected. Waiting to close before stopping.")
+                            _tg_alert(
+                                f"⏳ <b>Max trades reached — waiting for trade</b>\n"
+                                f"{self.email} | {self.symbol}\n"
+                                f"Trades: {self.trades_today}/{self.max_trades_per_day}. Will stop once trade closes."
+                            )
+                        else:
+                            self.log(f"Max trades/day reached ({self.trades_today}/{self.max_trades_per_day}). Stopping.")
+                            self.stop_event.set()
+                            break
                     continue
 
                 if self.stop_after_bad_trades > 0 and self.bad_trades_today >= self.stop_after_bad_trades:
@@ -4638,11 +4715,23 @@ class AutoRunner:
                     self.last_signal = "BLOCKED: MAX_BAD_TRADES"
                     if self.duration_days > 0:
                         self._sleep_until_dubai_midnight()
-                    else:
-                        self.log(f"Bad trade limit reached ({self.bad_trades_today}/{self.stop_after_bad_trades}). Stopping.")
-                        self.stop_event.set()
-                        email_ai_stopped(self.email, self.symbol, "MAX_BAD_TRADES", get_equity(self.email))
-                        break
+                    elif not self.waiting_for_trade_close:
+                        if self.pending_trades:
+                            self.waiting_for_trade_close = True
+                            self._delayed_stop_reason = "MAX_BAD_TRADES"
+                            self._waiting_since_ts = time.time()
+                            self._last_waiting_log_ts = 0.0
+                            self.log(f"Bad trade limit reached ({self.bad_trades_today}/{self.stop_after_bad_trades}) — open trade detected. Waiting to close before stopping.")
+                            _tg_alert(
+                                f"⏳ <b>Bad trade limit — waiting for trade</b>\n"
+                                f"{self.email} | {self.symbol}\n"
+                                f"Bad trades: {self.bad_trades_today}/{self.stop_after_bad_trades}. Will stop once trade closes."
+                            )
+                        else:
+                            self.log(f"Bad trade limit reached ({self.bad_trades_today}/{self.stop_after_bad_trades}). Stopping.")
+                            self.stop_event.set()
+                            email_ai_stopped(self.email, self.symbol, "MAX_BAD_TRADES", get_equity(self.email))
+                            break
                     continue
 
                 # ── Step 3: 4-layer signal analysis ─────────────────────────────────────
