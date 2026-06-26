@@ -1,2 +1,8 @@
 *.db
 .venv/
+.env
+candle_cache.json
+coin_caches/
+comprehensive_results.json
+asymmetric_ai_comprehensive_report.pdf
+asymmetric_ai_backtest_report.pdf
