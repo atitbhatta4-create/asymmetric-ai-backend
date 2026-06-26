@@ -1356,58 +1356,52 @@ _KLINES_CACHE_TTL = 55  # seconds — refresh just under 1 minute
 
 
 def _fetch_klines_raw(symbol: str, tf: str, limit: int) -> List[Dict[str, Any]]:
-    """Fetch candles with fallback: OKX → Bybit. Returns [] only if both fail."""
-    # ── Source 1: OKX ────────────────────────────────────────────────────────
+    """Direct OKX candle fetch — no cache, no fallback."""
     inst = to_okx_inst(symbol)
     bar = OKX_TF_MAP.get(str(tf))
-    if bar:
-        try:
-            r = httpx.get(
-                f"{OKX_BASE}/api/v5/market/candles",
-                params={"instId": inst, "bar": bar, "limit": int(limit)},
-                timeout=12,
-                headers={"accept": "application/json"},
-            )
-            if r.status_code == 429:
-                print(f"[klines] OKX 429 rate-limit for {inst}/{bar} — trying Bybit")
-            elif r.status_code != 200:
-                print(f"[klines] OKX HTTP {r.status_code} for {inst}/{bar} — trying Bybit")
-            else:
-                rows = (r.json() or {}).get("data") or []
-                if rows:
-                    out: List[Dict[str, Any]] = []
-                    for k in rows:
-                        out.append({"t": int(k[0]), "open": float(k[1]), "high": float(k[2]),
-                                    "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])})
-                    out.reverse()
-                    return out
-                print(f"[klines] OKX empty for {inst}/{bar} — trying Bybit")
-        except Exception as e:
-            print(f"[klines] OKX exception for {inst}/{bar}: {e} — trying Bybit")
-    else:
-        print(f"[klines] unknown tf={tf!r} for OKX — trying Bybit")
-
-    # ── Source 2: Bybit fallback ──────────────────────────────────────────────
-    result = _fetch_klines_bybit_sync(symbol, tf, limit=limit)
-    if result:
-        print(f"[klines] Bybit fallback OK for {symbol}/{tf} ({len(result)} candles)")
-    else:
-        print(f"[klines] Both OKX and Bybit failed for {symbol}/{tf}")
-    return result
+    if not bar:
+        print(f"[klines-okx] unknown tf={tf!r} for {symbol}")
+        return []
+    try:
+        r = httpx.get(
+            f"{OKX_BASE}/api/v5/market/candles",
+            params={"instId": inst, "bar": bar, "limit": int(limit)},
+            timeout=12,
+            headers={"accept": "application/json"},
+        )
+        if r.status_code == 429:
+            print(f"[klines-okx] 429 rate-limit for {inst}/{bar}")
+            return []
+        if r.status_code != 200:
+            print(f"[klines-okx] HTTP {r.status_code} for {inst}/{bar}: {r.text[:80]}")
+            return []
+        rows = (r.json() or {}).get("data") or []
+        if not rows:
+            print(f"[klines-okx] empty data for {inst}/{bar}")
+            return []
+        out: List[Dict[str, Any]] = []
+        for k in rows:
+            out.append({"t": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                        "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])})
+        out.reverse()
+        return out
+    except Exception as e:
+        print(f"[klines-okx] exception for {inst}/{bar}: {e}")
+        return []
 
 
-def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
-    """Cached candle fetch (OKX → Bybit fallback) — all users sharing same symbol+tf share one fetch."""
-    key = (symbol.upper(), tf)
+def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200, exchange: str = "bybit") -> List[Dict[str, Any]]:
+    """Cached candle fetch — per exchange, with 3-source fallback.
+    Cache key includes exchange so Bybit/OKX/Binance users each get their own slot."""
+    ex = (exchange or "bybit").lower()
+    key = (symbol.upper(), tf, ex)
     now = time.time()
     with _KLINES_CACHE_LOCK:
         if key in _KLINES_CACHE:
             fetched_at, cached = _KLINES_CACHE[key]
-            # Only use cache if it's fresh AND has enough candles for this request
             if now - fetched_at < _KLINES_CACHE_TTL and len(cached) >= limit:
                 return cached
-    # Cache miss, expired, or insufficient length — fetch fresh
-    fresh = _fetch_klines_raw(symbol, tf, limit)
+    fresh = _route_klines(symbol, tf, ex, limit)
     if fresh:
         with _KLINES_CACHE_LOCK:
             _KLINES_CACHE[key] = (now, fresh)
@@ -1484,19 +1478,93 @@ def _fetch_klines_bybit_sync(symbol: str, tf: str, limit: int = 200) -> List[Dic
         return []
 
 
-# alias used by trade engine (OKX has no geo-restriction on Render)
-binance_price = okx_price
+# ── MEXC klines (Binance-compatible format, no geo-blocking from Render) ──────
+_MEXC_TF_MAP = {"15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
+
+
+def _fetch_klines_mexc_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
+    interval = _MEXC_TF_MAP.get(str(tf))
+    if not interval:
+        print(f"[klines-mexc] unknown tf={tf!r} for {symbol}")
+        return []
+    sym = to_bybit_symbol(symbol)  # MEXC uses BTCUSDT format (no slash)
+    try:
+        r = httpx.get(
+            "https://api.mexc.com/api/v3/klines",
+            params={"symbol": sym, "interval": interval, "limit": int(limit)},
+            timeout=12,
+            headers={"accept": "application/json"},
+        )
+        if r.status_code != 200:
+            print(f"[klines-mexc] HTTP {r.status_code} for {sym}/{interval}: {r.text[:80]}")
+            return []
+        rows = r.json() or []
+        if not rows:
+            return []
+        out: List[Dict[str, Any]] = []
+        # MEXC/Binance: [openTime, open, high, low, close, vol, closeTime, ...]
+        for k in rows:
+            out.append({
+                "t":      int(k[0]),
+                "open":   float(k[1]),
+                "high":   float(k[2]),
+                "low":    float(k[3]),
+                "close":  float(k[4]),
+                "volume": float(k[5]),
+            })
+        return out  # already ascending order
+    except Exception as e:
+        print(f"[klines-mexc] exception for {sym}/{interval}: {e}")
+        return []
+
+
+# ── Per-exchange candle routing with 3-source fallback ────────────────────────
+def _route_klines(symbol: str, tf: str, exchange: str, limit: int) -> List[Dict[str, Any]]:
+    """Route candle fetch to user's exchange first, fall back to 2 others.
+    Bybit user: Bybit → OKX → MEXC
+    OKX user:   OKX → Bybit → MEXC
+    Binance user: MEXC → Bybit → OKX
+    """
+    ex = (exchange or "bybit").lower()
+    if ex == "bybit":
+        sources = [
+            ("Bybit", lambda: _fetch_klines_bybit_sync(symbol, tf, limit=limit)),
+            ("OKX",   lambda: _fetch_klines_raw(symbol, tf, limit)),
+            ("MEXC",  lambda: _fetch_klines_mexc_sync(symbol, tf, limit=limit)),
+        ]
+    elif ex == "okx":
+        sources = [
+            ("OKX",   lambda: _fetch_klines_raw(symbol, tf, limit)),
+            ("Bybit", lambda: _fetch_klines_bybit_sync(symbol, tf, limit=limit)),
+            ("MEXC",  lambda: _fetch_klines_mexc_sync(symbol, tf, limit=limit)),
+        ]
+    else:  # binance — MEXC is the closest public substitute (same API format, no geo-block)
+        sources = [
+            ("MEXC",  lambda: _fetch_klines_mexc_sync(symbol, tf, limit=limit)),
+            ("Bybit", lambda: _fetch_klines_bybit_sync(symbol, tf, limit=limit)),
+            ("OKX",   lambda: _fetch_klines_raw(symbol, tf, limit)),
+        ]
+
+    primary = sources[0][0]
+    for name, fn in sources:
+        try:
+            data = fn()
+            if data:
+                if name != primary:
+                    print(f"[klines] {name} fallback used for {symbol}/{tf} (primary exchange={ex})")
+                return data
+        except Exception as e:
+            print(f"[klines] {name} failed for {symbol}/{tf}: {e}")
+
+    print(f"[klines] All 3 sources failed for {symbol}/{tf} (exchange={ex})")
+    return []
+
+
+binance_price = okx_price  # price alias — okx_price already has BinanceUS/MEXC/OKX fallback chain
 
 
 async def _route_price(symbol: str, exchange: str) -> float:
-    # OKX is the only exchange whose public API is accessible from Render US servers.
-    # Binance and Bybit both geo-block US infrastructure.
-    # We use OKX as the data source for all exchanges — prices are essentially identical.
     return await okx_price(symbol)
-
-
-def _route_klines(symbol: str, tf: str, exchange: str, limit: int) -> List[Dict[str, Any]]:
-    return _fetch_klines_sync(symbol, tf, limit=limit)
 
 
 _EXCHANGE_ALLOWLIST = {"bybit", "okx", "binance"}
@@ -1776,10 +1844,11 @@ def klines(
     limit: int = Query(200, ge=20, le=1000),
     exchange: Optional[str] = Query(default=None),
 ):
-    rows = _route_klines(symbol, tf, exchange or "okx", limit)
+    ex = (exchange or "bybit").lower()
+    rows = _route_klines(symbol, tf, ex, limit)
     if not rows:
         raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or exchange unavailable).")
-    return {"symbol": symbol.upper().strip(), "tf": tf, "klines": rows, "exchange": (exchange or "okx").lower()}
+    return {"symbol": symbol.upper().strip(), "tf": tf, "klines": rows, "exchange": ex}
 
 
 # =========================
@@ -2866,6 +2935,12 @@ class AutoRunner:
         self._delayed_stop_reason: Optional[str] = None
         self._waiting_since_ts: float = 0.0
         self._last_waiting_log_ts: float = 0.0
+        # Exchange ID for klines routing — read once at startup so the hot loop never hits DB
+        try:
+            _ex_row = get_exchange(self.email)
+            self._exchange_id: str = (_ex_row.get("exchange") or "bybit").lower() if _ex_row else "bybit"
+        except Exception:
+            self._exchange_id = "bybit"
         # Momentum scaling (pyramiding) — tracks scale-in state per active trade
         # Allowed modes: MINI_ASYM, NORMAL, AGGRESSIVE only
         self._scaling_enabled: bool = mode in ("MINI_ASYM", "NORMAL", "AGGRESSIVE")
@@ -4012,7 +4087,7 @@ class AutoRunner:
         if not self.pending_trades:
             return
         try:
-            klines = _fetch_klines_sync(self.symbol, self.tf, limit=10)
+            klines = _fetch_klines_sync(self.symbol, self.tf, limit=10, exchange=self._exchange_id)
             if klines:
                 last_candle = klines[-1]
                 candle_high = last_candle["high"]
@@ -4088,19 +4163,19 @@ class AutoRunner:
             # On error, leave pending_trades intact — retry next interval
 
     def _signal_and_filters(self):
-        klines = _fetch_klines_sync(self.symbol, self.tf, limit=260)
+        klines = _fetch_klines_sync(self.symbol, self.tf, limit=260, exchange=self._exchange_id)
         higher_tf = HIGHER_TF_MAP.get(self.tf, "4h")
         higher_klines: List[Dict] = []
         if higher_tf != self.tf:
             try:
-                higher_klines = _fetch_klines_sync(self.symbol, higher_tf, limit=100)
+                higher_klines = _fetch_klines_sync(self.symbol, higher_tf, limit=100, exchange=self._exchange_id)
             except Exception:
                 higher_klines = []
         # 15m confirmation layer — DAY_TRADE and SWING only (SCALP IS 15m already)
         mtf_klines: List[Dict] = []
         if self.trade_style in ("DAY_TRADE", "SWING") and self.tf != "15m":
             try:
-                mtf_klines = _fetch_klines_sync(self.symbol, "15m", limit=50)
+                mtf_klines = _fetch_klines_sync(self.symbol, "15m", limit=50, exchange=self._exchange_id)
             except Exception:
                 mtf_klines = []
         res = _compute_signal_layers(klines, self.mode, self.adaptive_strictness, higher_klines, self.trade_style, mtf_klines)
@@ -4194,7 +4269,7 @@ class AutoRunner:
 
                     if _daily_bad_ok and _daily_trade_ok and _cooldown_ok:
                         # ── Fetch current candle open and live price ───────────────
-                        klines = _fetch_klines_sync(self.symbol, self.tf, limit=3)
+                        klines = _fetch_klines_sync(self.symbol, self.tf, limit=3, exchange=self._exchange_id)
                         if klines:
                             candle_open  = float(klines[-1]["open"])
                             current_px   = self._fetch_price_sync(self.symbol)
@@ -5321,7 +5396,7 @@ def _get_btc_momentum(tf: str) -> Optional[float]:
     """BTC % change over last 3 closed candles on given timeframe.
     Positive = rising, negative = falling. Returns None on error."""
     try:
-        klines = _fetch_klines_sync("BTCUSDT", tf, limit=6)
+        klines = _fetch_klines_sync("BTCUSDT", tf, limit=6, exchange="bybit")
         if not klines or len(klines) < 3:
             return None
         old_close = float(klines[-3]["close"])
