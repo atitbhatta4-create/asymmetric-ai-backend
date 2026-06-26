@@ -148,10 +148,10 @@ def email_trade_opened(to: str, symbol: str, side: str, mode: str,
                 border-radius:14px;padding:16px;">
       <table style="width:100%;border-collapse:collapse;font-size:14px;">
         {''.join(f'<tr><td style="padding:6px 0;color:#6b7280;width:140px;">{k}</td><td style="padding:6px 0;font-weight:900;color:{c};">{v}</td></tr>' for k,v,c in [
-            ("Entry price",   f"${entry:,.4f}",        "#f1f5f9"),
+            ("Entry price",   f"${entry:,.4f}",                    "#f1f5f9"),
             ("Stop loss",     f"${sl:,.4f}  (−{risk_pct:.2f}%)",  "#ff5078"),
             ("Take profit",   f"${tp:,.4f}  (+{reward_pct:.2f}%)", "#00ff9d"),
-            ("Equity",        f"${equity:,.2f} USDT",  "#f1f5f9"),
+            ("Equity",        f"${equity:,.2f} USDT",              "#f1f5f9"),
         ])}
       </table>
     </div>"""
