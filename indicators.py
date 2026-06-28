@@ -901,3 +901,225 @@ def _compute_signal_layers(
         "mtf_size_mult": mtf_size_mult,
     }
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHANGE 4 — Three-state market regime detector
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_market_regime(
+    btc_weekly_candles: List[Dict],
+    current_coin_adx: float,
+    is_parabolic: bool = False,
+) -> tuple:
+    """
+    Classify the global crypto market into one of three regimes using
+    weekly BTC candles and the current coin's ADX.
+
+    Returns:
+        (regime: str, new_is_parabolic: bool)
+
+    regime values:
+        "RANGING"   — ADX too low; sideways market, no trades.
+        "TRENDING"  — Normal directional conditions.
+        "PARABOLIC" — BTC well above 200-week EMA + strong ADX.
+                      Aggressive long-only mode, no ADX ceiling.
+
+    Hysteresis thresholds:
+        Enter PARABOLIC : BTC > 1.55× 200w EMA  AND  ADX > 40
+        Exit  PARABOLIC : BTC < 1.40× 200w EMA  (prevents whipsaw)
+
+    State (is_parabolic) must be stored on the caller (AutoRunner) and
+    passed in each call — never use a function attribute for shared state.
+    """
+    if current_coin_adx is not None and current_coin_adx < 15:
+        return "RANGING", False
+
+    if len(btc_weekly_candles) < 20:
+        return "TRENDING", is_parabolic
+
+    btc_closes = [c["close"] for c in btc_weekly_candles]
+    ema_period = min(200, len(btc_closes) - 1)
+    btc_long_ema_series = _ema(btc_closes, ema_period)
+    if not btc_long_ema_series:
+        return "TRENDING", is_parabolic
+
+    btc_price    = btc_closes[-1]
+    btc_long_ema = btc_long_ema_series[-1]
+    if btc_long_ema <= 0:
+        return "TRENDING", is_parabolic
+
+    ratio = btc_price / btc_long_ema
+
+    if is_parabolic:
+        # Already parabolic — stay until BTC drops below exit threshold
+        if ratio < 1.40:
+            return "TRENDING", False
+        return "PARABOLIC", True
+    else:
+        # Not parabolic — enter only on strong breakout above 200w EMA
+        if ratio > 1.55 and current_coin_adx is not None and current_coin_adx > 40:
+            return "PARABOLIC", True
+        return "TRENDING", False
+
+
+def check_weekly_trend(btc_weekly_candles: List[Dict]) -> str:
+    """
+    Weekly BTC trend direction for SWING trades.
+
+    Both the price position AND EMA slope must agree.
+
+    Returns:
+        "BULLISH"       — price above EMA21 and EMA21 rising → LONG only
+        "BEARISH"       — price below EMA21 and EMA21 falling → SHORT only
+        "TRANSITIONING" — disagreement → block SWING entries
+    """
+    if len(btc_weekly_candles) < 22:
+        return "TRANSITIONING"
+
+    btc_closes = [c["close"] for c in btc_weekly_candles]
+    ema21_series = _ema(btc_closes, 21)
+    if len(ema21_series) < 2:
+        return "TRANSITIONING"
+
+    price_above_ema = btc_closes[-1] > ema21_series[-1]
+    ema_rising      = ema21_series[-1] > ema21_series[-2]
+
+    if price_above_ema and ema_rising:
+        return "BULLISH"
+    if not price_above_ema and not ema_rising:
+        return "BEARISH"
+    return "TRANSITIONING"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHANGE 2 — Pullback entry system
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def check_pullback_entry(
+    candles: List[Dict],
+    signal_direction: str,
+    coin_params: dict,
+    regime: str,
+    candles_since_signal: int,
+    trade_style: str = "DAY_TRADE",
+) -> str:
+    """
+    After a signal fires, wait for price to pull back to EMA9/EMA21
+    before entering.  Prevents chasing extended candles.
+
+    Returns:
+        "ENTER"     — pullback complete, confirmed bounce, enter now
+        "WAIT"      — still waiting for pullback
+        "TIMEOUT"   — too many candles elapsed, cancel signal
+        "IMMEDIATE" — PARABOLIC regime, enter on signal without waiting
+    """
+    if regime == "PARABOLIC":
+        return "IMMEDIATE"
+
+    timeout = 3 if trade_style == "DAY_TRADE" else 5
+    if candles_since_signal >= timeout:
+        return "TIMEOUT"
+
+    closes = [c["close"] for c in candles]
+    ema9_series  = _ema(closes, 9)
+    ema21_series = _ema(closes, 21)
+    if not ema9_series or not ema21_series:
+        return "WAIT"
+
+    ema9  = ema9_series[-1]
+    ema21 = ema21_series[-1]
+    price = closes[-1]
+    tol   = coin_params.get("pullback_tolerance_pct", 0.6) / 100.0
+
+    last_candle = candles[-1]
+    bullish_close = last_candle["close"] > last_candle["open"]
+    bearish_close = last_candle["close"] < last_candle["open"]
+
+    if signal_direction == "LONG":
+        # In uptrend EMA9 > EMA21; wait for price to dip toward EMA9 support
+        support_ema = max(ema9, ema21)
+        distance    = (price - support_ema) / support_ema if support_ema > 0 else 1.0
+        if distance <= tol and bullish_close:
+            return "ENTER"
+
+    elif signal_direction == "SHORT":
+        # In downtrend EMA9 < EMA21; wait for price to bounce toward EMA9 resistance
+        resist_ema = min(ema9, ema21)
+        distance   = (resist_ema - price) / price if price > 0 else 1.0
+        if distance <= tol and bearish_close:
+            return "ENTER"
+
+    return "WAIT"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHANGE 3 — Hour-of-day volume confirmation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def check_volume_hour_confirmed(
+    candles: List[Dict],
+    coin_params: dict,
+) -> tuple:
+    """
+    Volume on the signal candle must exceed the average volume for the
+    same UTC hour across the last 20 occurrences of that hour.
+
+    Prevents false signals during thin off-hours when even small orders
+    can produce inflated volume-ratio readings on a simple 20-candle average.
+
+    Returns:
+        (confirmed: bool, current_vol: float, required_vol: float)
+    """
+    if len(candles) < 3:
+        return True, 0.0, 0.0
+
+    # Use the last completed candle (index -2) to avoid partial-volume bias
+    signal_candle  = candles[-2]
+    current_volume = signal_candle.get("volume", 0.0)
+
+    # UTC hour of the signal candle
+    ts = signal_candle.get("t") or signal_candle.get("timestamp")
+    try:
+        from datetime import datetime, timezone
+        if isinstance(ts, (int, float)):
+            # millisecond timestamp
+            dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+        else:
+            dt = datetime.fromisoformat(str(ts)).replace(tzinfo=timezone.utc)
+        signal_hour = dt.hour
+    except Exception:
+        # Fallback: no hour filter, use simple 20-candle average
+        vols = [c.get("volume", 0.0) for c in candles[-22:-2] if c.get("volume")]
+        avg  = sum(vols) / len(vols) if vols else 0.0
+        req  = avg * coin_params.get("volume_confirmation_mult", 1.2)
+        return current_volume >= req, current_volume, req
+
+    # Find last 20 completed candles at the same UTC hour
+    same_hour = [
+        c for c in candles[-202:-2]
+        if _candle_hour_utc(c) == signal_hour and c.get("volume", 0.0) > 0
+    ][-20:]
+
+    if len(same_hour) < 5:
+        # Not enough history for this hour — fall back to 20-candle median
+        vols = sorted(c.get("volume", 0.0) for c in candles[-22:-2] if c.get("volume"))
+        avg  = vols[len(vols) // 2] if vols else 0.0
+    else:
+        avg = sum(c["volume"] for c in same_hour) / len(same_hour)
+
+    required_mult = coin_params.get("volume_confirmation_mult", 1.2)
+    required      = avg * required_mult
+    return current_volume >= required, current_volume, required
+
+
+def _candle_hour_utc(candle: dict) -> int:
+    """Extract UTC hour from a candle's timestamp field."""
+    ts = candle.get("t") or candle.get("timestamp")
+    try:
+        from datetime import datetime, timezone
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(ts / 1000, tz=timezone.utc).hour
+        return datetime.fromisoformat(str(ts)).replace(tzinfo=timezone.utc).hour
+    except Exception:
+        return -1
+

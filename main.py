@@ -39,7 +39,12 @@ from indicators import (
     _ema, _rsi, _atr, _adx, _rsi_series,
     _session_quality, _ema_spread_trend, _candle_pattern, _rsi_divergence,
     _classify_regime, _compute_signal_layers,
+    get_market_regime, check_weekly_trend,
+    check_pullback_entry, check_volume_hour_confirmed,
 )
+from coin_params import get_coin_params
+from mode_params import get_mode_config, get_style_config
+from data_feeds import _fetch_btc_weekly_candles, _fetch_economic_calendar
 from routes_backtest import backtest_router
 from routes_optimizer import optimizer_router
 from routes_pipeline import pipeline_router
@@ -2925,6 +2930,24 @@ class AutoRunner:
         self.sl_atr_override: Optional[float] = None   # T16 reversal uses 1.5
         self.tp_atr_override: Optional[float] = None   # T16 reversal uses 3.0
         self.market_regime: str = "-"     # Phase 4: TRENDING / MARGINAL / CHOPPY / VOLATILE
+
+        # ── Change 4: Regime detector state ──────────────────────────────────
+        self.is_parabolic: bool = False          # BTC > 1.55× 200w EMA hysteresis flag
+        self.global_regime: str = "TRENDING"     # RANGING / TRENDING / PARABOLIC
+        self._weekly_btc_cache: List[Dict] = []  # cached weekly BTC candles
+        self._weekly_btc_cache_ts: float = 0.0   # unix ts of last weekly fetch
+
+        # ── Change 2: Pullback entry pending state ────────────────────────────
+        self.signal_pending: bool = False         # True = waiting for pullback entry
+        self.signal_direction: str = ""           # "LONG" or "SHORT"
+        self.candles_since_signal: int = 0        # candles elapsed since signal fired
+        self.pending_signal_score: float = 0.0    # original signal score (for logging)
+        self.pending_signal_side: str = ""
+
+        # ── Change 7: Economic calendar cache ────────────────────────────────
+        self._calendar_cache: List[Dict] = []
+        self._calendar_cache_ts: float = 0.0     # unix ts of last calendar fetch
+
         self._last_trade_bad: bool = False
         self._last_holding_log_ts: float = 0.0   # throttle repeated holding logs
         self._last_drawdown_log_ts: float = 0.0  # throttle repeated drawdown tier logs
@@ -4162,6 +4185,54 @@ class AutoRunner:
             self.log(f"Error evaluating trade(s): {e}")
             # On error, leave pending_trades intact — retry next interval
 
+    def _get_weekly_btc_candles(self) -> List[Dict]:
+        """Return cached weekly BTC candles, refreshing every 6 hours."""
+        now_ts = time.time()
+        if not self._weekly_btc_cache or (now_ts - self._weekly_btc_cache_ts) > 21600:
+            candles = _fetch_btc_weekly_candles(limit=210)
+            if candles:
+                self._weekly_btc_cache    = candles
+                self._weekly_btc_cache_ts = now_ts
+        return self._weekly_btc_cache
+
+    def _is_high_impact_event_soon(self) -> tuple:
+        """Check ForexFactory calendar for high-impact events within ±2h.
+        Returns (blocked: bool, event_name: str). Cache refreshes every 6 hours."""
+        now_ts = time.time()
+        if (now_ts - self._calendar_cache_ts) > 21600:
+            data = _fetch_economic_calendar()
+            if data:
+                self._calendar_cache    = data
+                self._calendar_cache_ts = now_ts
+
+        if not self._calendar_cache:
+            return False, ""
+
+        from datetime import datetime, timezone as _tz, timedelta as _td2
+        now_utc     = datetime.now(_tz.utc)
+        win_before  = now_utc + _td2(minutes=120)
+        win_after   = now_utc - _td2(minutes=60)
+
+        _high_titles = {"CPI", "Fed", "FOMC", "GDP", "NFP", "Non-Farm",
+                        "Interest Rate", "Unemployment", "Payroll"}
+
+        for event in self._calendar_cache:
+            if str(event.get("impact", "")).upper() not in ("HIGH", "3"):
+                continue
+            try:
+                ev_dt = datetime.fromisoformat(
+                    str(event.get("date", "")).replace("Z", "+00:00")
+                )
+                if ev_dt.tzinfo is None:
+                    ev_dt = ev_dt.replace(tzinfo=_tz.utc)
+            except Exception:
+                continue
+            if win_after <= ev_dt <= win_before:
+                name = event.get("title") or event.get("name") or "High-impact event"
+                if any(t in name for t in _high_titles):
+                    return True, name
+        return False, ""
+
     def _signal_and_filters(self):
         klines = _fetch_klines_sync(self.symbol, self.tf, limit=260, exchange=self._exchange_id)
         higher_tf = HIGHER_TF_MAP.get(self.tf, "4h")
@@ -4178,11 +4249,117 @@ class AutoRunner:
                 mtf_klines = _fetch_klines_sync(self.symbol, "15m", limit=50, exchange=self._exchange_id)
             except Exception:
                 mtf_klines = []
-        res = _compute_signal_layers(klines, self.mode, self.adaptive_strictness, higher_klines, self.trade_style, mtf_klines, symbol=self.symbol)
+
+        # ── Change 4: Global market regime ───────────────────────────────────
+        _weekly_btc = self._get_weekly_btc_candles()
+        _cur_adx: Optional[float] = None
+        if klines and len(klines) >= 15:
+            from indicators import _adx as _adx_fn
+            _closes = [k["close"] for k in klines]
+            _highs  = [k["high"]  for k in klines]
+            _lows   = [k["low"]   for k in klines]
+            _cur_adx = _adx_fn(_highs, _lows, _closes, 14)
+        self.global_regime, self.is_parabolic = get_market_regime(
+            _weekly_btc, _cur_adx or 0.0, self.is_parabolic
+        )
+
+        # RANGING = no trades at all
+        if self.global_regime == "RANGING":
+            return {
+                "ok": False,
+                "blocked": "REGIME_RANGING: ADX too low — market ranging, no trades",
+                "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+                "side": None, "market_regime": "RANGING",
+            }
+
+        # ── Change 7: Economic calendar block ────────────────────────────────
+        _cal_blocked, _cal_event = self._is_high_impact_event_soon()
+        if _cal_blocked:
+            return {
+                "ok": False,
+                "blocked": f"CALENDAR: High-impact event within 2h — {_cal_event}",
+                "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+                "side": None, "market_regime": self.global_regime,
+            }
+
+        # ── Change 5: Mode/style regime guard ────────────────────────────────
+        _mode_cfg  = get_mode_config(self.mode)
+        _style_cfg = get_style_config(self.trade_style)
+        if self.global_regime not in _mode_cfg["allowed_regimes"]:
+            return {
+                "ok": False,
+                "blocked": f"MODE_REGIME: {self.global_regime} not allowed for {self.mode}",
+                "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+                "side": None, "market_regime": self.global_regime,
+            }
+
+        # ── Change 5: SWING weekly trend filter ──────────────────────────────
+        _weekly_trend: Optional[str] = None
+        _allowed_sides: Optional[List[str]] = None
+        if _style_cfg.get("swing_weekly_filter") and _weekly_btc:
+            _weekly_trend = check_weekly_trend(_weekly_btc)
+            if _weekly_trend == "TRANSITIONING":
+                return {
+                    "ok": False,
+                    "blocked": "SWING_WEEKLY: Weekly trend transitioning — swing entry blocked",
+                    "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+                    "side": None, "market_regime": self.global_regime,
+                }
+            _allowed_sides = (
+                ["LONG"]  if _weekly_trend == "BULLISH"
+                else ["SHORT"] if _weekly_trend == "BEARISH"
+                else None
+            )
+
+        # ── PARABOLIC overrides: loosen score, widen TP, LONG only ───────────
+        _param_overrides = {}
+        if self.global_regime == "PARABOLIC":
+            _cp = get_coin_params(self.symbol)
+            _param_overrides = {
+                "min_score": max(0.35, _cp["score_threshold"] - 0.05),
+            }
+            _allowed_sides = ["LONG"]   # parabolic = bull mania, long only
+
+        res = _compute_signal_layers(
+            klines, self.mode, self.adaptive_strictness,
+            higher_klines, self.trade_style, mtf_klines,
+            param_overrides=_param_overrides if _param_overrides else None,
+            symbol=self.symbol,
+        )
+
+        # Enforce side restriction from weekly filter or parabolic regime
+        if _allowed_sides and res.get("ok") and res.get("side") not in _allowed_sides:
+            return {
+                "ok": False,
+                "blocked": (
+                    f"PARABOLIC_LONG_ONLY: SHORT blocked in parabolic regime"
+                    if self.global_regime == "PARABOLIC"
+                    else f"SWING_WEEKLY_{_weekly_trend}: only {_allowed_sides[0]} allowed"
+                ),
+                "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+                "side": res.get("side"), "market_regime": self.global_regime,
+            }
+
+        # ── Change 3: Hour-of-day volume confirmation ─────────────────────────
+        if res.get("ok") and klines:
+            _cp = get_coin_params(self.symbol)
+            _vol_ok, _vol_curr, _vol_req = check_volume_hour_confirmed(klines, _cp)
+            if not _vol_ok:
+                return {
+                    "ok": False,
+                    "blocked": (
+                        f"VOLUME_HOUR: {_vol_curr:.0f} < required {_vol_req:.0f} "
+                        f"(hour-of-day avg × {_cp['volume_confirmation_mult']}×)"
+                    ),
+                    "signal": "BLOCKED", "score": res.get("score", 0.0),
+                    "breakdown": res.get("breakdown", {}),
+                    "side": res.get("side"), "market_regime": self.global_regime,
+                }
+
         self.last_breakdown = res.get("breakdown", {})
-        self.last_score = res.get("score", 0.0)
-        self.market_grade = res.get("grade", "-")
-        self.signal_type = res.get("signal_type", "NORMAL")
+        self.last_score     = res.get("score", 0.0)
+        self.market_grade   = res.get("grade", "-")
+        self.signal_type    = res.get("signal_type", "NORMAL")
         self.sl_atr_override = res.get("sl_atr_override")
         self.tp_atr_override = res.get("tp_atr_override")
         if res.get("signal_type") == "REVERSAL" and res.get("reversal_log"):
@@ -4191,7 +4368,9 @@ class AutoRunner:
             self.market_regime = res["market_regime"]
         if res.get("atr_pct"):
             self.last_atr_pct = res["atr_pct"]
-        slope_pct = res.get("htf_bear_slope_pct")
+        # Attach regime info for the caller
+        res["global_regime"]  = self.global_regime
+        res["weekly_trend"]   = _weekly_trend
         return res
 
     def _secs_until_dubai_midnight(self) -> int:
@@ -4847,6 +5026,13 @@ class AutoRunner:
                 if res.get("side"):
                     self.last_side = res["side"]
                 if not res.get("ok"):
+                    # Cancel any pending pullback signal — conditions changed
+                    if self.signal_pending:
+                        self.log(f"Pending {self.pending_signal_side} signal cancelled — conditions no longer met.")
+                        self.signal_pending = False
+                        self.pending_signal_side = ""
+                        self.pending_signal_score = 0.0
+                        self.candles_since_signal = 0
                     self.blocked_reason = res.get("blocked") or "BLOCKED"
                     _side_lbl = res.get("side", "?")
                     _score_lbl = f"{res.get('score', 0.0):.2f}"
@@ -4858,6 +5044,65 @@ class AutoRunner:
 
                 self.blocked_reason = None
                 desired_side: Side = res["side"]
+
+                # ── Step 3b: Pullback entry gate (Change 2) ──────────────────
+                _style_cfg_pb = get_style_config(self.trade_style)
+
+                if not self.signal_pending:
+                    # First candle where signal is valid — arm pending state
+                    self.signal_pending = True
+                    self.pending_signal_side = desired_side
+                    self.pending_signal_score = res.get("score", 0.0)
+                    self.candles_since_signal = 0
+                    self.log(
+                        f"Signal armed — {desired_side} score={self.pending_signal_score:.2f}"
+                        + (" | entering immediately (pullback disabled)" if not _style_cfg_pb.get("pullback_required") else " | awaiting pullback")
+                    )
+                elif self.pending_signal_side != desired_side:
+                    # Direction flipped — re-arm from this candle
+                    self.log(f"Direction changed {self.pending_signal_side}→{desired_side} — re-arming signal.")
+                    self.pending_signal_side = desired_side
+                    self.pending_signal_score = res.get("score", 0.0)
+                    self.candles_since_signal = 0
+
+                self.candles_since_signal += 1
+
+                if _style_cfg_pb.get("pullback_required", True):
+                    _pb_klines = _fetch_klines_sync(self.symbol, self.tf, limit=50, exchange=self._exchange_id)
+                    _cp_pb = get_coin_params(self.symbol)
+                    _pb_result = check_pullback_entry(
+                        _pb_klines, self.pending_signal_side, _cp_pb,
+                        self.global_regime, self.candles_since_signal,
+                        trade_style=self.trade_style,
+                    )
+
+                    if _pb_result == "TIMEOUT":
+                        _max_c = _style_cfg_pb.get("pullback_timeout", 3)
+                        self.log(
+                            f"Signal expired — no pullback after {self.candles_since_signal}/{_max_c} candles "
+                            f"({self.pending_signal_side}). Waiting for next setup."
+                        )
+                        self.signal_pending = False
+                        self.pending_signal_side = ""
+                        self.pending_signal_score = 0.0
+                        self.candles_since_signal = 0
+                        continue
+
+                    if _pb_result == "WAIT":
+                        _max_c = _style_cfg_pb.get("pullback_timeout", 3)
+                        self.log(f"Pullback wait [{self.candles_since_signal}/{_max_c}] — {self.pending_signal_side} | price not yet at EMA")
+                        continue
+
+                    # ENTER or IMMEDIATE — confirmed, proceed to trade
+                    if _pb_result == "ENTER":
+                        self.log(f"Pullback confirmed — entering {self.pending_signal_side} (score={self.pending_signal_score:.2f})")
+
+                # Confirmed entry — clear pending state and lock in direction
+                desired_side = self.pending_signal_side
+                self.signal_pending = False
+                self.pending_signal_side = ""
+                self.pending_signal_score = 0.0
+                self.candles_since_signal = 0
 
                 now_ts = time.time()
                 # After a bad trade wait 2× the normal cooldown before entering again
@@ -5398,6 +5643,8 @@ def _resume_watchdog() -> None:
 # =========================
 # TRADING QUALITY HELPERS
 # =========================
+# _fetch_btc_weekly_candles and _fetch_economic_calendar live in data_feeds.py
+# (imported at top). Kept here: momentum + funding helpers used by AutoRunner.
 
 def _get_btc_momentum(tf: str) -> Optional[float]:
     """BTC % change over last 3 closed candles on given timeframe.
