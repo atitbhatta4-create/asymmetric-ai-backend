@@ -4223,8 +4223,15 @@ class AutoRunner:
                 )
                 self.log(f"Midnight reset (sleep path) — strictness stepped down to {self.adaptive_strictness:.2f}x")
             self.strictness_day_key = dubai_day_key()
-            # Reload counters from DB and resume
-            self.trades_today, self.bad_trades_today = self._load_today_stats()
+            # Reset counters unconditionally — we just slept through midnight so
+            # no new-day trades exist yet.  Do NOT call _load_today_stats() here:
+            # the sleep loop can exit a split-second before midnight flips, making
+            # now_dubai() still return the old day and counting yesterday's trades
+            # as today's.  That stale count then prevents _reset_if_new_day() from
+            # correcting it (keys match), so the daily limit fires on the first
+            # candle of the new day even though zero trades have been placed.
+            self.trades_today = 0
+            self.bad_trades_today = 0
             self.day_key = dubai_day_key()
             self._last_trade_bad = False
             self.last_trade_ts = time.time()
