@@ -138,6 +138,7 @@ def _sim_one(
     score_delta: float,
     sl_mult: float,
     tp_mult: float,
+    symbol: str = "BTCUSDT",
 ) -> Optional[Dict]:
     """
     Run one simulation pass with the given parameter offsets.
@@ -210,6 +211,7 @@ def _sim_one(
             sig = _compute_signal_layers(
                 klines, mode, 1.0, higher_slice, style, None,
                 param_overrides=param_overrides,
+                symbol=symbol,
             )
             if not sig.get("ok"):
                 continue
@@ -325,6 +327,7 @@ def _run_opt_worker(
                 main_candles, higher_candles,
                 mode, style, exchange, start_equity,
                 adx_d, score_d, sl_m, tp_m,
+                symbol=symbol,
             )
             if metrics:
                 wr = metrics.get("win_rate", 0) / 100

@@ -712,7 +712,7 @@ def _run_worker(
                     continue  # SCALP dead-zone block
 
                 sig = _compute_signal_layers(klines, mode, 1.0, higher_slice, style, mtf_slice,
-                                            enable_t16=enable_t16, enable_s4=enable_s4)
+                                            enable_t16=enable_t16, enable_s4=enable_s4, symbol=symbol)
 
                 if sig.get("ok"):
                     side          = sig["side"]

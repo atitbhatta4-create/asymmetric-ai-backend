@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Literal
 from config import now_dubai
+from coin_params import get_coin_params
 
 RiskMode = Literal["ULTRA_SAFE", "SAFE", "NORMAL", "MINI_ASYM", "AGGRESSIVE"]
 
@@ -428,6 +429,7 @@ def _compute_signal_layers(
     param_overrides: Optional[Dict] = None,
     enable_t16: bool = True,
     enable_s4: bool = False,
+    symbol: str = "BTCUSDT",
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -509,6 +511,30 @@ def _compute_signal_layers(
 
     # Apply adaptive strictness for MINI_ASYM
     p = MODE_SIGNAL_PARAMS.get(mode, MODE_SIGNAL_PARAMS["NORMAL"]).copy()
+
+    # ── Per-coin parameter overrides ─────────────────────────────────────────
+    # Layered on top of mode params: coin-specific ADX range, score threshold,
+    # ATR bounds, TP/SL geometry, and volume multiplier.  Mode params set the
+    # baseline strictness; coin params tighten or loosen per-asset behaviour.
+    _cp = get_coin_params(symbol)
+    # adx_min: use the HIGHER of mode baseline and coin minimum (both must agree)
+    p["adx_min"]    = max(p["adx_min"],    _cp["adx_min"])
+    # adx_max: hard ceiling — very high ADX means parabolic / exhaustion
+    p["adx_max"]    = _cp["adx_max"]
+    # ATR bounds from coin (coin volatility profile overrides mode defaults)
+    p["atr_min"]    = max(p["atr_min"],    _cp["atr_min_pct"] / 100.0)
+    p["atr_max"]    = min(p["atr_max"],    _cp["atr_max_pct"] / 100.0)
+    # Score threshold: use the HIGHER of mode and coin (stricter wins)
+    p["min_score"]  = max(p["min_score"],  _cp["score_threshold"])
+    # Volume multiplier: coin-specific liquidity profile
+    p["vol_factor"] = max(p["vol_factor"], _cp["volume_confirmation_mult"])
+    # Pullback tolerance: coin-specific EMA proximity requirement
+    p["pullback_max"] = max(p["pullback_max"], _cp["pullback_tolerance_pct"] / 100.0)
+    # Store TP/SL multipliers for use by the caller
+    p["tp_multiplier"] = _cp["tp_multiplier"]
+    p["sl_multiplier"] = _cp["sl_multiplier"]
+    p["ema_distance_max"] = _cp["ema_distance_max_pct"] / 100.0
+
     if param_overrides:
         p.update({k: v for k, v in param_overrides.items() if k in p})
         # Delta keys: optimizer passes offsets, not absolute replacements

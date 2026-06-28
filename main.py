@@ -4178,7 +4178,7 @@ class AutoRunner:
                 mtf_klines = _fetch_klines_sync(self.symbol, "15m", limit=50, exchange=self._exchange_id)
             except Exception:
                 mtf_klines = []
-        res = _compute_signal_layers(klines, self.mode, self.adaptive_strictness, higher_klines, self.trade_style, mtf_klines)
+        res = _compute_signal_layers(klines, self.mode, self.adaptive_strictness, higher_klines, self.trade_style, mtf_klines, symbol=self.symbol)
         self.last_breakdown = res.get("breakdown", {})
         self.last_score = res.get("score", 0.0)
         self.market_grade = res.get("grade", "-")
