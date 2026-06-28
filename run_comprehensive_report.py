@@ -26,8 +26,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import httpx
 from config import TRADE_STYLE_PARAMS, DUBAI_TZ
-from indicators import _compute_signal_layers, MODE_SIGNAL_PARAMS
+from indicators import (
+    _compute_signal_layers, _adx as _adx_fn, MODE_SIGNAL_PARAMS,
+    get_market_regime, check_weekly_trend,
+    check_pullback_entry, check_volume_hour_confirmed,
+)
 import indicators as _ind_mod
+from coin_params import get_coin_params
+from mode_params import get_mode_config, get_style_config
 from optimizer import OPT_GRID, MIN_TRADES, _sim_one
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -63,9 +69,9 @@ MONTHS_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov
 EXCHANGE     = "bybit"
 START_EQUITY = 1000.0
 DATE_FROM    = "2020-01-01"
-DATE_TO      = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-START_MS     = int(datetime(2020,1,1,tzinfo=timezone.utc).timestamp()*1000)
-END_MS       = int(datetime.now(timezone.utc).timestamp()*1000)
+DATE_TO      = "2026-05-31"
+START_MS     = int(datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+END_MS       = int(datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp() * 1000)
 ALL_YEARS    = [str(y) for y in range(2020, datetime.now().year+1)]
 PDF_OUT        = os.path.join(os.path.dirname(__file__),"asymmetric_ai_comprehensive_report.pdf")
 RESULTS_JSON   = os.path.join(os.path.dirname(__file__),"comprehensive_results.json")
@@ -80,7 +86,7 @@ MODE_PRESETS = {
     "AGGRESSIVE":{"size":0.85,"leverage":8},
 }
 WARMUP = 240
-TF_BN  = {"1h":"1h","4h":"4h","1d":"1d"}
+TF_BN  = {"1h":"1h","4h":"4h","1d":"1d","1W":"1w"}
 FEE    = {"maker":0.00020,"taker":0.00055,"slip":0.00025}
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -314,13 +320,19 @@ def calc_metrics(trades:List[Dict], curve:List[Dict], bh_in:float, bh_out:float)
 #  BACKTEST ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════
 def run_backtest(sym:str, label:str, mode:str, style:str,
-                 main_c:List[Dict], higher_c:List[Dict])->Optional[Dict]:
+                 main_c:List[Dict], higher_c:List[Dict],
+                 btc_weekly_c:List[Dict]=None)->Optional[Dict]:
     if len(main_c)<WARMUP+10: return None
     st=TRADE_STYLE_PARAMS[style]; c=MODE_PRESETS[mode]
     tf=STYLE_CFG[style]["main_tf"]
+    mode_cfg=get_mode_config(mode); style_cfg=get_style_config(style)
+    coin_p=get_coin_params(sym)
     equity=START_EQUITY; peak=START_EQUITY
     trades:List[Dict]=[]; curve=[{"ts":main_c[WARMUP]["t"],"equity":equity}]
     open_t=None; t0=time.time()
+    btc_wk=btc_weekly_c or []
+    # Regime + pullback state
+    is_parabolic=False; sig_pending=False; pending_side=""; candles_since=0
     _orig=_ind_mod._session_quality; _ind_mod._session_quality=_sess_hist
     try:
         for i in range(WARMUP,len(main_c)):
@@ -335,23 +347,87 @@ def run_backtest(sym:str, label:str, mode:str, style:str,
                     curve.append({"ts":res["exit_ts"],"equity":round(equity,4)}); open_t=None
             dd=(peak-equity)/peak if peak>0 else 0
             if dd>=0.15: break
-            if open_t is None:
-                _BT_TS[0]=candle["t"]
-                klines=main_c[max(0,i-299):i+1]
-                h_sl=aligned_slice(higher_c,candle["t"],100)
-                sig=_compute_signal_layers(klines,mode,1.0,h_sl,style,None)
-                if not sig.get("ok"): continue
-                grade=sig.get("grade","B"); atr=sig.get("atr_pct",ATR_BASELINE.get(tf,0.009))
-                sl_pct=min(atr*st["sl_atr"],st["sl_max"]/100)
-                tp_pct=min(atr*st["tp_atr"],st["tp_max"]/100)
-                bl=ATR_BASELINE.get(tf,0.009); vol_m=max(0.4,1/(atr/bl)) if atr/bl>1.5 else 1.0
-                dd_pct=(peak-equity)/peak if peak>0 else 0
-                dd_m=0.25 if dd_pct>=0.10 else 0.40 if dd_pct>=0.07 else 0.65 if dd_pct>=0.04 else 1.0
-                eff=c["size"]*vol_m*dd_m
-                open_t={"entry":candle["close"],"side":sig["side"],"grade":grade,
-                        "sl_pct":sl_pct,"tp_pct":tp_pct,"eff_size":eff,"leverage":c["leverage"],
-                        "equity_at_open":equity,"t1_size":eff*0.60,"t2_size":eff*0.40,
-                        "t1_done":False,"be":False,"be_next":False,"acc":0.0,"open_ts":candle["t"]}
+            if open_t is not None: continue
+            _BT_TS[0]=candle["t"]
+            klines=main_c[max(0,i-299):i+1]
+            h_sl=aligned_slice(higher_c,candle["t"],100)
+
+            # ── Regime detection ──────────────────────────────────────────
+            regime="TRENDING"
+            if btc_wk:
+                wk_sl=aligned_slice(btc_wk,candle["t"],210)
+                cur_adx=0.0
+                if len(klines)>=15:
+                    try:
+                        cur_adx=_adx_fn([k["high"] for k in klines],[k["low"] for k in klines],
+                                        [k["close"] for k in klines],14) or 0.0
+                    except Exception: cur_adx=0.0
+                regime,is_parabolic=get_market_regime(wk_sl,cur_adx,is_parabolic)
+            if regime=="RANGING":
+                if sig_pending: sig_pending=False; pending_side=""; candles_since=0
+                continue
+            if regime not in mode_cfg["allowed_regimes"]:
+                if sig_pending: sig_pending=False; pending_side=""; candles_since=0
+                continue
+
+            # ── SWING weekly trend filter ─────────────────────────────────
+            _allowed_sides=None
+            if style_cfg.get("swing_weekly_filter") and btc_wk:
+                wk_sl=aligned_slice(btc_wk,candle["t"],210)
+                wt=check_weekly_trend(wk_sl)
+                if wt=="TRANSITIONING":
+                    if sig_pending: sig_pending=False; pending_side=""; candles_since=0
+                    continue
+                _allowed_sides=["LONG"] if wt=="BULLISH" else ["SHORT"] if wt=="BEARISH" else None
+
+            # ── PARABOLIC overrides ───────────────────────────────────────
+            _param_ov={}
+            if regime=="PARABOLIC":
+                _param_ov={"min_score":max(0.35,coin_p["score_threshold"]-0.05)}
+                _allowed_sides=["LONG"]
+
+            sig=_compute_signal_layers(klines,mode,1.0,h_sl,style,None,
+                                       param_overrides=_param_ov if _param_ov else None,
+                                       symbol=sym)
+            if _allowed_sides and sig.get("ok") and sig.get("side") not in _allowed_sides:
+                sig["ok"]=False
+
+            # ── Volume hour confirmation ──────────────────────────────────
+            if sig.get("ok"):
+                vol_ok,_,_=check_volume_hour_confirmed(klines,coin_p)
+                if not vol_ok: sig["ok"]=False
+
+            if not sig.get("ok"):
+                if sig_pending: sig_pending=False; pending_side=""; candles_since=0
+                continue
+
+            desired_side=sig["side"]
+            # ── Pullback entry gate ───────────────────────────────────────
+            if not sig_pending:
+                sig_pending=True; pending_side=desired_side; candles_since=0
+            elif pending_side!=desired_side:
+                pending_side=desired_side; candles_since=0
+            candles_since+=1
+            if style_cfg.get("pullback_required",True):
+                pb=check_pullback_entry(klines,pending_side,coin_p,regime,candles_since,style)
+                if pb=="TIMEOUT":
+                    sig_pending=False; pending_side=""; candles_since=0; continue
+                if pb=="WAIT": continue
+            desired_side=pending_side
+            sig_pending=False; pending_side=""; candles_since=0
+
+            grade=sig.get("grade","B"); atr=sig.get("atr_pct",ATR_BASELINE.get(tf,0.009))
+            sl_pct=min(atr*st["sl_atr"],st["sl_max"]/100)
+            tp_pct=min(atr*st["tp_atr"],st["tp_max"]/100)
+            bl=ATR_BASELINE.get(tf,0.009); vol_m=max(0.4,1/(atr/bl)) if atr/bl>1.5 else 1.0
+            dd_pct=(peak-equity)/peak if peak>0 else 0
+            dd_m=0.25 if dd_pct>=0.10 else 0.40 if dd_pct>=0.07 else 0.65 if dd_pct>=0.04 else 1.0
+            mode_sm=mode_cfg.get("position_size_mult",1.0)
+            eff=c["size"]*vol_m*dd_m*mode_sm
+            open_t={"entry":candle["close"],"side":desired_side,"grade":grade,
+                    "sl_pct":sl_pct,"tp_pct":tp_pct,"eff_size":eff,"leverage":c["leverage"],
+                    "equity_at_open":equity,"t1_size":eff*0.60,"t2_size":eff*0.40,
+                    "t1_done":False,"be":False,"be_next":False,"acc":0.0,"open_ts":candle["t"]}
     finally:
         _ind_mod._session_quality=_orig
     m=calc_metrics(trades,curve,main_c[WARMUP]["close"],main_c[-1]["close"])
@@ -362,7 +438,8 @@ def run_backtest(sym:str, label:str, mode:str, style:str,
 #  OPTIMIZER
 # ═══════════════════════════════════════════════════════════════════════════════
 def run_optimizer(sym:str, mode:str, style:str,
-                  main_c:List[Dict], higher_c:List[Dict])->Optional[Dict]:
+                  main_c:List[Dict], higher_c:List[Dict],
+                  btc_weekly_c:List[Dict]=None)->Optional[Dict]:
     if len(main_c)<WARMUP+10: return None
     combos=list(itertools.product(OPT_GRID["adx_delta"],OPT_GRID["score_delta"],
                                    OPT_GRID["sl_mult"],OPT_GRID["tp_mult"]))
@@ -370,7 +447,8 @@ def run_optimizer(sym:str, mode:str, style:str,
     _ind_mod._session_quality=lambda _:(1.0,"opt-bt")
     try:
         for adx_d,sc_d,sl_m,tp_m in combos:
-            m=_sim_one(main_c,higher_c,mode,style,EXCHANGE,START_EQUITY,adx_d,sc_d,sl_m,tp_m)
+            m=_sim_one(main_c,higher_c,mode,style,EXCHANGE,START_EQUITY,adx_d,sc_d,sl_m,tp_m,
+                       symbol=sym,btc_weekly_candles=btc_weekly_c or [])
             if m:
                 wr=m.get("win_rate",0)/100; dd=abs(m.get("max_drawdown_pct",0))/100
                 passed=(m.get("total_trades",0)>=MIN_TRADES and wr>=0.25 and dd<=0.25)
@@ -849,6 +927,16 @@ def run_full(progress_cb=None) -> bytes:
         fetch_and_cache_coin(sym)
         gc.collect()
 
+    # Fetch BTC weekly candles once — shared for regime + weekly trend detection
+    print("[run_full] Fetching BTC weekly candles for regime detection...")
+    _btc_wk_cache: Dict = {}
+    btc_weekly_c: List[Dict] = []
+    try:
+        btc_weekly_c = get_candles("BTCUSDT", "1W", _btc_wk_cache)
+        print(f"[run_full] BTC weekly: {len(btc_weekly_c)} candles ready")
+    except Exception as _e:
+        print(f"[run_full] BTC weekly fetch failed ({_e}) — regime defaults to TRENDING")
+
     results:Dict[str,Dict[str,Dict[str,Dict]]]={s:{m:{} for m in MODES} for s in STYLES}
     done=0; total=len(STYLES)*len(MODES)*len(COINS)
 
@@ -872,14 +960,14 @@ def run_full(progress_cb=None) -> bytes:
                 print(f"  [{done}/{total}] {label} | {mode} | {style}")
                 bt=None
                 try:
-                    bt=run_backtest(sym,label,mode,style,mc,hc)
+                    bt=run_backtest(sym,label,mode,style,mc,hc,btc_weekly_c)
                 except Exception as e:
                     print(f"    BT ERROR: {e}")
                 opt=None
                 bt_trades=bt["total_trades"] if bt else 0
                 if bt_trades>=5:
                     try:
-                        opt=run_optimizer(sym,mode,style,mc,hc)
+                        opt=run_optimizer(sym,mode,style,mc,hc,btc_weekly_c)
                     except Exception as e:
                         print(f"    OPT ERROR: {e}")
                 else:
@@ -920,6 +1008,15 @@ def main():
         gc.collect()
     print("[DATA] All candles cached to disk.\n")
 
+    print("[DATA] Fetching BTC weekly candles for regime detection...")
+    _btc_wk_cache2: Dict = {}
+    btc_weekly_c: List[Dict] = []
+    try:
+        btc_weekly_c = get_candles("BTCUSDT", "1W", _btc_wk_cache2)
+        print(f"[DATA] BTC weekly: {len(btc_weekly_c)} candles ready\n")
+    except Exception as _e:
+        print(f"[DATA] BTC weekly fetch failed ({_e}) — regime defaults to TRENDING\n")
+
     results:Dict[str,Dict[str,Dict[str,Dict]]]={s:{m:{} for m in MODES} for s in STYLES}
     grand_t0=time.time(); done=0; total=len(STYLES)*len(MODES)*len(COINS)
 
@@ -947,7 +1044,7 @@ def main():
 
                 bt=None
                 try:
-                    bt=run_backtest(sym,label,mode,style,mc,hc)
+                    bt=run_backtest(sym,label,mode,style,mc,hc,btc_weekly_c)
                 except Exception as e:
                     print(f"    BT: ERROR — {e}")
                 if bt:
@@ -966,7 +1063,7 @@ def main():
                     print(f"    OPT ...",end="",flush=True)
                     opt_t0=time.time()
                     try:
-                        opt=run_optimizer(sym,mode,style,mc,hc)
+                        opt=run_optimizer(sym,mode,style,mc,hc,btc_weekly_c)
                     except Exception as e:
                         print(f" ERROR — {e}")
                     bp=opt["best"] if opt and opt.get("best") else None

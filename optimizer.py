@@ -30,7 +30,12 @@ from backtester import (
 )
 from config import HIGHER_TF_MAP, TRADE_STYLE_PARAMS
 from database import USING_PG, db_conn, serial_pk
-from indicators import _compute_signal_layers
+from indicators import (
+    _compute_signal_layers, _adx as _adx_fn,
+    get_market_regime, check_pullback_entry, check_volume_hour_confirmed,
+)
+from coin_params import get_coin_params
+from mode_params import get_mode_config, get_style_config
 
 # ── Parameter search grid ───────────────────────────────────────────────────────
 # Offsets are applied ON TOP of the mode's default values.
@@ -139,6 +144,7 @@ def _sim_one(
     sl_mult: float,
     tp_mult: float,
     symbol: str = "BTCUSDT",
+    btc_weekly_candles: List[Dict] = None,
 ) -> Optional[Dict]:
     """
     Run one simulation pass with the given parameter offsets.
@@ -148,14 +154,6 @@ def _sim_one(
     c  = MODE_PRESETS[mode]
     tf = TF_FROM_STYLE[style]
 
-    # Build signal param overrides — deltas on top of mode defaults
-    signal_overrides = {
-        "adx_min_delta":   adx_delta,    # handled inside _compute_signal_layers
-        "score_min_delta": score_delta,  # handled inside _compute_signal_layers
-    }
-    # We pass explicit absolute values so _compute_signal_layers doesn't need
-    # delta logic. Instead we compute absolute values here and pass them.
-    # These keys match MODE_SIGNAL_PARAMS — they override BEFORE style adjustments.
     from indicators import MODE_SIGNAL_PARAMS
     base = MODE_SIGNAL_PARAMS.get(mode, MODE_SIGNAL_PARAMS["NORMAL"])
     param_overrides = {
@@ -163,12 +161,22 @@ def _sim_one(
         "min_score": max(0.40, min(0.92, base["min_score"] + score_delta)),
     }
 
+    mode_cfg  = get_mode_config(mode)
+    style_cfg = get_style_config(style)
+    coin_p    = get_coin_params(symbol)
+    btc_wk    = btc_weekly_candles or []
+
     equity      = start_equity
     peak_equity = start_equity
     trades:       List[Dict] = []
     equity_curve: List[Dict] = [{"ts": main_candles[WARMUP_CANDLES]["t"], "equity": equity}]
     open_trade: Optional[Dict] = None
-    total_candles = len(main_candles) - WARMUP_CANDLES
+
+    # Regime + pullback state
+    is_parabolic = False
+    sig_pending  = False
+    pending_side = ""
+    candles_since = 0
 
     for i in range(WARMUP_CANDLES, len(main_candles)):
         candle = main_candles[i]
@@ -195,67 +203,129 @@ def _sim_one(
                 open_trade = None
 
         # Hard floor
-        drawdown = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0.0
-        if drawdown >= 0.15:
+        if (peak_equity - equity) / peak_equity >= 0.15:
             break
 
-        # Entry check
-        if open_trade is None:
-            hist_sess = _session_quality_for_ts(style, candle["t"])
-            if hist_sess == 0.0:
+        if open_trade is not None:
+            continue
+
+        hist_sess = _session_quality_for_ts(style, candle["t"])
+        if hist_sess == 0.0:
+            continue
+
+        klines       = main_candles[max(0, i - 299): i + 1]
+        higher_slice = _get_aligned_slice(higher_candles, candle["t"], 100)
+
+        # ── Regime detection ──────────────────────────────────────────
+        regime = "TRENDING"
+        if btc_wk:
+            wk_sl = _get_aligned_slice(btc_wk, candle["t"], 210)
+            cur_adx = 0.0
+            if len(klines) >= 15:
+                try:
+                    cur_adx = _adx_fn(
+                        [k["high"]  for k in klines],
+                        [k["low"]   for k in klines],
+                        [k["close"] for k in klines], 14,
+                    ) or 0.0
+                except Exception:
+                    cur_adx = 0.0
+            regime, is_parabolic = get_market_regime(wk_sl, cur_adx, is_parabolic)
+
+        if regime == "RANGING" or regime not in mode_cfg["allowed_regimes"]:
+            if sig_pending: sig_pending = False; pending_side = ""; candles_since = 0
+            continue
+
+        # PARABOLIC overrides
+        _po = {}
+        _allowed_sides = None
+        if regime == "PARABOLIC":
+            _po = {"min_score": max(0.35, coin_p["score_threshold"] - 0.05)}
+            _allowed_sides = ["LONG"]
+
+        # Merge optimizer param overrides with parabolic overrides
+        merged_overrides = {**param_overrides, **_po}
+
+        sig = _compute_signal_layers(
+            klines, mode, 1.0, higher_slice, style, None,
+            param_overrides=merged_overrides,
+            symbol=symbol,
+        )
+
+        if _allowed_sides and sig.get("ok") and sig.get("side") not in _allowed_sides:
+            sig["ok"] = False
+
+        # ── Volume hour confirmation ──────────────────────────────────
+        if sig.get("ok"):
+            vol_ok, _, _ = check_volume_hour_confirmed(klines, coin_p)
+            if not vol_ok:
+                sig["ok"] = False
+
+        if not sig.get("ok"):
+            if sig_pending: sig_pending = False; pending_side = ""; candles_since = 0
+            continue
+
+        desired_side = sig["side"]
+
+        # ── Pullback entry gate ───────────────────────────────────────
+        if not sig_pending:
+            sig_pending = True; pending_side = desired_side; candles_since = 0
+        elif pending_side != desired_side:
+            pending_side = desired_side; candles_since = 0
+        candles_since += 1
+
+        if style_cfg.get("pullback_required", True):
+            pb = check_pullback_entry(klines, pending_side, coin_p, regime, candles_since, style)
+            if pb == "TIMEOUT":
+                sig_pending = False; pending_side = ""; candles_since = 0
+                continue
+            if pb == "WAIT":
                 continue
 
-            klines       = main_candles[max(0, i - 299): i + 1]
-            higher_slice = _get_aligned_slice(higher_candles, candle["t"], 100)
+        desired_side  = pending_side
+        sig_pending   = False; pending_side = ""; candles_since = 0
 
-            sig = _compute_signal_layers(
-                klines, mode, 1.0, higher_slice, style, None,
-                param_overrides=param_overrides,
-                symbol=symbol,
-            )
-            if not sig.get("ok"):
-                continue
+        side  = desired_side
+        grade = sig.get("grade", "B")
+        atr_pct       = sig.get("atr_pct", ATR_BASELINE.get(tf, 0.009))
+        mtf_size_mult = sig.get("mtf_size_mult", 1.0)
 
-            side  = sig["side"]
-            grade = sig.get("grade", "B")
-            atr_pct       = sig.get("atr_pct", ATR_BASELINE.get(tf, 0.009))
-            mtf_size_mult = sig.get("mtf_size_mult", 1.0)
+        sl_pct = min(atr_pct * st["sl_atr"] * sl_mult, st["sl_max"] / 100)
+        tp_pct = min(atr_pct * st["tp_atr"] * tp_mult, st["tp_max"] / 100)
 
-            sl_pct = min(atr_pct * st["sl_atr"] * sl_mult, st["sl_max"] / 100)
-            tp_pct = min(atr_pct * st["tp_atr"] * tp_mult, st["tp_max"] / 100)
+        baseline  = ATR_BASELINE.get(tf, 0.009)
+        vol_ratio = atr_pct / baseline if baseline > 0 else 1.0
+        vol_mult  = max(0.4, 1.0 / vol_ratio) if vol_ratio > 1.5 else 1.0
 
-            baseline  = ATR_BASELINE.get(tf, 0.009)
-            vol_ratio = atr_pct / baseline if baseline > 0 else 1.0
-            vol_mult  = max(0.4, 1.0 / vol_ratio) if vol_ratio > 1.5 else 1.0
+        dd_pct = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0.0
+        dd_mult = (
+            0.25 if dd_pct >= 0.10 else
+            0.40 if dd_pct >= 0.07 else
+            0.65 if dd_pct >= 0.04 else 1.0
+        )
 
-            dd_pct = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0.0
-            dd_mult = (
-                0.25 if dd_pct >= 0.10 else
-                0.40 if dd_pct >= 0.07 else
-                0.65 if dd_pct >= 0.04 else 1.0
-            )
+        mode_sm        = mode_cfg.get("position_size_mult", 1.0)
+        effective_size = c["size"] * mtf_size_mult * vol_mult * dd_mult * mode_sm
 
-            effective_size = c["size"] * mtf_size_mult * vol_mult * dd_mult
-
-            open_trade = {
-                "entry":              candle["close"],
-                "side":               side,
-                "grade":              grade,
-                "sl_pct":             sl_pct,
-                "tp_pct":             tp_pct,
-                "effective_size":     effective_size,
-                "leverage":           c["leverage"],
-                "equity_at_open":     equity,
-                "t1_size":            effective_size * 0.60,
-                "t2_size":            effective_size * 0.40,
-                "t1_done":            False,
-                "t2_sl_is_breakeven": False,
-                "accumulated_pnl":    0.0,
-                "open_ts":            candle["t"],
-                "signal":             sig.get("signal", "-"),
-                "score":              round(sig.get("score", 0.0), 3),
-                "regime":             sig.get("market_regime", "-"),
-            }
+        open_trade = {
+            "entry":              candle["close"],
+            "side":               side,
+            "grade":              grade,
+            "sl_pct":             sl_pct,
+            "tp_pct":             tp_pct,
+            "effective_size":     effective_size,
+            "leverage":           c["leverage"],
+            "equity_at_open":     equity,
+            "t1_size":            effective_size * 0.60,
+            "t2_size":            effective_size * 0.40,
+            "t1_done":            False,
+            "t2_sl_is_breakeven": False,
+            "accumulated_pnl":    0.0,
+            "open_ts":            candle["t"],
+            "signal":             sig.get("signal", "-"),
+            "score":              round(sig.get("score", 0.0), 3),
+            "regime":             regime,
+        }
 
     if len(trades) < MIN_TRADES:
         return None
