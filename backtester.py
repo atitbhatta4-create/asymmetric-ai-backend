@@ -25,7 +25,13 @@ import httpx
 
 from config import DUBAI_TZ, HIGHER_TF_MAP, OKX_BASE, OKX_TF_MAP, TRADE_STYLE_PARAMS
 from database import db_conn, serial_pk, USING_PG
-from indicators import _atr, _compute_signal_layers
+from indicators import (
+    _atr, _adx, _compute_signal_layers,
+    get_market_regime, check_weekly_trend,
+    check_pullback_entry, check_volume_hour_confirmed,
+)
+from coin_params import get_coin_params
+from mode_params import get_mode_config, get_style_config
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 WARMUP_CANDLES = 240  # extra buffer above the 220-candle minimum in indicators.py
@@ -627,10 +633,25 @@ def _run_worker(
 
         _set("fetching", 60)
         higher_candles = _ensure_candles(symbol, higher_tf, start_ms, end_ms,
-                                         on_progress=_fetch_cb(60, 75, higher_tf))
+                                         on_progress=_fetch_cb(60, 73, higher_tf))
         mtf_candles: List[Dict] = []
 
+        # ── Fetch BTC weekly candles for regime + weekly trend detection ──
+        # Extend range back by 210 weeks so the warmup period has enough history.
+        btc_weekly_start_ms = start_ms - 210 * 7 * 24 * 3600 * 1000
+        btc_weekly_candles: List[Dict] = []
+        try:
+            btc_weekly_candles = _ensure_candles(
+                "BTCUSDT", "1W", btc_weekly_start_ms, end_ms,
+                on_progress=_fetch_cb(73, 75, "1W"),
+            )
+        except Exception:
+            btc_weekly_candles = []  # degrade to TRENDING if fetch fails
+
         _set("running", 75)
+
+        _mode_cfg  = get_mode_config(mode)
+        _style_cfg = get_style_config(style)
 
         # ── 2. Simulation loop ─────────────────────────────────────────────
         st = TRADE_STYLE_PARAMS[style]
@@ -643,6 +664,13 @@ def _run_worker(
 
         open_trade: Optional[Dict] = None
         total_candles = len(main_candles) - WARMUP_CANDLES
+
+        # Regime + pullback state (mirrors AutoRunner instance vars)
+        _is_parabolic:       bool = False
+        _signal_pending:     bool = False
+        _pending_side:       str  = ""
+        _pending_score:      float = 0.0
+        _candles_since_sig:  int  = 0
 
         for i in range(WARMUP_CANDLES, len(main_candles)):
             candle = main_candles[i]
@@ -711,59 +739,176 @@ def _run_worker(
                 if hist_sess == 0.0:
                     continue  # SCALP dead-zone block
 
-                sig = _compute_signal_layers(klines, mode, 1.0, higher_slice, style, mtf_slice,
-                                            enable_t16=enable_t16, enable_s4=enable_s4, symbol=symbol)
+                # ── Change 4: Regime detection ────────────────────────
+                btc_weekly_slice = _get_aligned_slice(btc_weekly_candles, candle["t"], 210) if btc_weekly_candles else []
+                cur_adx = 0.0
+                if len(klines) >= 15:
+                    try:
+                        cur_adx = _adx(
+                            [k["high"]  for k in klines],
+                            [k["low"]   for k in klines],
+                            [k["close"] for k in klines],
+                            14,
+                        ) or 0.0
+                    except Exception:
+                        cur_adx = 0.0
+                regime, _is_parabolic = get_market_regime(btc_weekly_slice, cur_adx, _is_parabolic)
 
-                if sig.get("ok"):
-                    side          = sig["side"]
-                    grade         = sig.get("grade", "B")
-                    atr_pct       = sig.get("atr_pct", ATR_BASELINE.get(tf, 0.009))
-                    mtf_size_mult = sig.get("mtf_size_mult", 1.0)
+                # RANGING = no trades
+                if regime == "RANGING":
+                    if _signal_pending:
+                        _signal_pending = False
+                        _pending_side   = ""
+                        _candles_since_sig = 0
+                    continue
 
-                    # T16 reversal uses wider SL/TP multipliers for choppy-market entries
-                    sl_atr_mult = sig.get("sl_atr_override", st["sl_atr"])
-                    tp_atr_mult = sig.get("tp_atr_override", st["tp_atr"])
-                    sl_pct = min(atr_pct * sl_atr_mult, st["sl_max"] / 100)
-                    tp_pct = min(atr_pct * tp_atr_mult, st["tp_max"] / 100)
+                # ── Change 5: Mode regime guard ───────────────────────
+                if regime not in _mode_cfg["allowed_regimes"]:
+                    if _signal_pending:
+                        _signal_pending = False
+                        _pending_side   = ""
+                        _candles_since_sig = 0
+                    continue
 
-                    # Volatility-adjusted size (same formula as live engine)
-                    baseline  = ATR_BASELINE.get(tf, 0.009)
-                    vol_ratio = atr_pct / baseline if baseline > 0 else 1.0
-                    vol_mult  = max(0.4, 1.0 / vol_ratio) if vol_ratio > 1.5 else 1.0
-
-                    # Drawdown tier size adjustment
-                    dd_pct = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0.0
-                    dd_mult = (
-                        0.25 if dd_pct >= 0.10 else
-                        0.40 if dd_pct >= 0.07 else
-                        0.65 if dd_pct >= 0.04 else
-                        1.0
+                # ── Change 5: SWING weekly trend filter ───────────────
+                _allowed_sides: Optional[List[str]] = None
+                if _style_cfg.get("swing_weekly_filter") and btc_weekly_slice:
+                    weekly_trend = check_weekly_trend(btc_weekly_slice)
+                    if weekly_trend == "TRANSITIONING":
+                        if _signal_pending:
+                            _signal_pending = False
+                            _pending_side   = ""
+                            _candles_since_sig = 0
+                        continue
+                    _allowed_sides = (
+                        ["LONG"]  if weekly_trend == "BULLISH"
+                        else ["SHORT"] if weekly_trend == "BEARISH"
+                        else None
                     )
 
-                    effective_size = c["size"] * mtf_size_mult * vol_mult * dd_mult
+                # PARABOLIC overrides: loosen score, LONG only
+                _param_overrides = {}
+                if regime == "PARABOLIC":
+                    _cp_par = get_coin_params(symbol)
+                    _param_overrides = {"min_score": max(0.35, _cp_par["score_threshold"] - 0.05)}
+                    _allowed_sides = ["LONG"]
 
-                    open_trade = {
-                        "entry":          candle["close"],
-                        "side":           side,
-                        "grade":          grade,
-                        "sl_pct":         sl_pct,
-                        "tp_pct":         tp_pct,
-                        "effective_size": effective_size,
-                        "leverage":       c["leverage"],
-                        "equity_at_open": equity,
-                        "atr_pct":        atr_pct,
-                        # Grade B legs
-                        "t1_size":           effective_size * 0.60,
-                        "t2_size":           effective_size * 0.40,
-                        "t1_done":           False,
-                        "t2_sl_is_breakeven": False,
-                        "accumulated_pnl":   0.0,
-                        # Metadata for result record
-                        "open_ts": candle["t"],
-                        "signal":  sig.get("signal", "-"),
-                        "score":   round(sig.get("score", 0.0), 3),
-                        "regime":  sig.get("market_regime", "-"),
-                    }
+                sig = _compute_signal_layers(
+                    klines, mode, 1.0, higher_slice, style, mtf_slice,
+                    enable_t16=enable_t16, enable_s4=enable_s4, symbol=symbol,
+                    param_overrides=_param_overrides if _param_overrides else None,
+                )
+
+                # Enforce side restriction
+                if _allowed_sides and sig.get("ok") and sig.get("side") not in _allowed_sides:
+                    sig["ok"] = False
+
+                # ── Change 3: Volume hour confirmation ────────────────
+                if sig.get("ok"):
+                    _cp_vol = get_coin_params(symbol)
+                    _vol_ok, _, _ = check_volume_hour_confirmed(klines, _cp_vol)
+                    if not _vol_ok:
+                        sig["ok"] = False
+
+                # ── Cancel pending signal if conditions no longer met ──
+                if not sig.get("ok"):
+                    if _signal_pending:
+                        _signal_pending    = False
+                        _pending_side      = ""
+                        _pending_score     = 0.0
+                        _candles_since_sig = 0
+                    continue
+
+                # ── Change 2: Pullback entry gate ─────────────────────
+                desired_side = sig["side"]
+                if not _signal_pending:
+                    _signal_pending    = True
+                    _pending_side      = desired_side
+                    _pending_score     = sig.get("score", 0.0)
+                    _candles_since_sig = 0
+                elif _pending_side != desired_side:
+                    _pending_side      = desired_side
+                    _pending_score     = sig.get("score", 0.0)
+                    _candles_since_sig = 0
+
+                _candles_since_sig += 1
+
+                if _style_cfg.get("pullback_required", True):
+                    _cp_pb   = get_coin_params(symbol)
+                    _pb_res  = check_pullback_entry(
+                        klines, _pending_side, _cp_pb, regime,
+                        _candles_since_sig, trade_style=style,
+                    )
+                    if _pb_res == "TIMEOUT":
+                        _signal_pending    = False
+                        _pending_side      = ""
+                        _pending_score     = 0.0
+                        _candles_since_sig = 0
+                        continue
+                    if _pb_res == "WAIT":
+                        continue
+                    # ENTER or IMMEDIATE → proceed
+
+                # Confirmed entry
+                desired_side   = _pending_side
+                _signal_pending    = False
+                _pending_side      = ""
+                _pending_score     = 0.0
+                _candles_since_sig = 0
+
+                grade         = sig.get("grade", "B")
+                atr_pct       = sig.get("atr_pct", ATR_BASELINE.get(tf, 0.009))
+                mtf_size_mult = sig.get("mtf_size_mult", 1.0)
+
+                # T16 reversal uses wider SL/TP multipliers for choppy-market entries
+                sl_atr_mult = sig.get("sl_atr_override", st["sl_atr"])
+                tp_atr_mult = sig.get("tp_atr_override", st["tp_atr"])
+                sl_pct = min(atr_pct * sl_atr_mult, st["sl_max"] / 100)
+                tp_pct = min(atr_pct * tp_atr_mult, st["tp_max"] / 100)
+
+                # Volatility-adjusted size (same formula as live engine)
+                baseline  = ATR_BASELINE.get(tf, 0.009)
+                vol_ratio = atr_pct / baseline if baseline > 0 else 1.0
+                vol_mult  = max(0.4, 1.0 / vol_ratio) if vol_ratio > 1.5 else 1.0
+
+                # Drawdown tier size adjustment
+                dd_pct = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0.0
+                dd_mult = (
+                    0.25 if dd_pct >= 0.10 else
+                    0.40 if dd_pct >= 0.07 else
+                    0.65 if dd_pct >= 0.04 else
+                    1.0
+                )
+
+                # ── Change 5: Mode position_size_mult ─────────────────
+                mode_size_mult = _mode_cfg.get("position_size_mult", 1.0)
+
+                effective_size = c["size"] * mtf_size_mult * vol_mult * dd_mult * mode_size_mult
+
+                side = desired_side
+
+                open_trade = {
+                    "entry":          candle["close"],
+                    "side":           side,
+                    "grade":          grade,
+                    "sl_pct":         sl_pct,
+                    "tp_pct":         tp_pct,
+                    "effective_size": effective_size,
+                    "leverage":       c["leverage"],
+                    "equity_at_open": equity,
+                    "atr_pct":        atr_pct,
+                    # Grade B legs
+                    "t1_size":           effective_size * 0.60,
+                    "t2_size":           effective_size * 0.40,
+                    "t1_done":           False,
+                    "t2_sl_is_breakeven": False,
+                    "accumulated_pnl":   0.0,
+                    # Metadata for result record
+                    "open_ts": candle["t"],
+                    "signal":  sig.get("signal", "-"),
+                    "score":   round(sig.get("score", 0.0), 3),
+                    "regime":  regime,
+                }
 
         # ── 3. Calculate metrics ───────────────────────────────────────────
         buy_hold_entry = main_candles[WARMUP_CANDLES]["close"]
