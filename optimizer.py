@@ -31,7 +31,7 @@ from backtester import (
 from config import HIGHER_TF_MAP, TRADE_STYLE_PARAMS
 from database import USING_PG, db_conn, serial_pk
 from indicators import (
-    _compute_signal_layers, _adx as _adx_fn,
+    _compute_signal_layers, _adx_series as _adx_series_fn,
     get_market_regime, check_pullback_entry, check_volume_hour_confirmed,
 )
 from coin_params import get_coin_params
@@ -178,6 +178,12 @@ def _sim_one(
     pending_side = ""
     candles_since = 0
 
+    # Precompute ADX series once — avoids recomputing 300-candle ADX every iteration
+    _all_highs  = [c["high"]  for c in main_candles]
+    _all_lows   = [c["low"]   for c in main_candles]
+    _all_closes = [c["close"] for c in main_candles]
+    _adx_vals   = _adx_series_fn(_all_highs, _all_lows, _all_closes, 14)
+
     for i in range(WARMUP_CANDLES, len(main_candles)):
         candle = main_candles[i]
 
@@ -219,17 +225,8 @@ def _sim_one(
         # ── Regime detection ──────────────────────────────────────────
         regime = "TRENDING"
         if btc_wk:
-            wk_sl = _get_aligned_slice(btc_wk, candle["t"], 210)
-            cur_adx = 0.0
-            if len(klines) >= 15:
-                try:
-                    cur_adx = _adx_fn(
-                        [k["high"]  for k in klines],
-                        [k["low"]   for k in klines],
-                        [k["close"] for k in klines], 14,
-                    ) or 0.0
-                except Exception:
-                    cur_adx = 0.0
+            wk_sl   = _get_aligned_slice(btc_wk, candle["t"], 210)
+            cur_adx = _adx_vals[i] or 0.0
             regime, is_parabolic = get_market_regime(wk_sl, cur_adx, is_parabolic)
 
         if regime == "RANGING" or regime not in mode_cfg["allowed_regimes"]:

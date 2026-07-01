@@ -50,6 +50,50 @@ def _atr(highs: List[float], lows: List[float], closes: List[float], period: int
     return atr
 
 
+def _adx_series(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> List[Optional[float]]:
+    """Return ADX value for every candle index in a single O(n) pass.
+    Indices before the warmup period return None.
+    Use this instead of calling _adx() per candle in simulation loops."""
+    n = len(closes)
+    result: List[Optional[float]] = [None] * n
+    if n < period * 2 + 1:
+        return result
+    pdms, ndms, trs = [], [], []
+    for i in range(1, n):
+        hd = highs[i] - highs[i - 1]
+        ld = lows[i - 1] - lows[i]
+        pdms.append(hd if hd > ld and hd > 0 else 0.0)
+        ndms.append(ld if ld > hd and ld > 0 else 0.0)
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+
+    def _wilder(s: List[float]) -> List[float]:
+        v = sum(s[:period])
+        out = [v]
+        for x in s[period:]:
+            v = v - v / period + x
+            out.append(v)
+        return out
+
+    s_tr, s_p, s_n = _wilder(trs), _wilder(pdms), _wilder(ndms)
+    dxs = []
+    for i in range(len(s_tr)):
+        pdi = 100 * s_p[i] / s_tr[i] if s_tr[i] else 0
+        ndi = 100 * s_n[i] / s_tr[i] if s_tr[i] else 0
+        dxs.append(100 * abs(pdi - ndi) / (pdi + ndi) if (pdi + ndi) else 0)
+    if len(dxs) < period:
+        return result
+    adx = sum(dxs[:period]) / period
+    adx_list = [adx]
+    for dx in dxs[period:]:
+        adx = (adx * (period - 1) + dx) / period
+        adx_list.append(adx)
+    # Place adx_list values at the tail of result (aligns with most-recent candles)
+    start = n - len(adx_list)
+    for k, val in enumerate(adx_list):
+        result[start + k] = val
+    return result
+
+
 def _adx(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
     if len(closes) < period * 2 + 1:
         return None
