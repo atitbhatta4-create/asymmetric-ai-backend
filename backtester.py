@@ -26,7 +26,7 @@ import httpx
 from config import DUBAI_TZ, HIGHER_TF_MAP, OKX_BASE, OKX_TF_MAP, TRADE_STYLE_PARAMS
 from database import db_conn, serial_pk, USING_PG
 from indicators import (
-    _atr, _adx, _compute_signal_layers,
+    _atr, _adx, _adx_series, _compute_signal_layers,
     get_market_regime, check_weekly_trend,
     check_pullback_entry, check_volume_hour_confirmed,
 )
@@ -672,6 +672,14 @@ def _run_worker(
         _pending_score:      float = 0.0
         _candles_since_sig:  int  = 0
 
+        # Precompute ADX series once — avoids recomputing 300-candle ADX every candle
+        _adx_vals = _adx_series(
+            [c["high"]  for c in main_candles],
+            [c["low"]   for c in main_candles],
+            [c["close"] for c in main_candles],
+            14,
+        )
+
         for i in range(WARMUP_CANDLES, len(main_candles)):
             candle = main_candles[i]
 
@@ -741,17 +749,7 @@ def _run_worker(
 
                 # ── Change 4: Regime detection ────────────────────────
                 btc_weekly_slice = _get_aligned_slice(btc_weekly_candles, candle["t"], 210) if btc_weekly_candles else []
-                cur_adx = 0.0
-                if len(klines) >= 15:
-                    try:
-                        cur_adx = _adx(
-                            [k["high"]  for k in klines],
-                            [k["low"]   for k in klines],
-                            [k["close"] for k in klines],
-                            14,
-                        ) or 0.0
-                    except Exception:
-                        cur_adx = 0.0
+                cur_adx = _adx_vals[i] or 0.0
                 regime, _is_parabolic = get_market_regime(btc_weekly_slice, cur_adx, _is_parabolic)
 
                 # RANGING = no trades
