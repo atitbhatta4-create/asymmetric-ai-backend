@@ -362,7 +362,8 @@ def run_backtest(sym:str, label:str, mode:str, style:str,
                         cur_adx=_adx_fn([k["high"] for k in klines],[k["low"] for k in klines],
                                         [k["close"] for k in klines],14) or 0.0
                     except Exception: cur_adx=0.0
-                regime,is_parabolic=get_market_regime(wk_sl,cur_adx,is_parabolic)
+                _rng_thresh=style_cfg.get("ranging_adx_threshold",15)
+                regime,is_parabolic=get_market_regime(wk_sl,cur_adx,is_parabolic,ranging_threshold=_rng_thresh)
             if regime=="RANGING":
                 if sig_pending: sig_pending=False; pending_side=""; candles_since=0
                 continue
