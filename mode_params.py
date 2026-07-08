@@ -10,8 +10,8 @@ MODE_CONFIG: Dict[str, Dict[str, Any]] = {
         "adx_min_add":          +8,
         "volume_mult_add":      +0.30,
         "max_trades_per_day":   1,
-        # ULTRA_SAFE sits out PARABOLIC — too few trades to build conviction
-        "allowed_regimes":      ["TRENDING"],
+        # ULTRA_SAFE trades in PARABOLIC at reduced size — strong bull markets are safe for LONG
+        "allowed_regimes":      ["TRENDING", "PARABOLIC"],
         "tp_multiplier_override": 1.5,
         "position_size_mult":   0.50,
         "description": "Minimum risk. Very few trades. Absolute beginners.",
@@ -66,6 +66,7 @@ STYLE_CONFIG: Dict[str, Dict[str, Any]] = {
         "pullback_timeout":     3,       # candles to wait for pullback before cancelling
         "swing_weekly_filter":  False,
         "scalp_mode":           False,
+        "ranging_adx_threshold": 12,    # 1h candles consolidate often; only block truly flat ADX
         "description": "1h candles. Trades last hours to 1 day.",
     },
     "SWING": {
@@ -74,6 +75,7 @@ STYLE_CONFIG: Dict[str, Dict[str, Any]] = {
         "pullback_timeout":     5,       # 4h × 5 = 20h window
         "swing_weekly_filter":  True,
         "scalp_mode":           False,
+        "ranging_adx_threshold": 15,    # 4h candles: ADX <15 is genuinely choppy
         "description": "4h candles. Trades last 1-5 days.",
     },
     "SCALP": {
@@ -82,6 +84,7 @@ STYLE_CONFIG: Dict[str, Dict[str, Any]] = {
         "pullback_timeout":     0,
         "swing_weekly_filter":  False,
         "scalp_mode":           True,
+        "ranging_adx_threshold": 18,    # 15m is noisiest; stricter ranging filter
         "experimental":         True,
         "description": "EXPERIMENTAL. 15m candles. High frequency. Experienced only.",
     },

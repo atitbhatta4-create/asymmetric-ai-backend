@@ -750,7 +750,8 @@ def _run_worker(
                 # ── Change 4: Regime detection ────────────────────────
                 btc_weekly_slice = _get_aligned_slice(btc_weekly_candles, candle["t"], 210) if btc_weekly_candles else []
                 cur_adx = _adx_vals[i] or 0.0
-                regime, _is_parabolic = get_market_regime(btc_weekly_slice, cur_adx, _is_parabolic)
+                _ranging_thresh = _style_cfg.get("ranging_adx_threshold", 15)
+                regime, _is_parabolic = get_market_regime(btc_weekly_slice, cur_adx, _is_parabolic, ranging_threshold=_ranging_thresh)
 
                 # RANGING = no trades
                 if regime == "RANGING":

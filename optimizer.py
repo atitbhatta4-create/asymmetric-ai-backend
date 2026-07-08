@@ -227,7 +227,8 @@ def _sim_one(
         if btc_wk:
             wk_sl   = _get_aligned_slice(btc_wk, candle["t"], 210)
             cur_adx = _adx_vals[i] or 0.0
-            regime, is_parabolic = get_market_regime(wk_sl, cur_adx, is_parabolic)
+            _ranging_thresh = style_cfg.get("ranging_adx_threshold", 15)
+            regime, is_parabolic = get_market_regime(wk_sl, cur_adx, is_parabolic, ranging_threshold=_ranging_thresh)
 
         if regime == "RANGING" or regime not in mode_cfg["allowed_regimes"]:
             if sig_pending: sig_pending = False; pending_side = ""; candles_since = 0

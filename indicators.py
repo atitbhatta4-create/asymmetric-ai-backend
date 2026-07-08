@@ -954,6 +954,7 @@ def get_market_regime(
     btc_weekly_candles: List[Dict],
     current_coin_adx: float,
     is_parabolic: bool = False,
+    ranging_threshold: float = 15.0,
 ) -> tuple:
     """
     Classify the global crypto market into one of three regimes using
@@ -974,8 +975,11 @@ def get_market_regime(
 
     State (is_parabolic) must be stored on the caller (AutoRunner) and
     passed in each call — never use a function attribute for shared state.
+
+    ranging_threshold: style-specific ADX floor below which market is too choppy.
+        DAY_TRADE=12, SWING=15, SCALP=18. Passed from STYLE_CONFIG.
     """
-    if current_coin_adx is not None and current_coin_adx < 15:
+    if current_coin_adx is not None and current_coin_adx < ranging_threshold:
         return "RANGING", False
 
     if len(btc_weekly_candles) < 20:
