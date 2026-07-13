@@ -27,14 +27,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import httpx
 from config import TRADE_STYLE_PARAMS, DUBAI_TZ
 from indicators import (
-    _compute_signal_layers, _adx as _adx_fn, MODE_SIGNAL_PARAMS,
+    _compute_signal_layers, _adx as _adx_fn, _adx_series as _adx_series_fn,
+    MODE_SIGNAL_PARAMS,
     get_market_regime, check_weekly_trend,
     check_pullback_entry, check_volume_hour_confirmed,
 )
 import indicators as _ind_mod
 from coin_params import get_coin_params
 from mode_params import get_mode_config, get_style_config
-from optimizer import OPT_GRID, MIN_TRADES, _sim_one
+from optimizer import OPT_GRID, MIN_TRADES, _sim_one, _get_aligned_slice
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CONFIG
@@ -444,12 +445,31 @@ def run_optimizer(sym:str, mode:str, style:str,
     if len(main_c)<WARMUP+10: return None
     combos=list(itertools.product(OPT_GRID["adx_delta"],OPT_GRID["score_delta"],
                                    OPT_GRID["sl_mult"],OPT_GRID["tp_mult"]))
+
+    # Precompute regime series once — regime only depends on BTC weekly + ADX,
+    # not on optimizer params, so computing it 135× per combo is pure waste.
+    _style_cfg_opt = get_style_config(style)
+    _rng_thresh_opt = _style_cfg_opt.get("ranging_adx_threshold", 15)
+    _btc_wk_opt = btc_weekly_c or []
+    _highs_opt  = [c["high"]  for c in main_c]
+    _lows_opt   = [c["low"]   for c in main_c]
+    _closes_opt = [c["close"] for c in main_c]
+    _adx_opt    = _adx_series_fn(_highs_opt, _lows_opt, _closes_opt, 14)
+    _pre_regimes: List[str] = ["TRENDING"] * len(main_c)
+    _par_opt = False
+    for _ri in range(WARMUP, len(main_c)):
+        if _btc_wk_opt:
+            _wk = _get_aligned_slice(_btc_wk_opt, main_c[_ri]["t"], 210)
+            _pre_regimes[_ri], _par_opt = get_market_regime(
+                _wk, _adx_opt[_ri] or 0.0, _par_opt, ranging_threshold=_rng_thresh_opt)
+
     results=[]; _orig=_ind_mod._session_quality
     _ind_mod._session_quality=lambda _:(1.0,"opt-bt")
     try:
         for adx_d,sc_d,sl_m,tp_m in combos:
             m=_sim_one(main_c,higher_c,mode,style,EXCHANGE,START_EQUITY,adx_d,sc_d,sl_m,tp_m,
-                       symbol=sym,btc_weekly_candles=btc_weekly_c or [])
+                       symbol=sym,btc_weekly_candles=_btc_wk_opt,
+                       precomputed_regimes=_pre_regimes)
             if m:
                 wr=m.get("win_rate",0)/100; dd=abs(m.get("max_drawdown_pct",0))/100
                 passed=(m.get("total_trades",0)>=MIN_TRADES and wr>=0.25 and dd<=0.25)

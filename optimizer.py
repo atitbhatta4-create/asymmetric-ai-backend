@@ -145,10 +145,15 @@ def _sim_one(
     tp_mult: float,
     symbol: str = "BTCUSDT",
     btc_weekly_candles: List[Dict] = None,
+    precomputed_regimes: List[str] = None,
 ) -> Optional[Dict]:
     """
     Run one simulation pass with the given parameter offsets.
     Returns metrics dict or None if not enough trades to be meaningful.
+
+    precomputed_regimes: optional list of regime strings (len == len(main_candles)).
+        When provided, skips per-candle regime detection entirely — pass this
+        from run_optimizer() to avoid recomputing the same regime 135× per coin.
     """
     st = TRADE_STYLE_PARAMS[style]
     c  = MODE_PRESETS[mode]
@@ -223,12 +228,15 @@ def _sim_one(
         higher_slice = _get_aligned_slice(higher_candles, candle["t"], 100)
 
         # ── Regime detection ──────────────────────────────────────────
-        regime = "TRENDING"
-        if btc_wk:
-            wk_sl   = _get_aligned_slice(btc_wk, candle["t"], 210)
-            cur_adx = _adx_vals[i] or 0.0
-            _ranging_thresh = style_cfg.get("ranging_adx_threshold", 15)
-            regime, is_parabolic = get_market_regime(wk_sl, cur_adx, is_parabolic, ranging_threshold=_ranging_thresh)
+        if precomputed_regimes is not None:
+            regime = precomputed_regimes[i]
+        else:
+            regime = "TRENDING"
+            if btc_wk:
+                wk_sl   = _get_aligned_slice(btc_wk, candle["t"], 210)
+                cur_adx = _adx_vals[i] or 0.0
+                _ranging_thresh = style_cfg.get("ranging_adx_threshold", 15)
+                regime, is_parabolic = get_market_regime(wk_sl, cur_adx, is_parabolic, ranging_threshold=_ranging_thresh)
 
         if regime == "RANGING" or regime not in mode_cfg["allowed_regimes"]:
             if sig_pending: sig_pending = False; pending_side = ""; candles_since = 0
