@@ -861,7 +861,8 @@ def _run_worker(
 
                 # T16 reversal uses wider SL/TP multipliers for choppy-market entries
                 sl_atr_mult = sig.get("sl_atr_override", st["sl_atr"])
-                tp_atr_mult = sig.get("tp_atr_override", st["tp_atr"])
+                _bt_tp_m    = _style_cfg.get("backtest_default_tp_mult", 1.0)
+                tp_atr_mult = sig.get("tp_atr_override", st["tp_atr"] * _bt_tp_m)
                 sl_pct = min(atr_pct * sl_atr_mult, st["sl_max"] / 100)
                 tp_pct = min(atr_pct * tp_atr_mult, st["tp_max"] / 100)
 
@@ -893,7 +894,7 @@ def _run_worker(
                     "sl_pct":         sl_pct,
                     "tp_pct":         tp_pct,
                     "effective_size": effective_size,
-                    "leverage":       c["leverage"],
+                    "leverage":       min(c["leverage"], 3) if style == "SWING" and mode == "AGGRESSIVE" else c["leverage"],
                     "equity_at_open": equity,
                     "atr_pct":        atr_pct,
                     # Grade B legs

@@ -420,14 +420,15 @@ def run_backtest(sym:str, label:str, mode:str, style:str,
 
             grade=sig.get("grade","B"); atr=sig.get("atr_pct",ATR_BASELINE.get(tf,0.009))
             sl_pct=min(atr*st["sl_atr"],st["sl_max"]/100)
-            tp_pct=min(atr*st["tp_atr"],st["tp_max"]/100)
+            _bt_tp_m=style_cfg.get("backtest_default_tp_mult",1.0)
+            tp_pct=min(atr*st["tp_atr"]*_bt_tp_m,st["tp_max"]/100)
             bl=ATR_BASELINE.get(tf,0.009); vol_m=max(0.4,1/(atr/bl)) if atr/bl>1.5 else 1.0
             dd_pct=(peak-equity)/peak if peak>0 else 0
             dd_m=0.25 if dd_pct>=0.10 else 0.40 if dd_pct>=0.07 else 0.65 if dd_pct>=0.04 else 1.0
             mode_sm=mode_cfg.get("position_size_mult",1.0)
             eff=c["size"]*vol_m*dd_m*mode_sm
             open_t={"entry":candle["close"],"side":desired_side,"grade":grade,
-                    "sl_pct":sl_pct,"tp_pct":tp_pct,"eff_size":eff,"leverage":c["leverage"],
+                    "sl_pct":sl_pct,"tp_pct":tp_pct,"eff_size":eff,"leverage":min(c["leverage"],3) if style=="SWING" and mode=="AGGRESSIVE" else c["leverage"],
                     "equity_at_open":equity,"t1_size":eff*0.60,"t2_size":eff*0.40,
                     "t1_done":False,"be":False,"be_next":False,"acc":0.0,"open_ts":candle["t"]}
     finally:

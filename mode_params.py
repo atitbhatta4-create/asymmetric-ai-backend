@@ -67,6 +67,7 @@ STYLE_CONFIG: Dict[str, Dict[str, Any]] = {
         "swing_weekly_filter":  False,
         "scalp_mode":           False,
         "ranging_adx_threshold": 12,    # 1h candles consolidate often; only block truly flat ADX
+        "backtest_default_tp_mult": 2.0, # DT WR ~30% → needs TP 2.5× to break even; 2.0× is conservative fix
         "description": "1h candles. Trades last hours to 1 day.",
     },
     "SWING": {
