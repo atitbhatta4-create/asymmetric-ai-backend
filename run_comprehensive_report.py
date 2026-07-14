@@ -322,7 +322,8 @@ def calc_metrics(trades:List[Dict], curve:List[Dict], bh_in:float, bh_out:float)
 # ═══════════════════════════════════════════════════════════════════════════════
 def run_backtest(sym:str, label:str, mode:str, style:str,
                  main_c:List[Dict], higher_c:List[Dict],
-                 btc_weekly_c:List[Dict]=None)->Optional[Dict]:
+                 btc_weekly_c:List[Dict]=None,
+                 precomputed_regimes:List[str]=None)->Optional[Dict]:
     if len(main_c)<WARMUP+10: return None
     st=TRADE_STYLE_PARAMS[style]; c=MODE_PRESETS[mode]
     tf=STYLE_CFG[style]["main_tf"]
@@ -334,6 +335,19 @@ def run_backtest(sym:str, label:str, mode:str, style:str,
     btc_wk=btc_weekly_c or []
     # Regime + pullback state
     is_parabolic=False; sig_pending=False; pending_side=""; candles_since=0
+
+    # Precompute regime series when not provided externally.
+    # Avoids O(300×n) _adx_fn per-candle — use _adx_series_fn once instead.
+    if precomputed_regimes is None and btc_wk:
+        _rng_thresh=style_cfg.get("ranging_adx_threshold",15)
+        _bh=[c2["high"] for c2 in main_c]; _bl=[c2["low"] for c2 in main_c]; _bc=[c2["close"] for c2 in main_c]
+        _adx_pre=_adx_series_fn(_bh,_bl,_bc,14)
+        precomputed_regimes=["TRENDING"]*len(main_c); _par_bt=False
+        for _ri in range(WARMUP,len(main_c)):
+            _wks=aligned_slice(btc_wk,main_c[_ri]["t"],210)
+            precomputed_regimes[_ri],_par_bt=get_market_regime(
+                _wks,_adx_pre[_ri] or 0.0,_par_bt,ranging_threshold=_rng_thresh)
+
     _orig=_ind_mod._session_quality; _ind_mod._session_quality=_sess_hist
     try:
         for i in range(WARMUP,len(main_c)):
@@ -353,18 +367,8 @@ def run_backtest(sym:str, label:str, mode:str, style:str,
             klines=main_c[max(0,i-299):i+1]
             h_sl=aligned_slice(higher_c,candle["t"],100)
 
-            # ── Regime detection ──────────────────────────────────────────
-            regime="TRENDING"
-            if btc_wk:
-                wk_sl=aligned_slice(btc_wk,candle["t"],210)
-                cur_adx=0.0
-                if len(klines)>=15:
-                    try:
-                        cur_adx=_adx_fn([k["high"] for k in klines],[k["low"] for k in klines],
-                                        [k["close"] for k in klines],14) or 0.0
-                    except Exception: cur_adx=0.0
-                _rng_thresh=style_cfg.get("ranging_adx_threshold",15)
-                regime,is_parabolic=get_market_regime(wk_sl,cur_adx,is_parabolic,ranging_threshold=_rng_thresh)
+            # ── Regime detection — use precomputed series ─────────────────
+            regime=precomputed_regimes[i] if precomputed_regimes else "TRENDING"
             if regime=="RANGING":
                 if sig_pending: sig_pending=False; pending_side=""; candles_since=0
                 continue
@@ -442,27 +446,31 @@ def run_backtest(sym:str, label:str, mode:str, style:str,
 # ═══════════════════════════════════════════════════════════════════════════════
 def run_optimizer(sym:str, mode:str, style:str,
                   main_c:List[Dict], higher_c:List[Dict],
-                  btc_weekly_c:List[Dict]=None)->Optional[Dict]:
+                  btc_weekly_c:List[Dict]=None,
+                  precomputed_regimes:List[str]=None)->Optional[Dict]:
     if len(main_c)<WARMUP+10: return None
     combos=list(itertools.product(OPT_GRID["adx_delta"],OPT_GRID["score_delta"],
                                    OPT_GRID["sl_mult"],OPT_GRID["tp_mult"]))
 
-    # Precompute regime series once — regime only depends on BTC weekly + ADX,
-    # not on optimizer params, so computing it 135× per combo is pure waste.
-    _style_cfg_opt = get_style_config(style)
-    _rng_thresh_opt = _style_cfg_opt.get("ranging_adx_threshold", 15)
     _btc_wk_opt = btc_weekly_c or []
-    _highs_opt  = [c["high"]  for c in main_c]
-    _lows_opt   = [c["low"]   for c in main_c]
-    _closes_opt = [c["close"] for c in main_c]
-    _adx_opt    = _adx_series_fn(_highs_opt, _lows_opt, _closes_opt, 14)
-    _pre_regimes: List[str] = ["TRENDING"] * len(main_c)
-    _par_opt = False
-    for _ri in range(WARMUP, len(main_c)):
-        if _btc_wk_opt:
-            _wk = _get_aligned_slice(_btc_wk_opt, main_c[_ri]["t"], 210)
-            _pre_regimes[_ri], _par_opt = get_market_regime(
-                _wk, _adx_opt[_ri] or 0.0, _par_opt, ranging_threshold=_rng_thresh_opt)
+
+    # Precompute regime series once per (sym, style) — not per mode.
+    # Caller (run_full) passes precomputed_regimes to avoid computing it 5× per style.
+    if precomputed_regimes is None:
+        _style_cfg_opt = get_style_config(style)
+        _rng_thresh_opt = _style_cfg_opt.get("ranging_adx_threshold", 15)
+        _highs_opt  = [c["high"]  for c in main_c]
+        _lows_opt   = [c["low"]   for c in main_c]
+        _closes_opt = [c["close"] for c in main_c]
+        _adx_opt    = _adx_series_fn(_highs_opt, _lows_opt, _closes_opt, 14)
+        precomputed_regimes = ["TRENDING"] * len(main_c)
+        _par_opt = False
+        for _ri in range(WARMUP, len(main_c)):
+            if _btc_wk_opt:
+                _wk = _get_aligned_slice(_btc_wk_opt, main_c[_ri]["t"], 210)
+                precomputed_regimes[_ri], _par_opt = get_market_regime(
+                    _wk, _adx_opt[_ri] or 0.0, _par_opt, ranging_threshold=_rng_thresh_opt)
+    _pre_regimes = precomputed_regimes
 
     results=[]; _orig=_ind_mod._session_quality
     _ind_mod._session_quality=lambda _:(1.0,"opt-bt")
@@ -977,19 +985,32 @@ def run_full(progress_cb=None) -> bytes:
             main_tf=scfg["main_tf"]; higher_tf=scfg["higher_tf"]
             mc=coin_data.get(f"{sym}_{main_tf}",[]); hc=coin_data.get(f"{sym}_{higher_tf}",[])
 
+            # Precompute regime series ONCE per (sym, style) — shared across all 5 modes.
+            # Regime depends on BTC weekly + ADX, not on mode, so computing it per-mode is waste.
+            _sty_cfg=get_style_config(style)
+            _rng_t=_sty_cfg.get("ranging_adx_threshold",15)
+            _bh=[c2["high"] for c2 in mc]; _bl=[c2["low"] for c2 in mc]; _bclose=[c2["close"] for c2 in mc]
+            _adx_pre=_adx_series_fn(_bh,_bl,_bclose,14) if mc else []
+            _shared_regimes:List[str]=["TRENDING"]*len(mc); _par_s=False
+            if btc_weekly_c and mc:
+                for _ri in range(WARMUP,len(mc)):
+                    _wks=aligned_slice(btc_weekly_c,mc[_ri]["t"],210)
+                    _shared_regimes[_ri],_par_s=get_market_regime(_wks,_adx_pre[_ri] or 0.0,_par_s,ranging_threshold=_rng_t)
+            print(f"  [{sym} {style}] Regime precomputed for {len(mc)} candles")
+
             for mode in MODES:
                 done+=1
                 print(f"  [{done}/{total}] {label} | {mode} | {style}")
                 bt=None
                 try:
-                    bt=run_backtest(sym,label,mode,style,mc,hc,btc_weekly_c)
+                    bt=run_backtest(sym,label,mode,style,mc,hc,btc_weekly_c,precomputed_regimes=_shared_regimes)
                 except Exception as e:
                     print(f"    BT ERROR: {e}")
                 opt=None
                 bt_trades=bt["total_trades"] if bt else 0
                 if bt_trades>=5:
                     try:
-                        opt=run_optimizer(sym,mode,style,mc,hc,btc_weekly_c)
+                        opt=run_optimizer(sym,mode,style,mc,hc,btc_weekly_c,precomputed_regimes=_shared_regimes)
                     except Exception as e:
                         print(f"    OPT ERROR: {e}")
                 else:
@@ -1060,13 +1081,25 @@ def main():
             mc=coin_data.get(f"{sym}_{main_tf}",[]); hc=coin_data.get(f"{sym}_{higher_tf}",[])
             print(f"\n  ── STYLE: {style} ──")
 
+            # Precompute regime series ONCE per (sym, style), shared across all 5 modes.
+            _sty_cfg2=get_style_config(style)
+            _rng_t2=_sty_cfg2.get("ranging_adx_threshold",15)
+            _bh2=[c2["high"] for c2 in mc]; _bl2=[c2["low"] for c2 in mc]; _bc2=[c2["close"] for c2 in mc]
+            _adx_pre2=_adx_series_fn(_bh2,_bl2,_bc2,14) if mc else []
+            _shared_reg2:List[str]=["TRENDING"]*len(mc); _par_s2=False
+            if btc_weekly_c and mc:
+                for _ri2 in range(WARMUP,len(mc)):
+                    _wks2=aligned_slice(btc_weekly_c,mc[_ri2]["t"],210)
+                    _shared_reg2[_ri2],_par_s2=get_market_regime(_wks2,_adx_pre2[_ri2] or 0.0,_par_s2,ranging_threshold=_rng_t2)
+            print(f"  Regime precomputed: {len(mc)} candles")
+
             for mode in MODES:
                 done+=1
                 print(f"\n  [{done}/{total}] {label} | {mode} | {style}")
 
                 bt=None
                 try:
-                    bt=run_backtest(sym,label,mode,style,mc,hc,btc_weekly_c)
+                    bt=run_backtest(sym,label,mode,style,mc,hc,btc_weekly_c,precomputed_regimes=_shared_reg2)
                 except Exception as e:
                     print(f"    BT: ERROR — {e}")
                 if bt:
@@ -1085,7 +1118,7 @@ def main():
                     print(f"    OPT ...",end="",flush=True)
                     opt_t0=time.time()
                     try:
-                        opt=run_optimizer(sym,mode,style,mc,hc,btc_weekly_c)
+                        opt=run_optimizer(sym,mode,style,mc,hc,btc_weekly_c,precomputed_regimes=_shared_reg2)
                     except Exception as e:
                         print(f" ERROR — {e}")
                     bp=opt["best"] if opt and opt.get("best") else None

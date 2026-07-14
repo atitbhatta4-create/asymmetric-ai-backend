@@ -183,11 +183,15 @@ def _sim_one(
     pending_side = ""
     candles_since = 0
 
-    # Precompute ADX series once — avoids recomputing 300-candle ADX every iteration
-    _all_highs  = [c["high"]  for c in main_candles]
-    _all_lows   = [c["low"]   for c in main_candles]
-    _all_closes = [c["close"] for c in main_candles]
-    _adx_vals   = _adx_series_fn(_all_highs, _all_lows, _all_closes, 14)
+    # Precompute ADX series — only needed when regime is NOT precomputed externally.
+    # When precomputed_regimes is passed (the normal case from run_optimizer), _adx_vals
+    # is never used, so skip the O(n) computation to avoid 135× redundant work.
+    _adx_vals = None
+    if precomputed_regimes is None:
+        _all_highs  = [c["high"]  for c in main_candles]
+        _all_lows   = [c["low"]   for c in main_candles]
+        _all_closes = [c["close"] for c in main_candles]
+        _adx_vals   = _adx_series_fn(_all_highs, _all_lows, _all_closes, 14)
 
     for i in range(WARMUP_CANDLES, len(main_candles)):
         candle = main_candles[i]
