@@ -8,14 +8,13 @@ Wire up in main.py:
 """
 from __future__ import annotations
 
-import os
-import time
-from typing import Dict, List, Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
+from auth_helpers import require_user as _require_user, require_admin as _require_admin
 from adaptive_pipeline import (
     PIPELINE_COINS,
     DEFAULT_MODE,
@@ -31,42 +30,6 @@ from adaptive_pipeline import (
 from database import db_conn
 
 pipeline_router = APIRouter(prefix="/pipeline", tags=["pipeline"])
-
-# ── Auth (same pattern as routes_backtest.py) ──────────────────────────────────
-_ADMIN_EMAILS = set(
-    e.strip().lower()
-    for e in os.getenv("ADMIN_EMAILS", "admin@demo.com").split(",")
-    if e.strip()
-)
-_SESSION_CACHE: Dict[str, tuple] = {}
-_SESSION_TTL   = 300
-
-
-def _require_user(session: Optional[str] = Cookie(default=None)) -> Dict:
-    if not session:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    now = time.time()
-    cached = _SESSION_CACHE.get(session)
-    if cached:
-        email, ts = cached
-        if now - ts < _SESSION_TTL:
-            return {"email": email}
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT email FROM sessions WHERE token = %s", (session,))
-        row = cur.fetchone()
-    if not row:
-        _SESSION_CACHE.pop(session, None)
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    _SESSION_CACHE[session] = (row["email"], now)
-    return {"email": row["email"]}
-
-
-def _require_admin(user=Depends(_require_user)) -> str:
-    email = user["email"].strip().lower()
-    if email not in _ADMIN_EMAILS:
-        raise HTTPException(status_code=403, detail="Admin access only")
-    return email
 
 
 # ── Pydantic models ────────────────────────────────────────────────────────────

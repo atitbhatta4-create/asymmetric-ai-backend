@@ -17,7 +17,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
-from routes_admin import _require_admin
+from auth_helpers import require_admin as _require_admin
 
 report_router = APIRouter(tags=["report"])
 

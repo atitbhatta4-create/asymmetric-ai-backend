@@ -7,15 +7,14 @@ Wire up in main.py:
 """
 from __future__ import annotations
 
-import os
-import time
 from dataclasses import asdict
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 
+from auth_helpers import require_user as _require_user, require_admin as _require_admin
 from config import START_EQUITY, now_dubai
 from database import db_conn, USING_PG
 
@@ -24,46 +23,6 @@ admin_router = APIRouter(tags=["admin"])
 # ── Local helpers ──────────────────────────────────────────────────────────────
 def _now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-
-# ── Auth session cache ─────────────────────────────────────────────────────────
-_SESSION_CACHE: Dict[str, tuple] = {}
-_SESSION_TTL = 300
-
-# ── Admin config ───────────────────────────────────────────────────────────────
-_ADMIN_EMAILS = set(
-    e.strip().lower()
-    for e in os.getenv("ADMIN_EMAILS", "admin@demo.com").split(",")
-    if e.strip()
-)
-
-
-# ── Auth dependencies ──────────────────────────────────────────────────────────
-def _require_user(session: Optional[str] = Cookie(default=None)) -> Dict:
-    if not session:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    now = time.time()
-    cached = _SESSION_CACHE.get(session)
-    if cached:
-        email, ts = cached
-        if now - ts < _SESSION_TTL:
-            return {"email": email}
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT email FROM sessions WHERE token = %s", (session,))
-        row = cur.fetchone()
-    if not row:
-        _SESSION_CACHE.pop(session, None)
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    _SESSION_CACHE[session] = (row["email"], now)
-    return {"email": row["email"]}
-
-
-def _require_admin(user=Depends(_require_user)) -> str:
-    email = user["email"].strip().lower()
-    if email not in _ADMIN_EMAILS:
-        raise HTTPException(status_code=403, detail="Admin access only")
-    return email
 
 
 # ── Models ─────────────────────────────────────────────────────────────────────

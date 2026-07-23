@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Literal, Any, Deque
 from collections import deque
 
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query, Request
+from fastapi import FastAPI, Depends, HTTPException, Response, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, field_validator
@@ -45,6 +45,7 @@ from indicators import (
 from coin_params import get_coin_params
 from mode_params import get_mode_config, get_style_config
 from data_feeds import _fetch_btc_weekly_candles, _fetch_economic_calendar
+from auth_helpers import require_user, require_admin, ADMIN_EMAILS
 from routes_backtest import backtest_router
 from routes_optimizer import optimizer_router
 from routes_pipeline import pipeline_router
@@ -530,11 +531,18 @@ if _RAW_ENC_KEY:
         pass
 
 if not _FERNET:
-    import base64, warnings
+    if os.getenv("ENV", "dev") == "prod":
+        # In production, a missing ENCRYPTION_KEY means all stored API keys
+        # would be encrypted with a publicly-known fallback — unacceptable.
+        # Crash loudly so the misconfiguration is caught immediately on deploy.
+        raise RuntimeError(
+            "ENCRYPTION_KEY env var is not set in production. "
+            "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\" "
+            "and add it to your Render environment variables."
+        )
+    import base64
     _FALLBACK = base64.urlsafe_b64encode(hashlib.sha256(b"asym-dev-key").digest())
     _FERNET = Fernet(_FALLBACK)
-    if os.getenv("ENV", "dev") == "prod":
-        warnings.warn("ENCRYPTION_KEY not set — using dev fallback. Set ENCRYPTION_KEY in prod!")
 
 
 def encrypt_key(value: str) -> str:
@@ -683,57 +691,16 @@ def get_exchange(email: str) -> Optional[dict]:
     }
 
 
-_SESSION_CACHE: Dict[str, tuple] = {}    # token → (email, cached_at_ts)
-_SESSION_TTL = 300                        # reuse cached token for 5 minutes
-
 _EX_STATUS_CACHE: Dict[str, tuple] = {}  # email → (status_dict, ts)
 _EX_STATUS_TTL = 60                       # re-read DB at most once per minute
 _EX_TEST_CACHE: Dict[str, tuple] = {}    # email → (test_result_dict, ts)
 _EX_TEST_TTL = 60                         # live Bybit test cached 60s
-
-def require_user(session: Optional[str] = Cookie(default=None)) -> Dict[str, str]:
-    if not session:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    now = time.time()
-    cached = _SESSION_CACHE.get(session)
-    if cached:
-        email, ts = cached
-        if now - ts < _SESSION_TTL:
-            return {"email": email}
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT email FROM sessions WHERE token = %s", (session,))
-        row = cur.fetchone()
-    if not row:
-        _SESSION_CACHE.pop(session, None)
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    _SESSION_CACHE[session] = (row["email"], now)
-    return {"email": row["email"]}
-
 
 # =========================
 # ADMIN
 # =========================
 DEMO_EMAIL = "admin@demo.com"
 DEMO_PASS = "demo123"
-
-ADMIN_EMAILS = set(
-    e.strip().lower()
-    for e in os.getenv("ADMIN_EMAILS", DEMO_EMAIL).split(",")
-    if e.strip()
-)
-
-ADMIN_FORCE_RESET_TOKEN = os.getenv("ADMIN_FORCE_RESET_TOKEN", "")
-
-
-def require_admin(user=Depends(require_user)) -> str:
-    email = user["email"].strip().lower()
-    if email not in ADMIN_EMAILS:
-        raise HTTPException(status_code=403, detail="Admin access only")
-    return email
-
 
 def admin_get_setting(key: str, default: str) -> str:
     with db_conn() as conn:
@@ -7385,6 +7352,23 @@ def auto_reset_floor(payload: FloorResetIn, user=Depends(require_user)):
 import threading as _threading
 _threading.Thread(target=_resume_runners_on_startup, daemon=True).start()
 _threading.Thread(target=_resume_watchdog, daemon=True).start()
+
+
+def _purge_expired_sessions() -> None:
+    """Delete sessions older than 7 days from the DB on every startup.
+    Prevents indefinite accumulation of stale tokens that can never be
+    used (cookie expired) but still occupy rows and the session cache."""
+    try:
+        cutoff = int(time.time()) - 7 * 24 * 3600
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM sessions WHERE created_at < %s", (cutoff,))
+            conn.commit()
+    except Exception:
+        pass
+
+_threading.Thread(target=_purge_expired_sessions, daemon=True).start()
+
 
 # ── Deploy/restart notification ───────────────────────────────────────────────
 # Fires on every successful startup so you know the service is alive.

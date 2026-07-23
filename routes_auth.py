@@ -25,6 +25,12 @@ import pyotp
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
+from auth_helpers import (
+    require_user as _require_user,
+    require_admin as _require_admin,
+    ADMIN_EMAILS as _ADMIN_EMAILS,
+    evict_session,
+)
 from config import IS_PROD, SMTP_USER, SMTP_PASS, SMTP_HOST, SMTP_PORT
 from database import db_conn
 from notifications import (
@@ -42,16 +48,6 @@ def _now_utc_str() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ── Auth session cache ─────────────────────────────────────────────────────────
-_SESSION_CACHE: Dict[str, tuple] = {}
-_SESSION_TTL = 300  # 5 minutes
-
-# ── Admin config ───────────────────────────────────────────────────────────────
-_ADMIN_EMAILS = set(
-    e.strip().lower()
-    for e in os.getenv("ADMIN_EMAILS", "admin@demo.com").split(",")
-    if e.strip()
-)
 _ADMIN_FORCE_RESET_TOKEN = os.getenv("ADMIN_FORCE_RESET_TOKEN", "")
 
 # ── Per-endpoint rate limiter (separate from global middleware) ─────────────────
@@ -108,34 +104,6 @@ def clear_session_cookie(response: Response) -> None:
         response.delete_cookie("session", path="/", samesite="none", secure=True)
     else:
         response.delete_cookie("session", path="/", samesite="lax", secure=False)
-
-
-# ── Auth dependencies ──────────────────────────────────────────────────────────
-def _require_user(session: Optional[str] = Cookie(default=None)) -> Dict:
-    if not session:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    now = time.time()
-    cached = _SESSION_CACHE.get(session)
-    if cached:
-        email, ts = cached
-        if now - ts < _SESSION_TTL:
-            return {"email": email}
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT email FROM sessions WHERE token = %s", (session,))
-        row = cur.fetchone()
-    if not row:
-        _SESSION_CACHE.pop(session, None)
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    _SESSION_CACHE[session] = (row["email"], now)
-    return {"email": row["email"]}
-
-
-def _require_admin(user=Depends(_require_user)) -> str:
-    email = user["email"].strip().lower()
-    if email not in _ADMIN_EMAILS:
-        raise HTTPException(status_code=403, detail="Admin access only")
-    return email
 
 
 # ── Models ─────────────────────────────────────────────────────────────────────
@@ -244,9 +212,17 @@ def login(request: Request, payload: AuthIn, response: Response):
 
     token = secrets.token_urlsafe(32)
     now = int(time.time())
+    _SESSION_MAX_AGE = 7 * 24 * 3600  # 7 days, matches cookie max_age
 
     with db_conn() as conn:
         cur = conn.cursor()
+        # Delete expired sessions for this user before creating a new one.
+        # Prevents unlimited session accumulation and ensures old tokens
+        # can never be reused after 7 days even if logout was never called.
+        cur.execute(
+            "DELETE FROM sessions WHERE email = %s AND created_at < %s",
+            (email, now - _SESSION_MAX_AGE),
+        )
         cur.execute("INSERT INTO sessions(token, email, created_at) VALUES(%s, %s, %s)", (token, email, now))
         conn.commit()
 
@@ -263,7 +239,7 @@ def login(request: Request, payload: AuthIn, response: Response):
 @auth_router.post("/auth/logout")
 def logout(response: Response, session: Optional[str] = Cookie(default=None)):
     if session:
-        _SESSION_CACHE.pop(session, None)
+        evict_session(session)
         with db_conn() as conn:
             cur = conn.cursor()
             cur.execute("DELETE FROM sessions WHERE token = %s", (session,))
