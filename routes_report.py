@@ -184,23 +184,24 @@ _BATCH_COINS = [
     "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
 ]
 _BATCH_STYLES      = ["DAY_TRADE", "SWING"]
-_BATCH_MODE        = "MINI_ASYM"
+_BATCH_MODES       = ["ULTRA_SAFE", "SAFE", "NORMAL", "MINI_ASYM", "AGGRESSIVE"]
 _BATCH_DATE_FROM   = "2020-01-01"
 _BATCH_DATE_TO     = "2026-05-31"
 _BATCH_EQUITY      = 1000.0
 
 _bstate: dict = {
-    "running":      False,
-    "current_coin": None,
+    "running":       False,
+    "current_coin":  None,
     "current_style": None,
-    "done_count":   0,
-    "total_count":  len(_BATCH_COINS) * len(_BATCH_STYLES),
-    "done":         False,
-    "error":        None,
-    "run_ids":      [],   # list of {symbol, style, run_id}
-    "summary":      None, # filled when done: list of best-result per coin/style
-    "elapsed_min":  0.0,
-    "started_at":   None,
+    "current_mode":  None,
+    "done_count":    0,
+    "total_count":   len(_BATCH_COINS) * len(_BATCH_STYLES) * len(_BATCH_MODES),
+    "done":          False,
+    "error":         None,
+    "run_ids":       [],   # list of {symbol, style, mode, run_id}
+    "summary":       None, # filled when done
+    "elapsed_min":   0.0,
+    "started_at":    None,
 }
 _bstate_lock = threading.Lock()
 
@@ -245,36 +246,38 @@ def _collect_batch_summary(run_ids: list) -> list:
                 )
                 row = cur.fetchone()
         except Exception as exc:
-            summary.append({"symbol": item["symbol"], "style": item["style"],
-                            "run_id": item["run_id"], "error": str(exc)})
+            summary.append({"symbol": item["symbol"], "mode": item.get("mode","?"),
+                            "style": item["style"], "run_id": item["run_id"],
+                            "error": str(exc)})
             continue
 
         if not row:
-            summary.append({"symbol": item["symbol"], "style": item["style"],
-                            "run_id": item["run_id"],
+            summary.append({"symbol": item["symbol"], "mode": item.get("mode","?"),
+                            "style": item["style"], "run_id": item["run_id"],
                             "error": "No results passed filters (too few trades)"})
             continue
 
         params = json.loads(row["params_json"])
-        # adx_delta is relative to MINI_ASYM base (adx_min=16)
-        effective_adx = 16 + params.get("adx_delta", 0)
-        # score_delta is relative to MINI_ASYM base (min_score=0.63)
-        effective_score = round(0.63 + params.get("score_delta", 0.0), 3)
+        from indicators import MODE_SIGNAL_PARAMS
+        mode_base = MODE_SIGNAL_PARAMS.get(item.get("mode","MINI_ASYM"), {})
+        effective_adx   = mode_base.get("adx_min", 16) + params.get("adx_delta", 0)
+        effective_score = round(mode_base.get("min_score", 0.63) + params.get("score_delta", 0.0), 3)
 
         summary.append({
-            "symbol":        item["symbol"],
-            "style":         item["style"],
-            "run_id":        item["run_id"],
-            "sharpe":        round(row["sharpe_ratio"], 3),
-            "total_return":  f"{row['total_return']*100:.1f}%",
-            "win_rate":      f"{row['win_rate']*100:.1f}%",
-            "max_drawdown":  f"{row['max_drawdown']*100:.1f}%",
-            "total_trades":  row["total_trades"],
-            "best_params":   params,
+            "symbol":       item["symbol"],
+            "mode":         item.get("mode", "MINI_ASYM"),
+            "style":        item["style"],
+            "run_id":       item["run_id"],
+            "sharpe":       round(row["sharpe_ratio"], 3),
+            "total_return": f"{row['total_return']*100:.1f}%",
+            "win_rate":     f"{row['win_rate']*100:.1f}%",
+            "max_drawdown": f"{row['max_drawdown']*100:.1f}%",
+            "total_trades": row["total_trades"],
+            "best_params":  params,
             "coin_params_update": {
-                "tp_multiplier":    params.get("tp_mult", 2.0),
-                "sl_multiplier":    params.get("sl_mult", 1.0),
-                "effective_adx_min":      effective_adx,
+                "tp_multiplier":             params.get("tp_mult", 2.0),
+                "sl_multiplier":             params.get("sl_mult", 1.0),
+                "effective_adx_min":         effective_adx,
                 "effective_score_threshold": effective_score,
             },
         })
@@ -295,34 +298,37 @@ def _run_batch_bg(admin_email: str):
 
     run_ids: list = []
     done = 0
+    total = len(_BATCH_COINS) * len(_BATCH_STYLES) * len(_BATCH_MODES)
 
     try:
-        for style in _BATCH_STYLES:
-            for sym in _BATCH_COINS:
-                _bupd("current_coin",  sym)
-                _bupd("current_style", style)
-                _bupd("elapsed_min",   round((time.time() - t0) / 60, 1))
+        for mode in _BATCH_MODES:
+            for style in _BATCH_STYLES:
+                for sym in _BATCH_COINS:
+                    _bupd("current_coin",  sym)
+                    _bupd("current_style", style)
+                    _bupd("current_mode",  mode)
+                    _bupd("elapsed_min",   round((time.time() - t0) / 60, 1))
 
-                print(f"[batch_opt] Starting {sym} MINI_ASYM {style}…")
-                run_id = start_optimizer(
-                    email=admin_email,
-                    symbol=sym,
-                    mode=_BATCH_MODE,
-                    style=style,
-                    exchange="bybit",
-                    date_from=_BATCH_DATE_FROM,
-                    date_to=_BATCH_DATE_TO,
-                    start_equity=_BATCH_EQUITY,
-                )
-                run_ids.append({"symbol": sym, "style": style, "run_id": run_id})
-                _bupd("run_ids", list(run_ids))
+                    print(f"[batch_opt] Starting {sym} {mode} {style}…")
+                    run_id = start_optimizer(
+                        email=admin_email,
+                        symbol=sym,
+                        mode=mode,
+                        style=style,
+                        exchange="bybit",
+                        date_from=_BATCH_DATE_FROM,
+                        date_to=_BATCH_DATE_TO,
+                        start_equity=_BATCH_EQUITY,
+                    )
+                    run_ids.append({"symbol": sym, "style": style, "mode": mode, "run_id": run_id})
+                    _bupd("run_ids", list(run_ids))
 
-                ok = _wait_for_opt_run(run_id)
-                done += 1
-                _bupd("done_count",  done)
-                _bupd("elapsed_min", round((time.time() - t0) / 60, 1))
-                print(f"[batch_opt] {sym} {style} {'done' if ok else 'FAILED'} "
-                      f"({done}/{_bstate['total_count']})")
+                    ok = _wait_for_opt_run(run_id)
+                    done += 1
+                    _bupd("done_count",  done)
+                    _bupd("elapsed_min", round((time.time() - t0) / 60, 1))
+                    print(f"[batch_opt] {sym} {mode} {style} {'done' if ok else 'FAILED'} "
+                          f"({done}/{total})")
 
         # All runs complete — collect best results
         summary = _collect_batch_summary(run_ids)
@@ -348,15 +354,18 @@ def trigger_batch_optimizer(admin: str = Depends(_require_admin)):
                 "Batch optimizer already running — check /admin/batch-optimizer-status"
             )
     threading.Thread(target=_run_batch_bg, args=(admin,), daemon=False).start()
+    total = len(_BATCH_COINS) * len(_BATCH_STYLES) * len(_BATCH_MODES)
     return {
         "status": "started",
         "message": (
-            f"Running MINI_ASYM optimizer for {len(_BATCH_COINS)} coins × "
-            f"{len(_BATCH_STYLES)} styles = {len(_BATCH_COINS)*len(_BATCH_STYLES)} runs. "
-            "Poll /admin/batch-optimizer-status for progress. Estimated time: 1-2 hours."
+            f"Running full optimizer: {len(_BATCH_MODES)} modes × {len(_BATCH_STYLES)} styles × "
+            f"{len(_BATCH_COINS)} coins = {total} runs (each 135 param combos). "
+            "Poll /admin/batch-optimizer-status. Estimated time: 8-12 hours — run overnight."
         ),
-        "coins": _BATCH_COINS,
+        "modes":  _BATCH_MODES,
         "styles": _BATCH_STYLES,
+        "coins":  _BATCH_COINS,
+        "total_runs": total,
         "date_range": f"{_BATCH_DATE_FROM} → {_BATCH_DATE_TO}",
     }
 
