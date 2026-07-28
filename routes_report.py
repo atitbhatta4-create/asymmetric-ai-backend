@@ -6,9 +6,13 @@ Endpoints:
   POST /admin/run-comprehensive-report  — start background run
   GET  /admin/report-status             — progress / ETA
   GET  /admin/report-download           — pre-signed R2 URL to download PDF
+
+  POST /admin/run-batch-optimizer       — run MINI_ASYM optimizer for all 10 coins (DAY_TRADE + SWING)
+  GET  /admin/batch-optimizer-status    — progress + best params per coin when done
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -18,6 +22,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 
 from auth_helpers import require_admin as _require_admin
+from database import db_conn
 
 report_router = APIRouter(tags=["report"])
 
@@ -167,3 +172,214 @@ def report_download(admin: str = Depends(_require_admin)):
         ExpiresIn=3600,
     )
     return {"url": url, "key": key, "expires_in_seconds": 3600}
+
+
+# ── Batch Optimizer ────────────────────────────────────────────────────────────
+# Runs MINI_ASYM + DAY_TRADE + SWING for all 10 coins sequentially on Render.
+# Results stored in optimizer_runs / optimizer_results tables (same as single runs).
+# Status endpoint returns best params per coin when done — use to update coin_params.py.
+
+_BATCH_COINS = [
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "XRPUSDT", "SOLUSDT",
+    "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT",
+]
+_BATCH_STYLES      = ["DAY_TRADE", "SWING"]
+_BATCH_MODE        = "MINI_ASYM"
+_BATCH_DATE_FROM   = "2020-01-01"
+_BATCH_DATE_TO     = "2026-05-31"
+_BATCH_EQUITY      = 1000.0
+
+_bstate: dict = {
+    "running":      False,
+    "current_coin": None,
+    "current_style": None,
+    "done_count":   0,
+    "total_count":  len(_BATCH_COINS) * len(_BATCH_STYLES),
+    "done":         False,
+    "error":        None,
+    "run_ids":      [],   # list of {symbol, style, run_id}
+    "summary":      None, # filled when done: list of best-result per coin/style
+    "elapsed_min":  0.0,
+    "started_at":   None,
+}
+_bstate_lock = threading.Lock()
+
+
+def _bupd(key, val):
+    with _bstate_lock:
+        _bstate[key] = val
+
+
+def _wait_for_opt_run(run_id: str, timeout_sec: int = 1200) -> bool:
+    """Poll DB until optimizer run completes. Returns True=done, False=error/timeout."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            with db_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT status FROM optimizer_runs WHERE run_id=%s", (run_id,)
+                )
+                row = cur.fetchone()
+            if row and row["status"] in ("done", "error"):
+                return row["status"] == "done"
+        except Exception:
+            pass
+        time.sleep(15)
+    return False
+
+
+def _collect_batch_summary(run_ids: list) -> list:
+    """For each completed run, pull the #1 Sharpe result and format it."""
+    summary = []
+    for item in run_ids:
+        try:
+            with db_conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT params_json, total_trades, win_rate, total_return, "
+                    "sharpe_ratio, max_drawdown, reward_risk, passed_filters "
+                    "FROM optimizer_results WHERE run_id=%s AND passed_filters=1 "
+                    "ORDER BY sharpe_ratio DESC LIMIT 1",
+                    (item["run_id"],),
+                )
+                row = cur.fetchone()
+        except Exception as exc:
+            summary.append({"symbol": item["symbol"], "style": item["style"],
+                            "run_id": item["run_id"], "error": str(exc)})
+            continue
+
+        if not row:
+            summary.append({"symbol": item["symbol"], "style": item["style"],
+                            "run_id": item["run_id"],
+                            "error": "No results passed filters (too few trades)"})
+            continue
+
+        params = json.loads(row["params_json"])
+        # adx_delta is relative to MINI_ASYM base (adx_min=16)
+        effective_adx = 16 + params.get("adx_delta", 0)
+        # score_delta is relative to MINI_ASYM base (min_score=0.63)
+        effective_score = round(0.63 + params.get("score_delta", 0.0), 3)
+
+        summary.append({
+            "symbol":        item["symbol"],
+            "style":         item["style"],
+            "run_id":        item["run_id"],
+            "sharpe":        round(row["sharpe_ratio"], 3),
+            "total_return":  f"{row['total_return']*100:.1f}%",
+            "win_rate":      f"{row['win_rate']*100:.1f}%",
+            "max_drawdown":  f"{row['max_drawdown']*100:.1f}%",
+            "total_trades":  row["total_trades"],
+            "best_params":   params,
+            "coin_params_update": {
+                "tp_multiplier":    params.get("tp_mult", 2.0),
+                "sl_multiplier":    params.get("sl_mult", 1.0),
+                "effective_adx_min":      effective_adx,
+                "effective_score_threshold": effective_score,
+            },
+        })
+    return summary
+
+
+def _run_batch_bg(admin_email: str):
+    t0 = time.time()
+    _bupd("running",     True)
+    _bupd("started_at",  datetime.now(timezone.utc).isoformat())
+    _bupd("done",        False)
+    _bupd("error",       None)
+    _bupd("done_count",  0)
+    _bupd("run_ids",     [])
+    _bupd("summary",     None)
+
+    from optimizer import start_optimizer
+
+    run_ids: list = []
+    done = 0
+
+    try:
+        for style in _BATCH_STYLES:
+            for sym in _BATCH_COINS:
+                _bupd("current_coin",  sym)
+                _bupd("current_style", style)
+                _bupd("elapsed_min",   round((time.time() - t0) / 60, 1))
+
+                print(f"[batch_opt] Starting {sym} MINI_ASYM {style}…")
+                run_id = start_optimizer(
+                    email=admin_email,
+                    symbol=sym,
+                    mode=_BATCH_MODE,
+                    style=style,
+                    exchange="bybit",
+                    date_from=_BATCH_DATE_FROM,
+                    date_to=_BATCH_DATE_TO,
+                    start_equity=_BATCH_EQUITY,
+                )
+                run_ids.append({"symbol": sym, "style": style, "run_id": run_id})
+                _bupd("run_ids", list(run_ids))
+
+                ok = _wait_for_opt_run(run_id)
+                done += 1
+                _bupd("done_count",  done)
+                _bupd("elapsed_min", round((time.time() - t0) / 60, 1))
+                print(f"[batch_opt] {sym} {style} {'done' if ok else 'FAILED'} "
+                      f"({done}/{_bstate['total_count']})")
+
+        # All runs complete — collect best results
+        summary = _collect_batch_summary(run_ids)
+        _bupd("summary",      summary)
+        _bupd("done",         True)
+        _bupd("current_coin", None)
+        print(f"[batch_opt] All done in {round((time.time()-t0)/60,1)} min")
+
+    except Exception as exc:
+        _bupd("error", str(exc))
+        print(f"[batch_opt] ERROR: {exc}")
+    finally:
+        _bupd("running",     False)
+        _bupd("elapsed_min", round((time.time() - t0) / 60, 1))
+
+
+@report_router.post("/admin/run-batch-optimizer")
+def trigger_batch_optimizer(admin: str = Depends(_require_admin)):
+    with _bstate_lock:
+        if _bstate["running"]:
+            raise HTTPException(
+                409,
+                "Batch optimizer already running — check /admin/batch-optimizer-status"
+            )
+    threading.Thread(target=_run_batch_bg, args=(admin,), daemon=False).start()
+    return {
+        "status": "started",
+        "message": (
+            f"Running MINI_ASYM optimizer for {len(_BATCH_COINS)} coins × "
+            f"{len(_BATCH_STYLES)} styles = {len(_BATCH_COINS)*len(_BATCH_STYLES)} runs. "
+            "Poll /admin/batch-optimizer-status for progress. Estimated time: 1-2 hours."
+        ),
+        "coins": _BATCH_COINS,
+        "styles": _BATCH_STYLES,
+        "date_range": f"{_BATCH_DATE_FROM} → {_BATCH_DATE_TO}",
+    }
+
+
+@report_router.get("/admin/batch-optimizer-status")
+def batch_optimizer_status(admin: str = Depends(_require_admin)):
+    with _bstate_lock:
+        s = dict(_bstate)
+
+    total = s["total_count"]
+    done  = s["done_count"]
+    pct   = round(done / total * 100, 1) if total else 0
+    eta   = None
+    if s["running"] and done > 0 and s["elapsed_min"] > 0:
+        rate = done / s["elapsed_min"]
+        eta  = round((total - done) / rate, 1) if rate > 0 else None
+
+    return {
+        **s,
+        "progress_pct":  pct,
+        "eta_minutes":   eta,
+        "next_step": (
+            "Review summary → update coin_params.py with best tp_multiplier/sl_multiplier "
+            "→ then trigger /admin/run-comprehensive-report (S4 is now enabled in that report)"
+        ) if s["done"] else None,
+    }

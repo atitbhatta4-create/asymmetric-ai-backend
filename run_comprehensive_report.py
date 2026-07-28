@@ -394,6 +394,7 @@ def run_backtest(sym:str, label:str, mode:str, style:str,
 
             sig=_compute_signal_layers(klines,mode,1.0,h_sl,style,None,
                                        param_overrides=_param_ov if _param_ov else None,
+                                       enable_s4=True,
                                        symbol=sym)
             if _allowed_sides and sig.get("ok") and sig.get("side") not in _allowed_sides:
                 sig["ok"]=False
@@ -926,7 +927,7 @@ def build_pdf(results:Dict, output_path:str=None) -> bytes:
         else: ex_opt.append(("TEXTCOLOR",(-1,ri),(-1,ri),CRED))
     story+=[T(opt_rows,ow,ex_opt),Spacer(1,0.8*cm),
             HRFlowable(width="100%",thickness=0.5,color=CTEAL,spaceAfter=8),
-            Paragraph(f"Asymmetric AI — Pre-Launch Comprehensive Validation  |  Binance OHLCV  |  "
+            Paragraph(f"Asymmetric AI — Pre-Launch Comprehensive Validation  |  S4 Dynamic Weights ON  |  Binance OHLCV  |  "
                       f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC  |  mes29571@gmail.com",FT)]
 
     buf = io.BytesIO()
