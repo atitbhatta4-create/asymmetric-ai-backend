@@ -50,6 +50,22 @@ def _atr(highs: List[float], lows: List[float], closes: List[float], period: int
     return atr
 
 
+def _atr_series(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> List[Optional[float]]:
+    """ATR value for every candle — single O(n) pass. Use in simulation loops instead of _atr()."""
+    n = len(closes)
+    result: List[Optional[float]] = [None] * n
+    if n < period + 1:
+        return result
+    trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+           for i in range(1, n)]
+    atr = sum(trs[:period]) / period
+    result[period] = atr
+    for k in range(period, len(trs)):
+        atr = (atr * (period - 1) + trs[k]) / period
+        result[k + 1] = atr
+    return result
+
+
 def _adx_series(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> List[Optional[float]]:
     """Return ADX value for every candle index in a single O(n) pass.
     Indices before the warmup period return None.
@@ -370,6 +386,7 @@ def _reversal_signal(klines: List[Dict], rsi: Optional[float], adx: Optional[flo
 def _classify_regime(
     highs: List[float], lows: List[float], closes: List[float],
     adx: Optional[float], atr_pct: float,
+    _atr_slow_pct: Optional[float] = None,
 ) -> Dict:
     """
     Phase 4 — Market regime classifier.
@@ -384,10 +401,12 @@ def _classify_regime(
         spike_ratio : current ATR / 50-candle ATR baseline
         reason   : human-readable explanation
     """
-    # 50-candle ATR as the volatility baseline for this symbol
-    atr_slow = _atr(highs, lows, closes, 50)
-    price    = closes[-1] if closes else 1.0
-    atr_slow_pct = (atr_slow / price) if (atr_slow and price) else 0.0
+    if _atr_slow_pct is not None:
+        atr_slow_pct = _atr_slow_pct
+    else:
+        atr_slow = _atr(highs, lows, closes, 50)
+        price    = closes[-1] if closes else 1.0
+        atr_slow_pct = (atr_slow / price) if (atr_slow and price) else 0.0
 
     spike_ratio = round(atr_pct / atr_slow_pct, 2) if atr_slow_pct > 0 else 1.0
     adx_val     = round(adx or 0.0, 1)
@@ -474,6 +493,7 @@ def _compute_signal_layers(
     enable_t16: bool = True,
     enable_s4: bool = False,
     symbol: str = "BTCUSDT",
+    _precomp: Optional[Dict] = None,
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -501,14 +521,29 @@ def _compute_signal_layers(
     lows    = [k["low"]    for k in klines]
     volumes = [k["volume"] for k in klines]
 
-    ema9      = _ema(closes, 9)
-    ema21     = _ema(closes, 21)
-    ema50     = _ema(closes, 50)
-    ema200    = _ema(closes, 200)
-    rsi       = _rsi(closes, 14)
-    rsi_vals  = _rsi_series(closes, 14)   # full series for divergence
-    atr       = _atr(highs, lows, closes, 14)
-    adx       = _adx(highs, lows, closes, 14)
+    if _precomp is not None:
+        # O(1) precomputed lookup — eliminates ~9× O(300) indicator recomputation per candle.
+        # Caller sets _precomp["idx"] = absolute candle index in the full candle array.
+        idx      = _precomp["idx"]
+        ema9     = _precomp["ema9"][max(0, idx - 4):idx + 1]
+        ema21    = _precomp["ema21"][max(0, idx - 4):idx + 1]
+        ema50    = [_precomp["ema50"][idx]]
+        rsi      = _precomp["rsi"][idx]
+        rsi_vals = _precomp["rsi"][max(0, idx - 13):idx + 1]
+        atr      = _precomp["atr14"][idx]
+        adx      = _precomp["adx"][idx]
+        _atr50_v = _precomp["atr50"][idx]
+        _atr_slow_pct_pc = (_atr50_v / closes[-1]) if (_atr50_v and closes[-1]) else None
+    else:
+        ema9      = _ema(closes, 9)
+        ema21     = _ema(closes, 21)
+        ema50     = _ema(closes, 50)
+        ema200    = _ema(closes, 200)
+        rsi       = _rsi(closes, 14)
+        rsi_vals  = _rsi_series(closes, 14)   # full series for divergence
+        atr       = _atr(highs, lows, closes, 14)
+        adx       = _adx(highs, lows, closes, 14)
+        _atr_slow_pct_pc = None
 
     price      = closes[-1]
     atr_pct    = (atr / price) if atr else 0.0
@@ -520,7 +555,7 @@ def _compute_signal_layers(
     _rev = _reversal_signal(klines, rsi, adx, atr) if enable_t16 else {"ok": False}
 
     # ── Phase 4: Regime classification (before any layer scoring) ────────────
-    regime_class = _classify_regime(highs, lows, closes, adx, atr_pct)
+    regime_class = _classify_regime(highs, lows, closes, adx, atr_pct, _atr_slow_pct=_atr_slow_pct_pc)
     if regime_class["block"]:
         if _rev["ok"]:
             return {

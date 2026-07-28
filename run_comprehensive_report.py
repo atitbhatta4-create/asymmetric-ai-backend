@@ -28,6 +28,7 @@ import httpx
 from config import TRADE_STYLE_PARAMS, DUBAI_TZ
 from indicators import (
     _compute_signal_layers, _adx as _adx_fn, _adx_series as _adx_series_fn,
+    _atr_series as _atr_series_fn, _rsi_series as _rsi_series_fn, _ema as _ema_fn,
     MODE_SIGNAL_PARAMS,
     get_market_regime, check_weekly_trend,
     check_pullback_entry, check_volume_hour_confirmed,
@@ -323,7 +324,8 @@ def calc_metrics(trades:List[Dict], curve:List[Dict], bh_in:float, bh_out:float)
 def run_backtest(sym:str, label:str, mode:str, style:str,
                  main_c:List[Dict], higher_c:List[Dict],
                  btc_weekly_c:List[Dict]=None,
-                 precomputed_regimes:List[str]=None)->Optional[Dict]:
+                 precomputed_regimes:List[str]=None,
+                 _precomp_ind:Optional[Dict]=None)->Optional[Dict]:
     if len(main_c)<WARMUP+10: return None
     st=TRADE_STYLE_PARAMS[style]; c=MODE_PRESETS[mode]
     tf=STYLE_CFG[style]["main_tf"]
@@ -392,10 +394,13 @@ def run_backtest(sym:str, label:str, mode:str, style:str,
                 _param_ov={"min_score":max(0.35,coin_p["score_threshold"]-0.05)}
                 _allowed_sides=["LONG"]
 
+            if _precomp_ind is not None:
+                _precomp_ind["idx"]=i
             sig=_compute_signal_layers(klines,mode,1.0,h_sl,style,None,
                                        param_overrides=_param_ov if _param_ov else None,
                                        enable_s4=True,
-                                       symbol=sym)
+                                       symbol=sym,
+                                       _precomp=_precomp_ind)
             if _allowed_sides and sig.get("ok") and sig.get("side") not in _allowed_sides:
                 sig["ok"]=False
 
@@ -448,7 +453,8 @@ def run_backtest(sym:str, label:str, mode:str, style:str,
 def run_optimizer(sym:str, mode:str, style:str,
                   main_c:List[Dict], higher_c:List[Dict],
                   btc_weekly_c:List[Dict]=None,
-                  precomputed_regimes:List[str]=None)->Optional[Dict]:
+                  precomputed_regimes:List[str]=None,
+                  _precomp_ind:Optional[Dict]=None)->Optional[Dict]:
     if len(main_c)<WARMUP+10: return None
     combos=list(itertools.product(OPT_GRID["adx_delta"],OPT_GRID["score_delta"],
                                    OPT_GRID["sl_mult"],OPT_GRID["tp_mult"]))
@@ -479,7 +485,8 @@ def run_optimizer(sym:str, mode:str, style:str,
         for adx_d,sc_d,sl_m,tp_m in combos:
             m=_sim_one(main_c,higher_c,mode,style,EXCHANGE,START_EQUITY,adx_d,sc_d,sl_m,tp_m,
                        symbol=sym,btc_weekly_candles=_btc_wk_opt,
-                       precomputed_regimes=_pre_regimes)
+                       precomputed_regimes=_pre_regimes,
+                       _precomp_ind=_precomp_ind)
             if m:
                 wr=m.get("win_rate",0)/100; dd=abs(m.get("max_drawdown_pct",0))/100
                 passed=(m.get("total_trades",0)>=MIN_TRADES and wr>=0.25 and dd<=0.25)
@@ -999,19 +1006,33 @@ def run_full(progress_cb=None) -> bytes:
                     _shared_regimes[_ri],_par_s=get_market_regime(_wks,_adx_pre[_ri] or 0.0,_par_s,ranging_threshold=_rng_t)
             print(f"  [{sym} {style}] Regime precomputed for {len(mc)} candles")
 
+            # Precompute all indicator series once — shared across 5 modes × 135 combos (100×+ speedup).
+            _pc_ind: Optional[Dict] = None
+            if mc:
+                _pc_rsi_s=_rsi_series_fn(_bclose,14)
+                _pc_ind={
+                    "ema9":  _ema_fn(_bclose,9),
+                    "ema21": _ema_fn(_bclose,21),
+                    "ema50": _ema_fn(_bclose,50),
+                    "rsi":   [None]*(len(_bclose)-len(_pc_rsi_s))+list(_pc_rsi_s),
+                    "atr14": _atr_series_fn(_bh,_bl,_bclose,14),
+                    "atr50": _atr_series_fn(_bh,_bl,_bclose,50),
+                    "adx":   _adx_pre,
+                }
+
             for mode in MODES:
                 done+=1
                 print(f"  [{done}/{total}] {label} | {mode} | {style}")
                 bt=None
                 try:
-                    bt=run_backtest(sym,label,mode,style,mc,hc,btc_weekly_c,precomputed_regimes=_shared_regimes)
+                    bt=run_backtest(sym,label,mode,style,mc,hc,btc_weekly_c,precomputed_regimes=_shared_regimes,_precomp_ind=_pc_ind)
                 except Exception as e:
                     print(f"    BT ERROR: {e}")
                 opt=None
                 bt_trades=bt["total_trades"] if bt else 0
                 if bt_trades>=5:
                     try:
-                        opt=run_optimizer(sym,mode,style,mc,hc,btc_weekly_c,precomputed_regimes=_shared_regimes)
+                        opt=run_optimizer(sym,mode,style,mc,hc,btc_weekly_c,precomputed_regimes=_shared_regimes,_precomp_ind=_pc_ind)
                     except Exception as e:
                         print(f"    OPT ERROR: {e}")
                 else:
@@ -1094,13 +1115,27 @@ def main():
                     _shared_reg2[_ri2],_par_s2=get_market_regime(_wks2,_adx_pre2[_ri2] or 0.0,_par_s2,ranging_threshold=_rng_t2)
             print(f"  Regime precomputed: {len(mc)} candles")
 
+            # Precompute all indicator series once — shared across 5 modes × 135 combos (100×+ speedup).
+            _pc_ind2: Optional[Dict] = None
+            if mc:
+                _pc_rsi_s2=_rsi_series_fn(_bc2,14)
+                _pc_ind2={
+                    "ema9":  _ema_fn(_bc2,9),
+                    "ema21": _ema_fn(_bc2,21),
+                    "ema50": _ema_fn(_bc2,50),
+                    "rsi":   [None]*(len(_bc2)-len(_pc_rsi_s2))+list(_pc_rsi_s2),
+                    "atr14": _atr_series_fn(_bh2,_bl2,_bc2,14),
+                    "atr50": _atr_series_fn(_bh2,_bl2,_bc2,50),
+                    "adx":   _adx_pre2,
+                }
+
             for mode in MODES:
                 done+=1
                 print(f"\n  [{done}/{total}] {label} | {mode} | {style}")
 
                 bt=None
                 try:
-                    bt=run_backtest(sym,label,mode,style,mc,hc,btc_weekly_c,precomputed_regimes=_shared_reg2)
+                    bt=run_backtest(sym,label,mode,style,mc,hc,btc_weekly_c,precomputed_regimes=_shared_reg2,_precomp_ind=_pc_ind2)
                 except Exception as e:
                     print(f"    BT: ERROR — {e}")
                 if bt:
@@ -1119,7 +1154,7 @@ def main():
                     print(f"    OPT ...",end="",flush=True)
                     opt_t0=time.time()
                     try:
-                        opt=run_optimizer(sym,mode,style,mc,hc,btc_weekly_c,precomputed_regimes=_shared_reg2)
+                        opt=run_optimizer(sym,mode,style,mc,hc,btc_weekly_c,precomputed_regimes=_shared_reg2,_precomp_ind=_pc_ind2)
                     except Exception as e:
                         print(f" ERROR — {e}")
                     bp=opt["best"] if opt and opt.get("best") else None
