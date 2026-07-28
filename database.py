@@ -19,15 +19,24 @@ if DATABASE_URL:
     if _url.startswith("postgres://"):
         _url = _url.replace("postgres://", "postgresql://", 1)
 
-    # Add TCP keepalives so idle pool connections survive Render's network
-    # timeouts without dropping the SSL session unexpectedly.
-    # keepalives_idle=30: send keepalive probe after 30s idle
-    # keepalives_interval=10: retry probe every 10s
-    # keepalives_count=5: declare dead after 5 missed probes (~80s total)
-    _ka = "keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=5&connect_timeout=10"
+    # TCP keepalives — aggressive settings so Render's 60-90s idle timeout
+    # never kills a pooled connection before the pre-ping catches it.
+    # keepalives_idle=30: probe after 30s idle (before Render drops it)
+    # keepalives_interval=5: retry probe every 5s (was 10)
+    # keepalives_count=3: declare dead after 3 missed probes (~45s total, was ~80s)
+    _ka = "keepalives=1&keepalives_idle=30&keepalives_interval=5&keepalives_count=3&connect_timeout=10"
     _url = _url + ("&" if "?" in _url else "?") + _ka
 
     USING_PG = True
+
+    def _pre_ping(conn: "psycopg.Connection") -> None:
+        """Pool pre-ping: verify connection is alive before handing to caller.
+        If this raises, psycopg_pool discards the connection and opens a fresh one."""
+        try:
+            conn.execute("SELECT 1")
+        except Exception as exc:
+            print(f"[DB] SSL drop detected in pre-ping ({type(exc).__name__}) — pool will reconnect")
+            raise
 
     # Connection pool — sized for ~100 concurrent active engines.
     # Render free PostgreSQL allows max 25 connections; Standard allows 97.
@@ -39,14 +48,31 @@ if DATABASE_URL:
         max_size=_PG_POOL_MAX,
         kwargs={"row_factory": dict_row},
         open=False,
+        check=_pre_ping,         # pool_pre_ping: ping before every hand-out
+        max_lifetime=1800,       # pool_recycle: recycle connections every 30 min
+        reconnect_timeout=10,
     )
     _pool.open(wait=True, timeout=30)
 
     @contextmanager
     def db_conn():
-        """Context manager — borrows a connection from the pool and returns it on exit."""
-        with _pool.connection() as conn:
-            yield conn
+        """Context manager — borrows a pre-pinged connection from the pool.
+
+        On SSL drop the pool's pre-ping catches the dead connection and reconnects
+        transparently. If a drop slips through (race between ping and use), we log
+        and re-raise so FastAPI returns a clean 500 rather than a cryptic SSL error.
+        """
+        try:
+            with _pool.connection() as conn:
+                yield conn
+        except psycopg.OperationalError as exc:
+            print(f"[DB] OperationalError after pool hand-out — {exc}")
+            try:
+                _pool.check()  # evict any remaining stale connections
+            except Exception:
+                pass
+            print("[DB] DB reconnected after SSL drop")
+            raise
 
     def db():
         """Legacy: returns a raw pool connection. Caller must call .close() to return it."""

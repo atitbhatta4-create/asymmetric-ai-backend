@@ -3262,18 +3262,40 @@ class AutoRunner:
             self.bad_trades_today = 0
             self.log("Daily counters reset (Dubai timezone).")
 
+            # Compute effective score threshold before/after for the log.
+            # Mirrors indicators.py: max(mode_base, coin_thresh) + style_add + strictness_add
+            _cp = get_coin_params(self.symbol)
+            _mode_base = {"ULTRA_SAFE": 0.75, "SAFE": 0.68, "NORMAL": 0.62,
+                          "MINI_ASYM": 0.63, "AGGRESSIVE": 0.58}.get(self.mode, 0.63)
+            _style_add = {"DAY_TRADE": 0.02, "SCALP": 0.02, "SWING": 0.0}.get(self.trade_style, 0.02)
+            _base_thresh = round(max(_mode_base, _cp["score_threshold"]) + _style_add, 3)
+            _old_strict  = self.adaptive_strictness
+            _thresh_was  = round(
+                _base_thresh + max(0.0, (_old_strict - 1) * 0.12), 3
+            ) if self.mode == "MINI_ASYM" and _old_strict > 1.0 else _base_thresh
+
             # Reset adaptive strictness at Dubai midnight so a bad day never
             # bleeds into the next. Step down gradually if very elevated.
             STEP_DOWN = {2.50: 1.50, 1.50: 1.25}
             if self.adaptive_strictness <= 1.25:
                 self.adaptive_strictness = 1.0
                 self.consecutive_wins = 0
-                self.log("Midnight reset — strictness cleared to 1.0x. Fresh start.")
+                self.log(
+                    f"Midnight reset — strictness {_old_strict:.2f}x → 1.0x. "
+                    f"Score threshold: was {_thresh_was:.2f} → now {_base_thresh:.2f}. "
+                    f"Vars cleared: bad_trades=0, trades_today=0, consecutive_wins=0. Fresh start."
+                )
             else:
                 self.adaptive_strictness = STEP_DOWN.get(
                     round(self.adaptive_strictness, 2), 1.25
                 )
-                self.log(f"Midnight reset — strictness stepped down to {self.adaptive_strictness:.2f}x")
+                _thresh_now = round(
+                    _base_thresh + max(0.0, (self.adaptive_strictness - 1) * 0.12), 3
+                ) if self.mode == "MINI_ASYM" else _base_thresh
+                self.log(
+                    f"Midnight reset — strictness {_old_strict:.2f}x → {self.adaptive_strictness:.2f}x (stepped down). "
+                    f"Score threshold: was {_thresh_was:.2f} → now {_thresh_now:.2f}."
+                )
             self.strictness_day_key = dubai_day_key()
             # Persist immediately so a server restart won't revert the reset
             _save_runner_state(self)
@@ -4358,16 +4380,35 @@ class AutoRunner:
             secs -= chunk
         if not self.stop_event.is_set():
             # New day — apply strictness step-down (same logic as _reset_if_new_day)
+            _cp = get_coin_params(self.symbol)
+            _mode_base = {"ULTRA_SAFE": 0.75, "SAFE": 0.68, "NORMAL": 0.62,
+                          "MINI_ASYM": 0.63, "AGGRESSIVE": 0.58}.get(self.mode, 0.63)
+            _style_add = {"DAY_TRADE": 0.02, "SCALP": 0.02, "SWING": 0.0}.get(self.trade_style, 0.02)
+            _base_thresh = round(max(_mode_base, _cp["score_threshold"]) + _style_add, 3)
+            _old_strict  = self.adaptive_strictness
+            _thresh_was  = round(
+                _base_thresh + max(0.0, (_old_strict - 1) * 0.12), 3
+            ) if self.mode == "MINI_ASYM" and _old_strict > 1.0 else _base_thresh
             STEP_DOWN = {2.50: 1.50, 1.50: 1.25}
             if self.adaptive_strictness <= 1.25:
                 self.adaptive_strictness = 1.0
                 self.consecutive_wins = 0
-                self.log("Midnight reset (sleep path) — strictness cleared to 1.0x. Fresh start.")
+                self.log(
+                    f"Midnight reset (sleep path) — strictness {_old_strict:.2f}x → 1.0x. "
+                    f"Score threshold: was {_thresh_was:.2f} → now {_base_thresh:.2f}. "
+                    f"Vars cleared: bad_trades=0, trades_today=0, consecutive_wins=0. Fresh start."
+                )
             else:
                 self.adaptive_strictness = STEP_DOWN.get(
                     round(self.adaptive_strictness, 2), 1.25
                 )
-                self.log(f"Midnight reset (sleep path) — strictness stepped down to {self.adaptive_strictness:.2f}x")
+                _thresh_now = round(
+                    _base_thresh + max(0.0, (self.adaptive_strictness - 1) * 0.12), 3
+                ) if self.mode == "MINI_ASYM" else _base_thresh
+                self.log(
+                    f"Midnight reset (sleep path) — strictness {_old_strict:.2f}x → {self.adaptive_strictness:.2f}x (stepped down). "
+                    f"Score threshold: was {_thresh_was:.2f} → now {_thresh_now:.2f}."
+                )
             self.strictness_day_key = dubai_day_key()
             # Reset counters unconditionally — we just slept through midnight so
             # no new-day trades exist yet.  Do NOT call _load_today_stats() here:
