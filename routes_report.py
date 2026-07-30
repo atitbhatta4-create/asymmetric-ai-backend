@@ -359,7 +359,7 @@ def trigger_batch_optimizer(admin: str = Depends(_require_admin)):
         "status": "started",
         "message": (
             f"Running full optimizer: {len(_BATCH_MODES)} modes × {len(_BATCH_STYLES)} styles × "
-            f"{len(_BATCH_COINS)} coins = {total} runs (each 135 param combos). "
+            f"{len(_BATCH_COINS)} coins = {total} runs (each 300 param combos). "
             "Poll /admin/batch-optimizer-status. Estimated time: 8-12 hours — run overnight."
         ),
         "modes":  _BATCH_MODES,

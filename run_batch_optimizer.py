@@ -5,13 +5,14 @@ Usage (Render shell):
     python run_batch_optimizer.py
 
 Scope : 5 modes × 2 styles × 10 coins = 100 optimizer runs
-        Each run tests 135 parameter combos (ADX / score / SL / TP offsets)
+        Each run tests 300 parameter combos (ADX / score / SL / TP offsets)
+        TP range expanded to 4.0× (was 2.5×) targeting 40-60% yearly return.
 Period: 2020-01-01 → 2026-05-31
 Output: Best params per combo printed to console + saved to optimizer_runs/optimizer_results DB tables
         At the end: copy the printed coin_params recommendations into coin_params.py,
         then run python run_comprehensive_report.py for the updated full PDF.
 
-Estimated time: 8-12 hours on Render. Safe to leave running overnight.
+Estimated time: 8-12 hours on Render (300 combos × 9× speedup ≈ same as old 135). Safe to leave running overnight.
 """
 from __future__ import annotations
 

@@ -40,12 +40,14 @@ from mode_params import get_mode_config, get_style_config
 
 # ── Parameter search grid ───────────────────────────────────────────────────────
 # Offsets are applied ON TOP of the mode's default values.
-# 5 × 3 × 3 × 3 = 135 combinations per run.
+# 5 × 3 × 4 × 5 = 300 combinations per run.
+# TP extended to 3.5× (was 2.5×) — main lever for higher yearly return targets.
+# SL tightened option (0.7×) improves R:R when combined with higher TP.
 OPT_GRID: Dict[str, List] = {
-    "adx_delta":   [-4, -2, 0, 2, 4],      # added to mode's adx_min
-    "score_delta": [-0.04, 0.0, 0.04],     # added to mode's min_score
-    "sl_mult":     [0.8, 1.0, 1.2],        # multiplied on style's sl_atr
-    "tp_mult":     [1.5, 2.0, 2.5],        # multiplied on style's tp_atr
+    "adx_delta":   [-4, -2, 0, 2, 4],           # added to mode's adx_min
+    "score_delta": [-0.04, 0.0, 0.04],          # added to mode's min_score
+    "sl_mult":     [0.7, 0.85, 1.0, 1.15],      # tighter SL options for better R:R
+    "tp_mult":     [2.0, 2.5, 3.0, 3.5, 4.0],  # higher TP to capture trend moves
 }
 
 TF_FROM_STYLE: Dict[str, str] = {
