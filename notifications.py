@@ -429,3 +429,58 @@ def email_first_trade(to: str, symbol: str, side: str, grade: str, equity: float
         f"Your first Asymmetric AI trade is live — {symbol} {side}",
         _email_base(content, footer="The AI manages risk automatically. Your hard floor protects your capital."),
     )
+
+
+def email_api_key_expired(to: str, symbol: str) -> None:
+    content = f"""
+    <h2 style="margin:0 0 6px;font-size:20px;font-weight:900;color:#f1f5f9;">Your API Key Has Expired</h2>
+    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">{symbol}</p>
+    <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(248,113,113,0.3);
+                border-radius:14px;padding:18px;margin-bottom:16px;">
+      <div style="font-size:15px;font-weight:900;color:#f87171;margin-bottom:8px;">⚠️ AI Stopped — Action Required</div>
+      <div style="font-size:13px;color:#fca5a5;line-height:1.7;">
+        Bybit rejected your API key because it has expired. The AI has stopped automatically to prevent any issues.
+      </div>
+    </div>
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:16px;margin-bottom:16px;">
+      <div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:12px;">What to do next:</div>
+      <div style="font-size:12px;color:#9ca3af;line-height:1.8;">
+        1. Log in to <b style="color:#f1f5f9;">bybit.com</b><br>
+        2. Go to <b style="color:#f1f5f9;">Account → API Management</b><br>
+        3. Create a new API key (Read + Trade permissions only)<br>
+        4. Open <b style="color:#f1f5f9;">Asymmetric AI → Settings → Exchange</b><br>
+        5. Disconnect the old key and connect your new key<br>
+        6. Restart the AI
+      </div>
+    </div>
+    <p style="font-size:12px;color:#4b5563;margin-top:12px;">
+      No trades were affected — the AI stopped before attempting any new positions.
+    </p>"""
+    send_email(to, f"Action required — API key expired ({symbol})", _email_base(content))
+
+
+def email_exchange_disconnected_open_trade(to: str, symbol: str, trade_count: int) -> None:
+    content = f"""
+    <h2 style="margin:0 0 6px;font-size:20px;font-weight:900;color:#f1f5f9;">Exchange Disconnected</h2>
+    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">{symbol}</p>
+    <div style="background:rgba(245,158,11,0.08);border:1px solid rgba(252,211,77,0.3);
+                border-radius:14px;padding:18px;margin-bottom:16px;">
+      <div style="font-size:15px;font-weight:900;color:#fbbf24;margin-bottom:8px;">
+        ⚠️ You have {trade_count} open trade{'s' if trade_count != 1 else ''} — reconnect immediately
+      </div>
+      <div style="font-size:13px;color:#fde68a;line-height:1.7;">
+        Your exchange was disconnected while a trade is still active on Bybit.
+        The AI is paused and cannot manage your position until you reconnect.
+      </div>
+    </div>
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:12px;padding:16px;margin-bottom:16px;">
+      <div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:12px;">What to do:</div>
+      <div style="font-size:12px;color:#9ca3af;line-height:1.8;">
+        1. Open <b style="color:#f1f5f9;">Asymmetric AI → Settings → Exchange</b><br>
+        2. Reconnect your exchange<br>
+        3. The AI will automatically resume managing your position<br><br>
+        <span style="color:#f87171;">If you do not reconnect, your open trade will not have a stop-loss managed by the AI.
+        You may need to close it manually on Bybit.</span>
+      </div>
+    </div>"""
+    send_email(to, f"Urgent — Exchange disconnected with open trade ({symbol})", _email_base(content))

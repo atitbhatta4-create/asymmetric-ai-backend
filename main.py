@@ -34,6 +34,7 @@ from notifications import (
     email_ai_started, email_trade_opened,
     email_trade_closed, email_ai_stopped,
     email_first_trade,
+    email_api_key_expired, email_exchange_disconnected_open_trade,
 )
 from indicators import (
     _ema, _rsi, _atr, _adx, _rsi_series,
@@ -4823,7 +4824,22 @@ class AutoRunner:
                 _save_runner_state(self)
 
         except Exception as e:
-            self.log(f"RECONCILE error (non-fatal): {e}")
+            _err_str = str(e)
+            if "EXCHANGE_AUTH_ERROR" in _err_str:
+                self.log(
+                    "⚠️ API KEY EXPIRED — Bybit rejected your API key. "
+                    "Check your email for steps to reconnect."
+                )
+                email_api_key_expired(self.email, self.symbol)
+                _tg_alert(
+                    f"🔑 <b>API Key Expired — AI Stopped</b>\n"
+                    f"{self.email} | {self.symbol}\n"
+                    f"Email sent to user. Engine stopped."
+                )
+                self.blocked_reason = "API_KEY_EXPIRED"
+                self.stop_event.set()
+            else:
+                self.log(f"RECONCILE error (non-fatal): {e}")
 
     def _run_loop(self):
         cooldown_sec = max(60, self.interval_sec)
@@ -4873,8 +4889,27 @@ class AutoRunner:
                 if not get_exchange(self.email):
                     self.blocked_reason = "EXCHANGE_NOT_CONNECTED"
                     self.last_signal = "BLOCKED: EXCHANGE_NOT_CONNECTED"
-                    self.log("Blocked: exchange not connected.")
-                    continue
+                    if self.pending_trades:
+                        _n = len(self.pending_trades)
+                        self.log(
+                            f"⚠️ Exchange disconnected — {_n} trade(s) still open on Bybit. "
+                            f"AI is paused. Reconnect your exchange to resume."
+                        )
+                        email_exchange_disconnected_open_trade(self.email, self.symbol, _n)
+                        _tg_alert(
+                            f"🔌 <b>Exchange Disconnected — Open Trade</b>\n"
+                            f"{self.email} | {self.symbol}\n"
+                            f"{_n} trade(s) open. Email sent to user. AI waiting for reconnection."
+                        )
+                        continue  # keep looping — auto-resumes when exchange reconnects
+                    else:
+                        self.log("⚠️ Exchange disconnected — AI stopping now.")
+                        _tg_alert(
+                            f"🔌 <b>Exchange Disconnected — AI Stopped</b>\n"
+                            f"{self.email} | {self.symbol}"
+                        )
+                        self.stop_event.set()
+                        break
 
                 # ── Step 1: Close any pending trades first (real exit after one interval) ──
                 if self.pending_trades:
