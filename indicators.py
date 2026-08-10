@@ -949,9 +949,10 @@ def _compute_signal_layers(
     }
 
     failed = [k for k, v in breakdown.items() if not v.get("ok") and k != "mtf_15m"]
-    if failed or total_score < min_score:
+    _score_below = round(total_score, 4) < round(min_score, 4)
+    if failed or _score_below:
         reasons = " | ".join(breakdown[k]["reason"] for k in failed if breakdown[k].get("reason"))
-        if total_score < min_score and not failed:
+        if _score_below and not failed:
             reasons = f"Signal quality {total_score:.2f} below threshold {min_score:.2f} — setup not strong enough"
         return {
             "ok": False,

@@ -50,7 +50,7 @@ COIN_PARAMS: Dict[str, Dict[str, Any]] = {
         "atr_min_pct":              0.1,
         "tp_multiplier":            2.5,
         "sl_multiplier":            1.0,
-        "volume_confirmation_mult": 1.3,
+        "volume_confirmation_mult": 1.1,
         "ema_distance_max_pct":     2.2,
         "pullback_tolerance_pct":   0.7,
     },
