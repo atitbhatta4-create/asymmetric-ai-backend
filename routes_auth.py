@@ -68,6 +68,39 @@ def _rate_limit(request: Request, limit: int, window: int = 60) -> None:
         _rl_hits[key] = hits
 
 
+# ── Brute force lockout — per email ───────────────────────────────────────────
+_FAILED_LOGINS: Dict[str, list] = {}  # email → [timestamps of failed attempts]
+_FAILED_LOCK   = threading.Lock()
+_MAX_FAILURES  = 5     # lock after 5 failures
+_FAILURE_WIN   = 900   # within 15 minutes
+_LOCKOUT_SEC   = 1800  # locked for 30 minutes
+
+
+def _record_failed_login(email: str) -> None:
+    now = time.time()
+    with _FAILED_LOCK:
+        attempts = [t for t in _FAILED_LOGINS.get(email, []) if now - t < _FAILURE_WIN]
+        attempts.append(now)
+        _FAILED_LOGINS[email] = attempts
+
+
+def _check_brute_force(email: str) -> None:
+    now = time.time()
+    with _FAILED_LOCK:
+        attempts = [t for t in _FAILED_LOGINS.get(email, []) if now - t < _FAILURE_WIN]
+        if len(attempts) >= _MAX_FAILURES:
+            wait = int(_LOCKOUT_SEC - (now - attempts[-1]))
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many failed attempts. Try again in {max(1, wait // 60)} minute(s)."
+            )
+
+
+def _clear_failed_login(email: str) -> None:
+    with _FAILED_LOCK:
+        _FAILED_LOGINS.pop(email, None)
+
+
 # ── Password helpers ───────────────────────────────────────────────────────────
 def hash_pw(pw: str) -> str:
     return bcrypt.hashpw(pw.encode(), bcrypt.gensalt(rounds=12)).decode()
@@ -192,6 +225,7 @@ def signup(request: Request, payload: SignupIn):
 def login(request: Request, payload: AuthIn, response: Response):
     _rate_limit(request, limit=15, window=900)
     email = payload.email.strip().lower()
+    _check_brute_force(email)
 
     with db_conn() as conn:
         cur = conn.cursor()
@@ -199,6 +233,7 @@ def login(request: Request, payload: AuthIn, response: Response):
         row = cur.fetchone()
 
     if not row or not verify_pw(payload.password, row["password_hash"]):
+        _record_failed_login(email)
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     # Silently migrate legacy SHA-256 hash to bcrypt on successful login
@@ -226,6 +261,7 @@ def login(request: Request, payload: AuthIn, response: Response):
         cur.execute("INSERT INTO sessions(token, email, created_at) VALUES(%s, %s, %s)", (token, email, now))
         conn.commit()
 
+    _clear_failed_login(email)
     set_session_cookie(response, token)
 
     from main import ensure_user_state
@@ -260,7 +296,8 @@ def session_me(session: Optional[str] = Cookie(default=None)):
 
 
 @auth_router.post("/auth/change-password")
-def change_password(payload: ChangePasswordIn, user=Depends(_require_user)):
+def change_password(request: Request, payload: ChangePasswordIn, user=Depends(_require_user)):
+    _rate_limit(request, limit=5, window=900)
     email = user["email"]
     if not payload.current_password or not payload.new_password:
         raise HTTPException(status_code=400, detail="Both current and new password are required.")
@@ -353,7 +390,8 @@ def reset_password(request: Request, payload: VerifyOtpIn):
 
 # Legacy token-based reset (kept for compatibility)
 @auth_router.post("/auth/forgot")
-def auth_forgot(payload: ForgotIn):
+def auth_forgot(request: Request, payload: ForgotIn):
+    _rate_limit(request, limit=3, window=3600)
     email = payload.email.strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="email required")
@@ -376,7 +414,8 @@ def auth_forgot(payload: ForgotIn):
 
 
 @auth_router.post("/auth/reset")
-def auth_reset(payload: ResetIn):
+def auth_reset(request: Request, payload: ResetIn):
+    _rate_limit(request, limit=5, window=900)
     token = payload.token.strip()
     new_pw = payload.new_password or ""
     if not token or len(new_pw) < 8:
