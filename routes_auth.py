@@ -264,8 +264,8 @@ def change_password(payload: ChangePasswordIn, user=Depends(_require_user)):
     email = user["email"]
     if not payload.current_password or not payload.new_password:
         raise HTTPException(status_code=400, detail="Both current and new password are required.")
-    if len(payload.new_password) < 6:
-        raise HTTPException(status_code=400, detail="New password must be at least 6 characters.")
+    if len(payload.new_password) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters.")
 
     with db_conn() as conn:
         cur = conn.cursor()
@@ -321,8 +321,8 @@ def reset_password(request: Request, payload: VerifyOtpIn):
 
     if not email or not code or not payload.new_password:
         raise HTTPException(status_code=400, detail="Email, code and new password required")
-    if len(payload.new_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    if len(payload.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
 
     OTP_TTL = 15 * 60
 
@@ -372,15 +372,15 @@ def auth_forgot(payload: ForgotIn):
         )
         conn.commit()
 
-    return {"ok": True, "reset_token": token}
+    return {"ok": True}
 
 
 @auth_router.post("/auth/reset")
 def auth_reset(payload: ResetIn):
     token = payload.token.strip()
     new_pw = payload.new_password or ""
-    if not token or len(new_pw) < 4:
-        raise HTTPException(status_code=400, detail="token + new_password required (min 4 chars)")
+    if not token or len(new_pw) < 8:
+        raise HTTPException(status_code=400, detail="token + new_password required (min 8 chars)")
 
     with db_conn() as conn:
         cur = conn.cursor()
@@ -522,8 +522,8 @@ def admin_force_reset(payload: AdminForceResetIn):
         raise HTTPException(status_code=400, detail="email required")
     if email not in _ADMIN_EMAILS:
         raise HTTPException(status_code=400, detail="email is not an admin")
-    if not payload.new_password or len(payload.new_password) < 4:
-        raise HTTPException(status_code=400, detail="new_password min 4 chars")
+    if not payload.new_password or len(payload.new_password) < 8:
+        raise HTTPException(status_code=400, detail="new_password min 8 chars")
 
     with db_conn() as conn:
         cur = conn.cursor()

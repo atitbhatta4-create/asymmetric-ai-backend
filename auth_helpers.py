@@ -15,12 +15,32 @@ from fastapi import Cookie, Depends, HTTPException
 from database import db_conn
 
 _SESSION_CACHE: Dict[str, tuple] = {}
-_SESSION_TTL     = 300           # reuse cached lookup for 5 minutes
-_SESSION_MAX_AGE = 7 * 24 * 3600 # hard expiry — matches cookie max_age
+_SESSION_TTL        = 300            # reuse cached lookup for 5 minutes
+_SESSION_MAX_AGE    = 7 * 24 * 3600  # hard expiry — matches cookie max_age
+_CACHE_LAST_PURGE   = 0.0
+_CACHE_PURGE_EVERY  = 3600           # purge stale entries once per hour
 
+
+def _purge_session_cache() -> None:
+    global _CACHE_LAST_PURGE
+    now = time.time()
+    if now - _CACHE_LAST_PURGE < _CACHE_PURGE_EVERY:
+        return
+    cutoff = now - _SESSION_TTL
+    stale = [t for t, (_, ts) in _SESSION_CACHE.items() if ts < cutoff]
+    for t in stale:
+        _SESSION_CACHE.pop(t, None)
+    _CACHE_LAST_PURGE = now
+
+_ADMIN_EMAILS_RAW = os.getenv("ADMIN_EMAILS", "").strip()
+if not _ADMIN_EMAILS_RAW and os.getenv("ENV", "dev") == "prod":
+    raise RuntimeError(
+        "ADMIN_EMAILS env var is not set in production. "
+        "Add your admin email(s) to Render environment variables."
+    )
 ADMIN_EMAILS: set = set(
     e.strip().lower()
-    for e in os.getenv("ADMIN_EMAILS", "admin@demo.com").split(",")
+    for e in (_ADMIN_EMAILS_RAW or "admin@demo.com").split(",")
     if e.strip()
 )
 
@@ -28,6 +48,7 @@ ADMIN_EMAILS: set = set(
 def require_user(session: Optional[str] = Cookie(default=None)) -> Dict:
     if not session:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    _purge_session_cache()
     now = time.time()
     cached = _SESSION_CACHE.get(session)
     if cached:
