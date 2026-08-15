@@ -197,7 +197,7 @@ def signup(request: Request, payload: SignupIn):
     if not email or not payload.password:
         raise HTTPException(status_code=400, detail="Email and password required")
 
-    from main import signup_is_enabled, seat_capacity, seats_used
+    from user_state import signup_is_enabled, seat_capacity, seats_used
     if not signup_is_enabled():
         raise HTTPException(status_code=403, detail="Signup is currently disabled by admin.")
     if seats_used() >= seat_capacity():
@@ -264,7 +264,7 @@ def login(request: Request, payload: AuthIn, response: Response):
     _clear_failed_login(email)
     set_session_cookie(response, token)
 
-    from main import ensure_user_state
+    from user_state import ensure_user_state
     ensure_user_state(email)
 
     totp_row = _get_totp_row(email)
@@ -451,7 +451,7 @@ def totp_status(user=Depends(_require_user)):
 
 @auth_router.post("/auth/2fa/setup")
 def totp_setup(user=Depends(_require_user)):
-    from main import encrypt_key
+    from user_state import encrypt_key
     email = user["email"]
     secret = pyotp.random_base32()
     uri = pyotp.totp.TOTP(secret).provisioning_uri(name=email, issuer_name="Asymmetric AI")
@@ -469,7 +469,7 @@ def totp_setup(user=Depends(_require_user)):
 
 @auth_router.post("/auth/2fa/confirm")
 def totp_confirm(payload: TotpCodeIn, user=Depends(_require_user)):
-    from main import decrypt_key
+    from user_state import decrypt_key
     email = user["email"]
     row = _get_totp_row(email)
     if not row:
@@ -491,7 +491,7 @@ def totp_confirm(payload: TotpCodeIn, user=Depends(_require_user)):
 
 @auth_router.post("/auth/2fa/verify")
 def totp_verify(payload: TotpCodeIn, user=Depends(_require_user)):
-    from main import decrypt_key
+    from user_state import decrypt_key
     email = user["email"]
     row = _get_totp_row(email)
     if not row or not row["enabled"]:
@@ -507,7 +507,7 @@ def totp_verify(payload: TotpCodeIn, user=Depends(_require_user)):
 
 @auth_router.post("/auth/2fa/disable")
 def totp_disable(payload: TotpCodeIn, user=Depends(_require_user)):
-    from main import decrypt_key
+    from user_state import decrypt_key
     email = user["email"]
     row = _get_totp_row(email)
     if not row or not row["enabled"]:

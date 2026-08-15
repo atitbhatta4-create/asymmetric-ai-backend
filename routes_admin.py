@@ -55,7 +55,8 @@ def _analytics_win_rate(rows: List[Dict]) -> Dict:
 
 @admin_router.get("/admin/status")
 def admin_status(admin=Depends(_require_admin)):
-    from main import AUTO_RUNNERS, signup_is_enabled, seat_capacity, seats_used
+    from main import AUTO_RUNNERS
+    from user_state import signup_is_enabled, seat_capacity, seats_used
     return {
         "ok": True, "admin": admin,
         "signup_enabled": signup_is_enabled(),
@@ -68,7 +69,7 @@ def admin_status(admin=Depends(_require_admin)):
 
 @admin_router.get("/admin/settings")
 def admin_settings(admin=Depends(_require_admin)):
-    from main import signup_is_enabled, seat_capacity, seats_used
+    from user_state import signup_is_enabled, seat_capacity, seats_used
     return {
         "signup_enabled": signup_is_enabled(),
         "seat_capacity": seat_capacity(),
@@ -79,7 +80,7 @@ def admin_settings(admin=Depends(_require_admin)):
 
 @admin_router.post("/admin/settings")
 def admin_update_settings(payload: AdminSettingsIn, admin=Depends(_require_admin)):
-    from main import admin_set_setting, signup_is_enabled, seat_capacity, seats_used
+    from user_state import admin_set_setting, signup_is_enabled, seat_capacity, seats_used
     sc = int(max(1, min(100000, payload.seat_capacity)))
     admin_set_setting("signup_enabled", "true" if payload.signup_enabled else "false")
     admin_set_setting("seat_capacity", str(sc))
@@ -106,7 +107,7 @@ def admin_stop_all_ai(admin=Depends(_require_admin)):
 
 @admin_router.post("/admin/reset-user")
 def admin_reset_user(email: str, admin=Depends(_require_admin)):
-    from main import ensure_user_state, set_equity, get_session_id, set_session_id
+    from user_state import ensure_user_state, set_equity, get_session_id, set_session_id
     email = (email or "").strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="email required")

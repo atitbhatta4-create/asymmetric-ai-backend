@@ -27,7 +27,7 @@ from config import (
     OKX_BASE, OKX_TF_MAP, TF_MIN_INTERVAL,
     START_EQUITY, RiskMode, Side, TF, TradeStyle, TF_MAP, HIGHER_TF_MAP,
     TRADE_STYLE_PARAMS, _MID_CANDLE_THRESHOLDS, _MID_CANDLE_MIN_SCORE, _MID_CANDLE_INTERVAL,
-    DUBAI_TZ, now_dubai, dubai_day_key,
+    DUBAI_TZ, now_dubai, dubai_day_key, now_utc_str,
 )
 from notifications import (
     tg_alert as _tg_alert,
@@ -47,6 +47,17 @@ from coin_params import get_coin_params
 from mode_params import get_mode_config, get_style_config
 from data_feeds import _fetch_btc_weekly_candles, _fetch_economic_calendar
 from auth_helpers import require_user, require_admin, ADMIN_EMAILS
+from user_state import (
+    encrypt_key, decrypt_key, mask_key,
+    ensure_user_state, get_equity, set_equity,
+    get_session_id, set_session_id,
+    _compute_floor, update_peak_ath,
+    _check_first_trade_email,
+    get_exchange,
+    admin_get_setting, admin_set_setting,
+    signup_is_enabled, seat_capacity, seats_used,
+    _FIRST_TRADE_SENT,
+)
 from market_data import (
     to_okx_inst,
     _validate_exchange_param, _validate_symbol, _validate_path_symbol,
@@ -241,9 +252,6 @@ async def global_rate_limit(request: Request, call_next):
 
     return await call_next(request)
 
-
-def now_utc_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def init_db() -> None:
@@ -538,234 +546,10 @@ start_monthly_scheduler()
 # Runners are resumed after all AutoRunner code is defined — see bottom of file.
 
 # =========================
-# SECURITY — KEY ENCRYPTION
-# =========================
-
-# Fernet encryption for API keys stored in DB
-# Set ENCRYPTION_KEY env var to a Fernet key (generate once: Fernet.generate_key().decode())
-_RAW_ENC_KEY = os.getenv("ENCRYPTION_KEY", "")
-_FERNET: Fernet | None = None
-if _RAW_ENC_KEY:
-    try:
-        _FERNET = Fernet(_RAW_ENC_KEY.encode() if isinstance(_RAW_ENC_KEY, str) else _RAW_ENC_KEY)
-    except Exception:
-        pass
-
-if not _FERNET:
-    if os.getenv("ENV", "dev") == "prod":
-        # In production, a missing ENCRYPTION_KEY means all stored API keys
-        # would be encrypted with a publicly-known fallback — unacceptable.
-        # Crash loudly so the misconfiguration is caught immediately on deploy.
-        raise RuntimeError(
-            "ENCRYPTION_KEY env var is not set in production. "
-            "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\" "
-            "and add it to your Render environment variables."
-        )
-    import base64
-    _FALLBACK = base64.urlsafe_b64encode(hashlib.sha256(b"asym-dev-key").digest())
-    _FERNET = Fernet(_FALLBACK)
-
-
-def encrypt_key(value: str) -> str:
-    if not value:
-        return ""
-    return _FERNET.encrypt(value.encode()).decode()
-
-
-def decrypt_key(value: str) -> str:
-    if not value:
-        return ""
-    try:
-        return _FERNET.decrypt(value.encode()).decode()
-    except Exception:
-        # Fallback: might be unencrypted legacy value
-        return value
-
-
-def mask_key(s: str) -> str:
-    s = (s or "").strip()
-    if len(s) <= 8:
-        return "*" * len(s)
-    return s[:4] + ("*" * (len(s) - 8)) + s[-4:]
-
-
-def ensure_user_state(email: str) -> None:
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT equity, session_id FROM user_state WHERE email = %s", (email,))
-        row = cur.fetchone()
-        if not row:
-            cur.execute(
-                "INSERT INTO user_state(email, equity, session_id) VALUES(%s, %s, %s)"
-                " ON CONFLICT (email) DO NOTHING",
-                (email, START_EQUITY, 0),
-            )
-            conn.commit()
-        elif float(row["equity"]) <= 0:
-            # Equity is zero — reset to configured start amount
-            cur.execute("UPDATE user_state SET equity = %s WHERE email = %s", (START_EQUITY, email))
-            conn.commit()
-
-
-def get_equity(email: str) -> float:
-    ensure_user_state(email)
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT equity FROM user_state WHERE email = %s", (email,))
-        row = cur.fetchone()
-    return float(row["equity"])
-
-
-def set_equity(email: str, equity: float) -> None:
-    ensure_user_state(email)
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE user_state SET equity = %s WHERE email = %s", (float(equity), email))
-        conn.commit()
-
-
-_FIRST_TRADE_SENT: set = set()
-
-def _check_first_trade_email(email: str, symbol: str, side: str, grade: str, equity: float) -> None:
-    """Send first-trade milestone email once per user lifetime. Uses in-memory set + DB count."""
-    if email in _FIRST_TRADE_SENT:
-        return
-    try:
-        with db_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) AS n FROM trade_outcomes WHERE email=%s", (email,))
-            row = cur.fetchone()
-            total = int(row["n"] if row else 0)
-        if total <= 1:
-            from notifications import email_first_trade
-            email_first_trade(email, symbol, side, grade, equity)
-        _FIRST_TRADE_SENT.add(email)
-    except Exception:
-        pass
-
-
-def _compute_floor(peak: float, start_capital: float) -> float:
-    """R1 Hybrid floor: flat 15% from peak until equity doubles start capital,
-    then ratchet tightens to 10% from peak (locks in compounded gains).
-    Flat while proving edge, ratchet only after 2× growth."""
-    if start_capital > 0 and peak >= 2.0 * start_capital:
-        return round(max(start_capital * 0.85, peak * 0.90), 2)
-    return round(peak * 0.85, 2)
-
-
-def update_peak_ath(email: str, peak: float, equity_after: float) -> None:
-    """Update peak_equity, all_time_high, and floor_equity in user_state after each trade.
-    All three columns only ever increase — never decrease — so the floor survives runner
-    restarts, redeploys, and ai_runner_state deletions without dropping."""
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT peak_equity, all_time_high, floor_equity, starting_capital FROM user_state WHERE email = %s",
-            (email,),
-        )
-        row = cur.fetchone()
-        if row:
-            new_peak = max(float(row["peak_equity"] or 0), peak)
-            new_ath = max(float(row["all_time_high"] or 0), equity_after)
-            _sc = float(row["starting_capital"] or 0)
-            # R1 hybrid floor: only ever moves UP.
-            # Stored here so it persists even after ai_runner_state is deleted on stop.
-            new_floor = max(float(row["floor_equity"] or 0), _compute_floor(new_peak, _sc))
-            cur.execute(
-                "UPDATE user_state SET peak_equity=%s, all_time_high=%s, floor_equity=%s "
-                "WHERE email=%s",
-                (new_peak, new_ath, new_floor, email),
-            )
-            conn.commit()
-
-
-def get_session_id(email: str) -> int:
-    ensure_user_state(email)
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT session_id FROM user_state WHERE email = %s", (email,))
-        row = cur.fetchone()
-    return int(row["session_id"] or 0)
-
-
-def set_session_id(email: str, sid: int) -> None:
-    ensure_user_state(email)
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE user_state SET session_id = %s WHERE email = %s", (int(sid), email))
-        conn.commit()
-
-
-def get_exchange(email: str) -> Optional[dict]:
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM exchange_keys WHERE email = %s", (email,))
-        row = cur.fetchone()
-    if not row:
-        return None
-    # Decrypt keys before returning — callers always get plain text
-    return {
-        **dict(row),
-        "api_key":    decrypt_key(row["api_key"]),
-        "api_secret": decrypt_key(row["api_secret"]),
-        "passphrase": decrypt_key(row.get("passphrase") or ""),
-    }
-
-
-_EX_STATUS_CACHE: Dict[str, tuple] = {}  # email → (status_dict, ts)
-_EX_STATUS_TTL = 60                       # re-read DB at most once per minute
-_EX_TEST_CACHE: Dict[str, tuple] = {}    # email → (test_result_dict, ts)
-_EX_TEST_TTL = 60                         # live Bybit test cached 60s
-
-# =========================
-# ADMIN
+# ADMIN SEED + EXCHANGE CACHES
 # =========================
 DEMO_EMAIL = "admin@demo.com"
-DEMO_PASS = "demo123"
-
-def admin_get_setting(key: str, default: str) -> str:
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT v FROM admin_settings WHERE k=%s", (key,))
-        row = cur.fetchone()
-    return (row["v"] if row else default)
-
-
-def admin_set_setting(key: str, value: str) -> None:
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO admin_settings(k,v,updated_at) VALUES(%s,%s,%s)
-            ON CONFLICT(k) DO UPDATE SET
-                v=excluded.v,
-                updated_at=excluded.updated_at
-            """,
-            (key, value, now_utc_str()),
-        )
-        conn.commit()
-
-
-def signup_is_enabled() -> bool:
-    if os.environ.get("INVITE_ONLY", "").lower() == "true":
-        return False
-    return admin_get_setting("signup_enabled", "true").lower() == "true"
-
-
-def seat_capacity() -> int:
-    try:
-        return int(admin_get_setting("seat_capacity", "50"))
-    except Exception:
-        return 50
-
-
-def seats_used() -> int:
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) AS n FROM users")
-        n = int(cur.fetchone()["n"])
-    return n
-
+DEMO_PASS  = "demo123"
 
 # Seed demo admin user if missing
 with db_conn() as conn:
@@ -777,6 +561,11 @@ with db_conn() as conn:
             (DEMO_EMAIL, hash_pw(DEMO_PASS), now_utc_str()),
         )
         conn.commit()
+
+_EX_STATUS_CACHE: Dict[str, tuple] = {}  # email → (status_dict, ts)
+_EX_STATUS_TTL = 60
+_EX_TEST_CACHE: Dict[str, tuple] = {}    # email → (test_result_dict, ts)
+_EX_TEST_TTL = 60
 
 # =========================
 # BASIC INFO
