@@ -48,13 +48,11 @@ from mode_params import get_mode_config, get_style_config
 from data_feeds import _fetch_btc_weekly_candles, _fetch_economic_calendar
 from auth_helpers import require_user, require_admin, ADMIN_EMAILS
 from market_data import (
-    BYBIT_BASE, BYBIT_TF_MAP,
-    to_okx_inst, to_bybit_symbol,
+    to_okx_inst,
     _validate_exchange_param, _validate_symbol, _validate_path_symbol,
-    okx_price, bybit_price, binance_price, _route_price,
-    _fetch_klines_sync, _route_klines, _fetch_klines_raw,
-    _fetch_klines_bybit_sync, _fetch_klines_mexc_sync,
-    _fetch_ticker_24h, _parse_binance_style_24h,
+    binance_price, _route_price,
+    _fetch_klines_sync, _route_klines,
+    _fetch_ticker_24h,
     _fetch_symbols_for_exchange,
 )
 from routes_backtest import backtest_router
