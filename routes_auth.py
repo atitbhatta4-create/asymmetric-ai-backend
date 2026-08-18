@@ -199,9 +199,9 @@ def signup(request: Request, payload: SignupIn):
 
     from user_state import signup_is_enabled, seat_capacity, seats_used
     if not signup_is_enabled():
-        raise HTTPException(status_code=403, detail="Signup is currently disabled by admin.")
+        raise HTTPException(status_code=403, detail="We're not accepting new registrations at this time. Please check back soon or contact support.")
     if seats_used() >= seat_capacity():
-        raise HTTPException(status_code=403, detail="Seats are full. Signup is closed.")
+        raise HTTPException(status_code=403, detail="We've reached our current member capacity. Registration is temporarily closed — please check back soon.")
 
     with db_conn() as conn:
         cur = conn.cursor()
