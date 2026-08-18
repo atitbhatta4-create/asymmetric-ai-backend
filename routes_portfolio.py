@@ -46,7 +46,22 @@ class RiskPreviewIn(BaseModel):
 def risk_preview(payload: RiskPreviewIn, user=Depends(require_user)):
     email = user["email"]
     equity = get_equity(email)
-    out = mini_asym_risk_engine(payload.mode, equity)
+
+    # Read user's real starting capital so the preview shows accurate
+    # growth/reduction relative to their actual first deposit, not the
+    # paper trading $1000 default.
+    start_capital: float = 0.0
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT starting_capital FROM user_state WHERE email = %s", (email,))
+            row = cur.fetchone()
+            if row:
+                start_capital = float(row["starting_capital"] or 0)
+    except Exception:
+        pass
+
+    out = mini_asym_risk_engine(payload.mode, equity, start_capital=start_capital or None)
     c = out["computed"]
     return {
         "allowed": True,
