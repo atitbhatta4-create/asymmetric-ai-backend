@@ -529,9 +529,9 @@ def totp_disable(payload: TotpCodeIn, user=Depends(_require_user)):
 # ── Debug / admin-access endpoints ─────────────────────────────────────────────
 
 @auth_router.get("/debug/email")
-def debug_email(to: str = Query(default="")):
+def debug_email(to: str = Query(default=""), admin=Depends(require_admin)):
     if not SMTP_USER or not SMTP_PASS:
-        return {"ok": False, "error": "SMTP_USER or SMTP_PASS not set", "smtp_user": repr(SMTP_USER)}
+        return {"ok": False, "error": "SMTP_USER or SMTP_PASS not set"}
     target = to.strip() if to.strip() else SMTP_USER
     content = "<h2 style='color:#f1f5f9;'>Test Email</h2><p style='opacity:0.85;'>SMTP is working on Asymmetric AI.</p>"
     err = None
@@ -548,7 +548,7 @@ def debug_email(to: str = Query(default="")):
             srv.sendmail(SMTP_USER, target, msg.as_string())
     except Exception as e:
         err = str(e)
-    return {"ok": err is None, "sent_to": target, "smtp_user": SMTP_USER, "error": err}
+    return {"ok": err is None, "sent_to": target, "error": err}
 
 
 @auth_router.post("/admin/force-reset-password")
