@@ -192,7 +192,7 @@ def _session_quality(trade_style: str) -> tuple:
 
     # Asia / Tokyo session — decent crypto liquidity
     if 6 <= hour < 12:
-        return 0.85, f"Asia {hour:02d}:xx"
+        return 0.90, f"Asia {hour:02d}:xx"
 
     # London open — institutions enter, volume spikes, big directional moves
     if 12 <= hour < 16:
@@ -207,7 +207,7 @@ def _session_quality(trade_style: str) -> tuple:
         return 0.92, f"NY {hour:02d}:xx"
 
     # NY close / wind-down (01:00-02:00)
-    return 0.80, f"NY-close {hour:02d}:xx"
+    return 0.85, f"NY-close {hour:02d}:xx"
 
 
 def _ema_spread_trend(ema_fast: List[float], ema_slow: List[float], n: int = 4) -> tuple:
@@ -445,7 +445,7 @@ def _classify_regime(
 
     # ── MARGINAL — weak trend or mildly elevated volatility ─────────────────
     # Still tradeable but requires a stronger signal than normal.
-    # Raise min_score by 0.07 so only the clearest setups fire.
+    # Raise min_score by 0.04 so only the clearest setups fire.
     if (adx is not None and adx < 22) or spike_ratio >= 1.80:
         label = (
             f"ADX {adx_val} — weak trend"
@@ -455,7 +455,7 @@ def _classify_regime(
         return {
             "regime": "MARGINAL",
             "block":  False,
-            "min_score_penalty": 0.07,
+            "min_score_penalty": 0.04,
             "spike_ratio": spike_ratio,
             "adx": adx_val,
             "reason": f"{label}. Requiring stronger signal before entry.",
@@ -627,7 +627,7 @@ def _compute_signal_layers(
     # mom_n_add=0 for SCALP: MINI_ASYM already requires 1 candle — adding a 2nd
     # blocks too many valid entries in volatile/recovering markets.
     _style_adj = {
-        "SCALP":     dict(pullback_mult=0.40, mom_n_add=0, rsi_tighten=4,  score_add=0.02),
+        "SCALP":     dict(pullback_mult=0.55, mom_n_add=0, rsi_tighten=4,  score_add=0.02),
         "DAY_TRADE": dict(pullback_mult=0.70, mom_n_add=0, rsi_tighten=2,  score_add=0.02),
         "SWING":     dict(pullback_mult=1.20, mom_n_add=0, rsi_tighten=-3, score_add=0.0),
     }
