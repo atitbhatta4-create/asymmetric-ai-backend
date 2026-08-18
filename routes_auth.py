@@ -529,7 +529,7 @@ def totp_disable(payload: TotpCodeIn, user=Depends(_require_user)):
 # ── Debug / admin-access endpoints ─────────────────────────────────────────────
 
 @auth_router.get("/debug/email")
-def debug_email(to: str = Query(default=""), admin=Depends(require_admin)):
+def debug_email(to: str = Query(default=""), admin=Depends(_require_admin)):
     if not SMTP_USER or not SMTP_PASS:
         return {"ok": False, "error": "SMTP_USER or SMTP_PASS not set"}
     target = to.strip() if to.strip() else SMTP_USER
