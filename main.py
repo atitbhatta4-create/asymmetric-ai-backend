@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, field_validator
 
-from database import db, db_conn, USING_PG, column_exists, serial_pk, log_trade_outcome, init_outcome_log_table
+from database import db, db_conn, USING_PG, serial_pk, log_trade_outcome, init_outcome_log_table
 from config import (
     ENV, IS_PROD, REAL_TRADING, FRONTEND_ORIGINS,
     SMTP_USER, SMTP_PASS, SMTP_HOST, SMTP_PORT,
@@ -133,7 +133,13 @@ def _tg_alert(text: str) -> None:
 # =========================
 # App
 # =========================
-app = FastAPI(title="Asymmetric AI Backend", version="0.9.0")
+app = FastAPI(
+    title="Asymmetric AI Backend",
+    version="0.9.0",
+    docs_url=None if IS_PROD else "/docs",
+    redoc_url=None if IS_PROD else "/redoc",
+    openapi_url=None if IS_PROD else "/openapi.json",
+)
 
 # Simple in-memory rate limiter — keyed by (endpoint, ip)
 _rl_hits: Dict[str, List[float]] = {}
@@ -410,8 +416,7 @@ def init_db() -> None:
             msg         TEXT NOT NULL
         )
         """)
-        if not column_exists(conn, "ai_logs", "session_id"):
-            cur.execute("ALTER TABLE ai_logs ADD COLUMN session_id INTEGER")
+        cur.execute("ALTER TABLE ai_logs ADD COLUMN IF NOT EXISTS session_id INTEGER")
 
         # Performance indexes
         cur.execute("CREATE INDEX IF NOT EXISTS ix_ai_sessions_email ON ai_sessions(email)")
@@ -458,42 +463,22 @@ def init_db() -> None:
         )
         """)
 
-        if not column_exists(conn, "users", "display_name"):
-            cur.execute("ALTER TABLE users ADD COLUMN display_name TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT DEFAULT ''")
 
-        # Safe migrations for existing databases
-        if not column_exists(conn, "trades", "reason"):
-            cur.execute("ALTER TABLE trades ADD COLUMN reason TEXT")
-        if not column_exists(conn, "trades", "session_id"):
-            cur.execute("ALTER TABLE trades ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
-        if not column_exists(conn, "user_state", "session_id"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
-        if not column_exists(conn, "trades", "hard_floor"):
-            cur.execute("ALTER TABLE trades ADD COLUMN hard_floor REAL DEFAULT 0")
-        if not column_exists(conn, "trades", "is_primary"):
-            cur.execute("ALTER TABLE trades ADD COLUMN is_primary INTEGER DEFAULT 1")
-        if not column_exists(conn, "user_state", "peak_equity"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN peak_equity REAL DEFAULT 0")
-        if not column_exists(conn, "user_state", "all_time_high"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN all_time_high REAL DEFAULT 0")
-        # Floor reset tracking — records initial starting capital and reset history for Situation 1/2/3 logic
-        if not column_exists(conn, "user_state", "starting_capital"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN starting_capital REAL DEFAULT 0")
-        if not column_exists(conn, "user_state", "floor_reset_count"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN floor_reset_count INTEGER DEFAULT 0")
-        if not column_exists(conn, "user_state", "floor_reset_at"):
-            # JSON array of Unix timestamps — used to enforce 7-day cooldown after 3 resets in 30 days
-            cur.execute("ALTER TABLE user_state ADD COLUMN floor_reset_at TEXT DEFAULT '[]'")
-        # Persistent floor — separate from peak so it survives ai_runner_state deletion.
-        # Updated via max() only — never decreases except on explicit reset (reset_sandbox / reset-floor).
-        # Fixes: floor dropping after redeploy when ai_runner_state (and its floor_equity column) is cleared.
-        if not column_exists(conn, "user_state", "floor_equity"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN floor_equity REAL DEFAULT 0")
-        # Persists why the engine last stopped — allows frontend to show correct warning on restart.
-        # Cleared when engine starts successfully (auto_start writes NULL).
-        if not column_exists(conn, "user_state", "last_stop_reason"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN last_stop_reason TEXT DEFAULT NULL")
-        # Live runner state — persists adaptive_strictness, open positions, etc. across redeploys
+        # Schema migrations — ADD COLUMN IF NOT EXISTS is atomic in Postgres,
+        # no pre-check needed (eliminates 16 information_schema round-trips on startup)
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS reason TEXT")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS session_id INTEGER NOT NULL DEFAULT 0")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS hard_floor REAL DEFAULT 0")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS is_primary INTEGER DEFAULT 1")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS session_id INTEGER NOT NULL DEFAULT 0")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS peak_equity REAL DEFAULT 0")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS all_time_high REAL DEFAULT 0")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS starting_capital REAL DEFAULT 0")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS floor_reset_count INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS floor_reset_at TEXT DEFAULT '[]'")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS floor_equity REAL DEFAULT 0")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS last_stop_reason TEXT DEFAULT NULL")
         for col, coltype, defval in [
             ("adaptive_strictness",  "REAL",    "1.0"),
             ("last_trade_ts",        "REAL",    "0"),
@@ -503,10 +488,9 @@ def init_db() -> None:
             ("floor_equity",         "REAL",    "0"),
             ("consecutive_wins",     "INTEGER", "0"),
             ("session_start_equity", "REAL",    "0"),
-            ("strictness_day_key",   "TEXT",    "''"),  # Dubai date when strictness was last changed
+            ("strictness_day_key",   "TEXT",    "''"),
         ]:
-            if not column_exists(conn, "ai_runner_state", col):
-                cur.execute(f"ALTER TABLE ai_runner_state ADD COLUMN {col} {coltype} DEFAULT {defval}")
+            cur.execute(f"ALTER TABLE ai_runner_state ADD COLUMN IF NOT EXISTS {col} {coltype} DEFAULT {defval}")
 
         # Support chat tables
         cur.execute(f"""
@@ -5994,7 +5978,7 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
             f"Error: `{_start_err}`\n"
             f"This caused a 500 on /auto/start — engine NOT running."
         )
-        raise HTTPException(status_code=500, detail=f"Engine failed to start: {_start_err}")
+        raise HTTPException(status_code=500, detail="Engine failed to start. Our team has been notified.")
 
     try:
         with db_conn() as _clr_conn:
