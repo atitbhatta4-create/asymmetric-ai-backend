@@ -586,21 +586,13 @@ def config():
     return {
         "market": "okx",
         "timezone": "Asia/Dubai (UTC+4)",
-        "env": ENV,
-        "frontend_origins": FRONTEND_ORIGINS,
-        "db": "postgresql" if USING_PG else "sqlite",
         "real_trading": REAL_TRADING,
     }
 
 
 @app.get("/health")
 def health():
-    return {
-        "health": "green",
-        "market": "okx",
-        "db": "postgresql" if USING_PG else "sqlite",
-        "env": ENV,
-    }
+    return {"health": "green"}
 
 
 # Auth endpoints moved to routes_auth.py (auth_router)
