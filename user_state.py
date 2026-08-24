@@ -164,6 +164,20 @@ def mark_onboarding_complete(email: str) -> None:
         conn.commit()
 
 
+def check_and_mark_reference_email(email: str) -> bool:
+    """Atomically transitions reference_email_sent FALSE→TRUE.
+    Returns True exactly once per user — the caller should send the email when True."""
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE user_state SET reference_email_sent = TRUE"
+            " WHERE email = %s AND reference_email_sent = FALSE RETURNING email",
+            (email,),
+        )
+        conn.commit()
+        return cur.fetchone() is not None
+
+
 # ── First-trade milestone email ───────────────────────────────────────────────
 
 _FIRST_TRADE_SENT: set = set()

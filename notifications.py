@@ -41,6 +41,29 @@ def tg_alert(text: str) -> None:
 
 # ── Email helpers ─────────────────────────────────────────────────────────────
 
+def _letter_base(content: str, footer: str = "Automated trading involves risk. Never trade more than you can afford to lose.") -> str:
+    """Open, letter-style layout for welcome and guide emails."""
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Asymmetric AI</title></head>
+<body style="margin:0;padding:0;background:#060a18;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#cbd5e1;">
+  <div style="max-width:600px;margin:0 auto;padding:52px 28px 60px;">
+
+    <div style="margin-bottom:36px;">
+      <span style="font-size:11px;font-weight:900;color:#00ffe0;letter-spacing:0.12em;text-transform:uppercase;">Asymmetric&nbsp;AI</span>
+    </div>
+
+    <div>{content}</div>
+
+    <div style="margin-top:52px;padding-top:20px;border-top:1px solid rgba(255,255,255,0.06);
+                font-size:11px;color:#2d3748;line-height:1.8;">
+      {footer}<br>
+      &copy; Asymmetric AI &nbsp;&middot;&nbsp; You are receiving this because you have an account with us.
+    </div>
+  </div>
+</body></html>"""
+
+
 def _email_base(content: str, footer: str = "Automated trading involves risk. Never trade more than you can afford to lose.") -> str:
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -332,190 +355,234 @@ def email_2fa_enabled(to: str) -> None:
 # ── Onboarding emails ─────────────────────────────────────────────────────────
 
 def email_welcome(to: str) -> None:
+    items = [
+        ("How to create a trade-only API key", "Bybit, OKX, or Binance — step by step."),
+        ("Where to keep your funds", "The right account type on your exchange."),
+        ("Modes and styles", "Which combination is right for your goals and risk tolerance."),
+        ("The 4-layer signal system", "Why the AI trades less than you expect — and why that's the point."),
+        ("Capital protection", "Hard floor, drawdown tiers, and per-trade loss caps explained."),
+        ("Starting the AI", "Set a coin, mode, style, duration, and go."),
+    ]
+    rows = "".join(
+        f"""<tr>
+          <td style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.05);vertical-align:top;width:16px;">
+            <span style="font-size:11px;font-weight:900;color:#00ffe0;">{i+1}</span>
+          </td>
+          <td style="padding:10px 0 10px 14px;border-bottom:1px solid rgba(255,255,255,0.05);">
+            <div style="font-size:14px;font-weight:600;color:#e2e8f0;margin-bottom:2px;">{title}</div>
+            <div style="font-size:13px;color:#6b7280;">{desc}</div>
+          </td>
+        </tr>"""
+        for i, (title, desc) in enumerate(items)
+    )
     content = f"""
-    <div style="font-size:22px;font-weight:900;color:#f1f5f9;margin-bottom:4px;">Welcome to Asymmetric AI</div>
-    <div style="font-size:13px;color:#6b7280;margin-bottom:22px;">Your account is ready.</div>
+    <p style="font-size:16px;color:#94a3b8;margin:0 0 28px;line-height:1;font-weight:300;">Hi,</p>
 
-    <div style="font-size:14px;color:#94a3b8;line-height:1.75;margin-bottom:22px;">
-      We've prepared a <b style="color:#e2e8f0;">6-step setup guide</b> inside the app that walks you through everything — connecting your exchange API, choosing the right mode and style, understanding how the risk engine protects your capital, and placing your first trade.
-    </div>
+    <h1 style="font-size:26px;font-weight:900;color:#f1f5f9;margin:0 0 16px;line-height:1.2;letter-spacing:-0.02em;">
+      Welcome to Asymmetric AI.
+    </h1>
 
-    <div style="background:#0b1120;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px 16px;margin-bottom:22px;">
-      <div style="font-size:11px;font-weight:700;color:#4b5563;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:10px;">What the guide covers</div>
-      {''.join(f'<div style="display:flex;align-items:center;padding:5px 0;font-size:13px;color:#94a3b8;"><span style="color:#00ffe0;margin-right:10px;font-weight:700;">&#x2022;</span>{item}</div>' for item in [
-          "How to create a trade-only API key on Bybit, OKX, or Binance",
-          "Where to keep your funds (exchange trading account)",
-          "Modes and styles — which one is right for you",
-          "How the 4-layer signal system filters entries",
-          "Capital protection: hard floor, drawdown tiers, per-trade caps",
-          "How to start the AI in under 2 minutes",
-      ])}
-    </div>
+    <p style="font-size:15px;color:#94a3b8;line-height:1.75;margin:0 0 28px;">
+      Your account is ready. Before you start trading, we'd like to walk you through a short setup guide inside the app. It covers everything you need to know and takes about five minutes.
+    </p>
 
-    <div style="font-size:12px;color:#4b5563;line-height:1.6;">
-      Once you complete the guide, you'll receive a full reference email you can keep in your inbox — covering everything in one place for whenever you need a quick reminder.
-    </div>"""
+    <p style="font-size:12px;font-weight:800;color:#00ffe0;text-transform:uppercase;letter-spacing:0.1em;margin:0 0 14px;">
+      What the guide covers
+    </p>
+
+    <table style="width:100%;border-collapse:collapse;margin-bottom:32px;">{rows}</table>
+
+    <p style="font-size:15px;color:#94a3b8;line-height:1.75;margin:0 0 32px;">
+      Once you complete the guide, we'll send you a full reference email — every detail in one place for whenever you need a quick reminder.
+    </p>
+
+    <p style="font-size:14px;color:#6b7280;margin:0;">
+      The Asymmetric AI Team
+    </p>"""
     send_email(
         to,
-        "Welcome to Asymmetric AI — Let's get you set up",
-        _email_base(content, footer="You are in control. The AI only trades with your API keys on your exchange account."),
+        "Welcome to Asymmetric AI",
+        _letter_base(content, footer="You are in control. The AI only trades with your API keys on your exchange account."),
     )
 
 
 def email_onboarding_complete(to: str) -> None:
-    def _section(title: str, body: str) -> str:
-        return f"""
-        <div style="margin-bottom:24px;">
-          <div style="display:flex;align-items:center;margin-bottom:12px;">
-            <div style="width:3px;height:18px;background:#00ffe0;border-radius:2px;margin-right:10px;flex-shrink:0;"></div>
-            <div style="font-size:13px;font-weight:800;color:#f1f5f9;text-transform:uppercase;letter-spacing:0.06em;">{title}</div>
-          </div>
-          {body}
-        </div>"""
+    def _heading(text: str) -> str:
+        return (
+            f'<p style="font-size:11px;font-weight:800;color:#00ffe0;text-transform:uppercase;'
+            f'letter-spacing:0.1em;margin:36px 0 14px;padding-bottom:10px;'
+            f'border-bottom:1px solid rgba(0,255,224,0.12);">{text}</p>'
+        )
 
-    def _api_row(exchange: str, steps: str, funds: str) -> str:
-        return f"""
-        <div style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.05);">
-          <div style="font-size:12px;font-weight:800;color:#00ffe0;margin-bottom:4px;">{exchange}</div>
-          <div style="font-size:12px;color:#94a3b8;line-height:1.6;">{steps}</div>
-          <div style="font-size:11px;color:#6b7280;margin-top:3px;">Funds &rarr; {funds}</div>
-        </div>"""
+    def _exchange_block(name: str, steps: str, funds: str) -> str:
+        return (
+            f'<p style="font-size:13px;font-weight:700;color:#e2e8f0;margin:16px 0 4px;">{name}</p>'
+            f'<p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0 0 4px;">{steps}</p>'
+            f'<p style="font-size:12px;color:#4b5563;margin:0 0 12px;">Funds &rarr; {funds}</p>'
+        )
 
-    def _layer_row(num: str, title: str, desc: str) -> str:
-        return f"""
-        <div style="display:flex;align-items:flex-start;padding:9px 0;border-bottom:1px solid rgba(255,255,255,0.04);">
-          <div style="min-width:22px;height:22px;background:rgba(0,255,224,0.1);border:1px solid rgba(0,255,224,0.25);
-                      border-radius:50%;display:flex;align-items:center;justify-content:center;
-                      font-size:10px;font-weight:900;color:#00ffe0;margin-right:12px;flex-shrink:0;
-                      line-height:22px;text-align:center;">{num}</div>
-          <div>
-            <div style="font-size:12px;font-weight:700;color:#e2e8f0;margin-bottom:1px;">{title}</div>
-            <div style="font-size:12px;color:#6b7280;">{desc}</div>
-          </div>
-        </div>"""
+    def _layer(num: str, title: str, desc: str) -> str:
+        return (
+            f'<tr>'
+            f'<td style="padding:10px 14px 10px 0;vertical-align:top;width:28px;">'
+            f'<span style="display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;'
+            f'background:rgba(0,255,224,0.08);border:1px solid rgba(0,255,224,0.2);border-radius:50%;'
+            f'font-size:10px;font-weight:900;color:#00ffe0;">{num}</span>'
+            f'</td>'
+            f'<td style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.05);">'
+            f'<div style="font-size:14px;font-weight:600;color:#e2e8f0;margin-bottom:3px;">{title}</div>'
+            f'<div style="font-size:13px;color:#6b7280;line-height:1.6;">{desc}</div>'
+            f'</td></tr>'
+        )
 
-    def _shield_row(label: str, value: str) -> str:
-        return f"""
-        <div style="display:flex;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.04);">
-          <div style="font-size:16px;margin-right:10px;">&#x2713;</div>
-          <div>
-            <span style="font-size:12px;font-weight:700;color:#e2e8f0;">{label} &nbsp;</span>
-            <span style="font-size:12px;color:#6b7280;">{value}</span>
-          </div>
-        </div>"""
+    def _shield(label: str, value: str) -> str:
+        return (
+            f'<tr><td style="padding:9px 14px 9px 0;vertical-align:top;width:16px;">'
+            f'<span style="color:#00ffe0;font-size:13px;font-weight:700;">&#x2714;</span></td>'
+            f'<td style="padding:9px 0;border-bottom:1px solid rgba(255,255,255,0.05);">'
+            f'<span style="font-size:14px;font-weight:600;color:#e2e8f0;">{label}</span> &nbsp;'
+            f'<span style="font-size:13px;color:#6b7280;">{value}</span>'
+            f'</td></tr>'
+        )
 
-    def _mode_row(name: str, size: str, lev: str, best: str, flagship: bool = False) -> str:
-        bg = "rgba(0,255,224,0.06)" if flagship else "transparent"
-        badge = " &nbsp;<span style='font-size:9px;background:rgba(0,255,224,0.15);color:#00ffe0;border-radius:4px;padding:1px 5px;font-weight:800;'>FLAGSHIP</span>" if flagship else ""
-        return f"""
-        <tr style="background:{bg};">
-          <td style="padding:8px 10px;font-size:12px;font-weight:700;color:#00ffe0;white-space:nowrap;">{name}{badge}</td>
-          <td style="padding:8px 6px;font-size:12px;color:#94a3b8;text-align:center;">{size}</td>
-          <td style="padding:8px 6px;font-size:12px;color:#94a3b8;text-align:center;">{lev}</td>
-          <td style="padding:8px 6px;font-size:12px;color:#94a3b8;">{best}</td>
-        </tr>"""
-
-    capital_section = _section("Recommended Capital", """
-        <div style="background:rgba(0,255,224,0.05);border:1px solid rgba(0,255,224,0.15);border-radius:10px;padding:12px 16px;">
-          <div style="font-size:13px;color:#a7f3d0;font-weight:700;margin-bottom:4px;">Minimum: $50 USDT</div>
-          <div style="font-size:12px;color:#6b7280;line-height:1.6;">$100–$500 is the ideal starting range for meaningful results with controlled risk. Keep funds in your exchange trading account — not in your bank wallet.</div>
-        </div>""")
-
-    api_section = _section("API Key Setup", f"""
-        <div style="background:#0c1322;border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:0 14px;">
-          {_api_row("Bybit", "Profile &rarr; API Management &rarr; Create New Key &rarr; Enable <b style='color:#e2e8f0;'>Read</b> + <b style='color:#e2e8f0;'>Trade</b>. Disable Withdrawal.", "Unified Trading Account &middot; USDT")}
-          {_api_row("OKX", "Profile &rarr; API &rarr; Create V5 API Key &rarr; Enable <b style='color:#e2e8f0;'>Read</b> + <b style='color:#e2e8f0;'>Trade</b>, set a Passphrase. Disable Withdrawal.", "Trading Account &middot; USDT")}
-          <div style="padding:12px 0;">
-            <div style="font-size:12px;font-weight:800;color:#00ffe0;margin-bottom:4px;">Binance</div>
-            <div style="font-size:12px;color:#94a3b8;line-height:1.6;">Profile &rarr; API Management &rarr; Create API &rarr; Enable <b style='color:#e2e8f0;'>Reading</b> + <b style='color:#e2e8f0;'>Futures Trading</b>. Disable Withdrawal.</div>
-            <div style="font-size:11px;color:#6b7280;margin-top:3px;">Funds &rarr; Futures Account &middot; USDT</div>
-          </div>
-        </div>
-        <div style="font-size:11px;color:#6b7280;margin-top:8px;">Never enable Withdrawal permission. Asymmetric AI can only trade — it cannot move funds off your account.</div>""")
-
-    signal_section = _section("How the 4-Layer Signal Works", f"""
-        <div style="background:#0c1322;border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:0 14px;">
-          {_layer_row("1", "Regime", "ADX + ATR confirm a real trend is active — filters out choppy, low-quality markets.")}
-          {_layer_row("2", "Direction", "4h EMA21 vs EMA50 determines whether to go long or short.")}
-          {_layer_row("3", "Entry", "Price in a pullback zone, qualifying candle pattern, RSI confirmed.")}
-          {_layer_row("4", "Momentum", "Volume is real and recent candles confirm the move.")}
-        </div>
-        <div style="font-size:12px;color:#6b7280;margin-top:8px;line-height:1.6;">All 4 layers must align before any trade is placed. If even one is missing, the engine waits. This is why trade frequency is lower than you might expect — and why entry quality is higher.</div>""")
-
-    protection_section = _section("Capital Protection", f"""
-        <div style="background:#0c1322;border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:0 14px;">
-          {_shield_row("Hard Floor", "Engine stops entirely if equity drops 15% from its peak.")}
-          {_shield_row("Drawdown Tiers", "Position size shrinks at &minus;4% &rarr; 65%, &minus;7% &rarr; 40%, &minus;10% &rarr; 25%.")}
-          {_shield_row("Per-Trade Loss Cap", "Max 1.5% (Scalp) / 2% (Day Trade) / 3% (Swing) of equity per trade.")}
-          {_shield_row("Non-Custodial", "We hold no funds. We cannot withdraw. Trade permission only.")}
-        </div>""")
-
-    modes_section = _section("Modes &amp; Styles — Quick Reference", f"""
-        <div style="background:#0c1322;border:1px solid rgba(255,255,255,0.07);border-radius:10px;overflow:hidden;">
-          <table style="width:100%;border-collapse:collapse;">
-            <thead>
-              <tr style="border-bottom:1px solid rgba(255,255,255,0.08);">
-                <th style="padding:9px 10px;font-size:11px;font-weight:700;color:#4b5563;text-align:left;text-transform:uppercase;letter-spacing:0.05em;">Mode</th>
-                <th style="padding:9px 6px;font-size:11px;font-weight:700;color:#4b5563;text-align:center;text-transform:uppercase;letter-spacing:0.05em;">Size</th>
-                <th style="padding:9px 6px;font-size:11px;font-weight:700;color:#4b5563;text-align:center;text-transform:uppercase;letter-spacing:0.05em;">Lev</th>
-                <th style="padding:9px 6px;font-size:11px;font-weight:700;color:#4b5563;text-align:left;text-transform:uppercase;letter-spacing:0.05em;">Best For</th>
-              </tr>
-            </thead>
-            <tbody>
-              {_mode_row("ULTRA_SAFE", "30%", "2×", "First week, getting familiar")}
-              {_mode_row("SAFE", "45%", "3×", "Conservative, steady growth")}
-              {_mode_row("MINI_ASYM", "65%", "6×", "Most popular, balanced performance", flagship=True)}
-              {_mode_row("NORMAL", "60%", "5×", "Balanced exposure")}
-              {_mode_row("AGGRESSIVE", "85%", "8×", "Experienced traders only")}
-            </tbody>
-          </table>
-        </div>
-        <div style="margin-top:12px;background:#0c1322;border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:12px 14px;">
-          <div style="font-size:11px;font-weight:800;color:#4b5563;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Trade Styles</div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;">
-            <div style="flex:1;min-width:100px;padding:8px 10px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);border-radius:8px;">
-              <div style="font-size:11px;font-weight:800;color:#e2e8f0;">SCALP</div>
-              <div style="font-size:11px;color:#6b7280;margin-top:2px;">15m chart · checks every 15 min</div>
-            </div>
-            <div style="flex:1;min-width:100px;padding:8px 10px;background:rgba(0,255,224,0.05);border:1px solid rgba(0,255,224,0.15);border-radius:8px;">
-              <div style="font-size:11px;font-weight:800;color:#00ffe0;">DAY TRADE &#x2605;</div>
-              <div style="font-size:11px;color:#6b7280;margin-top:2px;">1h chart · checks every hour</div>
-            </div>
-            <div style="flex:1;min-width:100px;padding:8px 10px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);border-radius:8px;">
-              <div style="font-size:11px;font-weight:800;color:#e2e8f0;">SWING</div>
-              <div style="font-size:11px;color:#6b7280;margin-top:2px;">4h chart · checks every 4 hours</div>
-            </div>
-          </div>
-        </div>""")
-
-    closing = """
-        <div style="margin-top:28px;padding-top:20px;border-top:1px solid rgba(255,255,255,0.06);">
-          <div style="font-size:13px;color:#94a3b8;line-height:1.7;">
-            You're all set. Log in to the app, configure your API keys in Settings, and start the AI when you're ready.<br><br>
-            If you have questions, reach out to our support team at any time — we're here to help.
-          </div>
-          <div style="margin-top:16px;font-size:12px;color:#4b5563;">
-            — The Asymmetric AI Team
-          </div>
-        </div>"""
+    def _mode(name: str, size: str, lev: str, best: str, flagship: bool = False) -> str:
+        name_cell = (
+            f'<span style="font-size:13px;font-weight:700;color:#00ffe0;">{name}</span>'
+            + (
+                ' &nbsp;<span style="font-size:9px;background:rgba(0,255,224,0.12);color:#00ffe0;'
+                'border-radius:3px;padding:1px 5px;font-weight:800;letter-spacing:0.05em;">FLAGSHIP</span>'
+                if flagship else ""
+            )
+        )
+        row_bg = 'background:rgba(0,255,224,0.04);' if flagship else ''
+        return (
+            f'<tr style="{row_bg}">'
+            f'<td style="padding:9px 10px 9px 0;border-bottom:1px solid rgba(255,255,255,0.05);">{name_cell}</td>'
+            f'<td style="padding:9px 8px;border-bottom:1px solid rgba(255,255,255,0.05);font-size:13px;color:#6b7280;text-align:center;">{size}</td>'
+            f'<td style="padding:9px 8px;border-bottom:1px solid rgba(255,255,255,0.05);font-size:13px;color:#6b7280;text-align:center;">{lev}</td>'
+            f'<td style="padding:9px 0 9px 8px;border-bottom:1px solid rgba(255,255,255,0.05);font-size:13px;color:#6b7280;">{best}</td>'
+            f'</tr>'
+        )
 
     content = f"""
-    <div style="margin-bottom:22px;">
-      <div style="font-size:20px;font-weight:900;color:#f1f5f9;margin-bottom:6px;">Setup Complete</div>
-      <div style="font-size:13px;color:#6b7280;line-height:1.6;">Your account is ready. This email is your permanent reference — bookmark it or save it for whenever you need a quick reminder of how everything works.</div>
-    </div>
+    <p style="font-size:16px;color:#94a3b8;margin:0 0 28px;font-weight:300;">Hi,</p>
 
-    {capital_section}
-    {api_section}
-    {signal_section}
-    {protection_section}
-    {modes_section}
-    {closing}"""
+    <h1 style="font-size:26px;font-weight:900;color:#f1f5f9;margin:0 0 16px;line-height:1.2;letter-spacing:-0.02em;">
+      Your setup is complete.
+    </h1>
+
+    <p style="font-size:15px;color:#94a3b8;line-height:1.75;margin:0 0 8px;">
+      This is your permanent reference guide — save this email for whenever you need a quick reminder of how Asymmetric AI works.
+    </p>
+
+    {_heading("Minimum Capital")}
+
+    <p style="font-size:15px;color:#94a3b8;line-height:1.75;margin:0 0 8px;">
+      <span style="color:#e2e8f0;font-weight:700;">Minimum: $50 USDT.</span> &nbsp;$100–$500 is the ideal starting range for meaningful results with controlled risk.
+    </p>
+    <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0;">
+      Keep your funds in your exchange <b style="color:#94a3b8;">trading account</b>, not in a bank or funding wallet. The AI can only access and trade funds in the trading account.
+    </p>
+
+    {_heading("Connecting Your Exchange")}
+
+    <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0 0 4px;">
+      Create a <b style="color:#94a3b8;">trade-only API key</b> on your exchange. Always enable <b style="color:#94a3b8;">Read</b> and <b style="color:#94a3b8;">Trade</b> permissions. <b style="color:#ff8080;">Never enable Withdrawal</b> — Asymmetric AI cannot and should not be able to move your funds.
+    </p>
+
+    {_exchange_block(
+        "Bybit",
+        "Profile &rarr; API Management &rarr; Create New Key &rarr; Enable Read + Trade &rarr; Disable Withdrawal",
+        "Unified Trading Account &middot; USDT"
+    )}
+    {_exchange_block(
+        "OKX",
+        "Profile &rarr; API &rarr; Create V5 API Key &rarr; Enable Read + Trade, set a Passphrase &rarr; Disable Withdrawal",
+        "Trading Account &middot; USDT"
+    )}
+    {_exchange_block(
+        "Binance",
+        "Profile &rarr; API Management &rarr; Create API &rarr; Enable Reading + Futures Trading &rarr; Disable Withdrawal",
+        "Futures Account &middot; USDT"
+    )}
+
+    {_heading("How the 4-Layer Signal Works")}
+
+    <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0 0 14px;">
+      Every trade must pass all four layers before it is placed. If any layer fails, the AI waits. This is what keeps entry quality high — and why you'll see fewer trades than you might expect.
+    </p>
+
+    <table style="width:100%;border-collapse:collapse;margin-bottom:8px;">
+      {_layer("1", "Regime", "ADX + ATR confirm that a real, tradeable trend is active — not chop or sideways noise.")}
+      {_layer("2", "Direction", "4h EMA21 vs EMA50 determines the trend bias: long or short.")}
+      {_layer("3", "Entry", "Price is in a pullback zone with a qualifying candle pattern and confirmed RSI.")}
+      {_layer("4", "Momentum", "Volume is real and recent candles confirm the move is continuing.")}
+    </table>
+
+    {_heading("Capital Protection")}
+
+    <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0 0 14px;">
+      The risk engine operates continuously in the background, independent of the signal. These controls are always active.
+    </p>
+
+    <table style="width:100%;border-collapse:collapse;margin-bottom:8px;">
+      {_shield("Hard floor", "The engine stops entirely if your equity drops 15% from its peak.")}
+      {_shield("Drawdown tiers", "Position size automatically shrinks at &minus;4% &rarr; 65%, &minus;7% &rarr; 40%, &minus;10% &rarr; 25%.")}
+      {_shield("Per-trade loss cap", "Maximum 1.5% (Scalp) / 2% (Day Trade) / 3% (Swing) of equity per trade.")}
+      {_shield("Non-custodial", "We hold no funds and cannot withdraw. API keys grant trade permission only.")}
+    </table>
+
+    {_heading("Modes &amp; Styles")}
+
+    <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0 0 14px;">
+      Choose a <b style="color:#94a3b8;">Mode</b> (how aggressively the AI sizes positions) and a <b style="color:#94a3b8;">Style</b> (which timeframe it trades on). If you're unsure, start with <b style="color:#00ffe0;">MINI_ASYM</b> mode and <b style="color:#00ffe0;">DAY_TRADE</b> style.
+    </p>
+
+    <table style="width:100%;border-collapse:collapse;margin-bottom:20px;">
+      <thead>
+        <tr>
+          <th style="padding:0 10px 8px 0;font-size:11px;color:#374151;text-align:left;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Mode</th>
+          <th style="padding:0 8px 8px;font-size:11px;color:#374151;text-align:center;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Size</th>
+          <th style="padding:0 8px 8px;font-size:11px;color:#374151;text-align:center;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Lev</th>
+          <th style="padding:0 0 8px 8px;font-size:11px;color:#374151;text-align:left;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Best for</th>
+        </tr>
+      </thead>
+      <tbody>
+        {_mode("ULTRA_SAFE", "30%", "2×", "First week, getting familiar")}
+        {_mode("SAFE", "45%", "3×", "Conservative, steady growth")}
+        {_mode("MINI_ASYM", "65%", "6×", "Most popular, balanced performance", flagship=True)}
+        {_mode("NORMAL", "60%", "5×", "Balanced exposure")}
+        {_mode("AGGRESSIVE", "85%", "8×", "Experienced traders only")}
+      </tbody>
+    </table>
+
+    <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0 0 4px;">
+      <b style="color:#94a3b8;">SCALP</b> &mdash; 15-minute chart, checks every 15 minutes.<br>
+      <b style="color:#00ffe0;">DAY_TRADE</b> &mdash; 1-hour chart, checks every hour. <span style="color:#00ffe0;">Recommended.</span><br>
+      <b style="color:#94a3b8;">SWING</b> &mdash; 4-hour chart, checks every 4 hours.
+    </p>
+
+    {_heading("Starting the AI")}
+
+    <p style="font-size:15px;color:#94a3b8;line-height:1.75;margin:0 0 8px;">
+      From the Dashboard: add your API keys in Settings, choose a coin, select your Mode and Style, set a duration (1–30 days), and press <b style="color:#e2e8f0;">Start AI</b>. That's it.
+    </p>
+    <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0;">
+      The AI will send you an email every time a trade opens or closes. When your session ends, you'll receive a notification and can start a new one whenever you're ready.
+    </p>
+
+    <p style="font-size:14px;color:#6b7280;margin:40px 0 0;line-height:1.6;">
+      If you have any questions, reach out through the support chat inside the app — we're here to help.
+    </p>
+
+    <p style="font-size:14px;color:#6b7280;margin:20px 0 0;">
+      The Asymmetric AI Team
+    </p>"""
 
     send_email(
         to,
-        "Asymmetric AI — Setup complete. Your reference guide.",
-        _email_base(content, footer="You are in control. The AI only trades with your API keys on your exchange account. We can never withdraw your funds."),
+        "Your Asymmetric AI setup guide",
+        _letter_base(content, footer="You are in control. The AI only trades with your API keys on your exchange account. We can never withdraw your funds."),
     )
 
 
