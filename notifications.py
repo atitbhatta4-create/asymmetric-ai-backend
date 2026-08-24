@@ -43,16 +43,32 @@ def tg_alert(text: str) -> None:
 
 def _email_base(content: str, footer: str = "Automated trading involves risk. Never trade more than you can afford to lose.") -> str:
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
-<body style="margin:0;padding:0;background:#050814;font-family:system-ui,-apple-system,sans-serif;color:#e5e7eb;">
-  <div style="max-width:520px;margin:32px auto;padding:0 16px;">
-    <div style="background:#0a0f1e;border:1px solid rgba(255,255,255,0.08);border-radius:18px;overflow:hidden;">
-      <div style="padding:18px 24px;border-bottom:1px solid rgba(255,255,255,0.06);">
-        <span style="font-size:17px;font-weight:900;color:#00ffe0;">Asymmetric AI</span>
-      </div>
-      <div style="padding:24px;">{content}</div>
-      <div style="padding:14px 24px;border-top:1px solid rgba(255,255,255,0.06);font-size:12px;color:#4b5563;">
-        {footer}
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Asymmetric AI</title></head>
+<body style="margin:0;padding:0;background:#060a18;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#e2e8f0;">
+  <div style="max-width:540px;margin:36px auto;padding:0 16px 32px;">
+
+    <!-- Header -->
+    <div style="margin-bottom:6px;">
+      <span style="font-size:15px;font-weight:900;color:#00ffe0;letter-spacing:-0.02em;">Asymmetric AI</span>
+    </div>
+
+    <!-- Card -->
+    <div style="background:#0d1426;border:1px solid rgba(255,255,255,0.09);border-radius:16px;overflow:hidden;
+                box-shadow:0 4px 24px rgba(0,0,0,0.4);">
+
+      <!-- Accent bar -->
+      <div style="height:3px;background:linear-gradient(90deg,#00ffe0,#00ff9d);"></div>
+
+      <!-- Body -->
+      <div style="padding:28px 28px 24px;">{content}</div>
+
+      <!-- Footer -->
+      <div style="padding:14px 28px 18px;border-top:1px solid rgba(255,255,255,0.06);">
+        <div style="font-size:11px;color:#374151;line-height:1.6;">{footer}</div>
+        <div style="margin-top:8px;font-size:11px;color:#1f2937;">
+          &copy; Asymmetric AI &nbsp;&middot;&nbsp; You are receiving this because you have an account with us.
+        </div>
       </div>
     </div>
   </div>
@@ -86,13 +102,14 @@ def send_email(to: str, subject: str, html: str) -> None:
 
 def email_password_changed(to: str) -> None:
     content = f"""
-    <h2 style="margin:0 0 14px;font-size:20px;font-weight:900;color:#f1f5f9;">Password Changed</h2>
-    <p style="margin:0 0 14px;opacity:0.85;line-height:1.6;">
-      Your password for <b>{to}</b> was changed successfully.
-    </p>
-    <div style="background:rgba(220,38,38,0.12);border:1px solid rgba(248,113,113,0.3);
-                border-radius:12px;padding:12px 16px;font-size:13px;color:#fecaca;">
-      If this wasn't you, change your password immediately and secure your account.
+    <div style="font-size:19px;font-weight:800;color:#f1f5f9;margin-bottom:6px;">Password Changed</div>
+    <div style="font-size:13px;color:#6b7280;margin-bottom:20px;">Security notification for {to}</div>
+    <div style="font-size:14px;color:#94a3b8;line-height:1.7;margin-bottom:18px;">
+      Your password was changed successfully. You can continue using Asymmetric AI with your new password.
+    </div>
+    <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);
+                border-radius:10px;padding:13px 16px;font-size:13px;color:#fca5a5;line-height:1.6;">
+      If you did not make this change, reset your password immediately and contact our support team.
     </div>"""
     send_email(to, "Your Asymmetric AI password was changed", _email_base(content))
 
@@ -103,25 +120,22 @@ def email_ai_started(to: str, symbol: str, mode: str, trade_style: str,
     interval_str = f"{sp['interval'] // 60}m"
     duration_str = f"{duration_days} day{'s' if duration_days != 1 else ''}" if duration_days > 0 else "Unlimited"
     content = f"""
-    <h2 style="margin:0 0 6px;font-size:20px;font-weight:900;color:#f1f5f9;">AI Trading Started</h2>
-    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">
-      Your AI trader is live and monitoring the market.
-    </p>
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);
-                border-radius:14px;padding:16px;margin-bottom:16px;">
-      <table style="width:100%;border-collapse:collapse;font-size:14px;">
-        {''.join(f'<tr><td style="padding:7px 0;color:#6b7280;width:140px;">{k}</td><td style="padding:7px 0;font-weight:900;color:#f1f5f9;">{v}</td></tr>' for k,v in [
-            ("Coin", symbol), ("Mode", mode), ("Style", trade_style),
-            ("Timeframe", sp["tf"]), ("Check every", interval_str), ("Duration", duration_str),
-            ("Max trades / day", str(max_trades)), ("Bad trade limit", f"{stop_after_bad} per day"),
-        ])}
-      </table>
+    <div style="font-size:19px;font-weight:800;color:#f1f5f9;margin-bottom:4px;">AI Trading Started</div>
+    <div style="font-size:13px;color:#6b7280;margin-bottom:22px;">Your AI is live and monitoring the market.</div>
+
+    <div style="background:#0b1120;border:1px solid rgba(255,255,255,0.08);border-radius:12px;overflow:hidden;margin-bottom:18px;">
+      {''.join(f'<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid rgba(255,255,255,0.05);"><span style="font-size:12px;color:#6b7280;">{k}</span><span style="font-size:13px;font-weight:700;color:#f1f5f9;">{v}</span></div>' for k,v in [
+          ("Coin", symbol), ("Mode", mode), ("Style", trade_style),
+          ("Timeframe", sp["tf"]), ("Checks every", interval_str), ("Duration", duration_str),
+          ("Max trades / day", str(max_trades)), ("Bad trade limit", f"{stop_after_bad} per day"),
+      ])}
+      <div style="padding:10px 14px;font-size:11px;color:#374151;">Session configuration</div>
     </div>
-    <p style="margin:0;font-size:12px;color:#4b5563;">
-      The AI only trades when all 4 signal layers pass.
-      You will receive an email for each completed trade.
-    </p>"""
-    send_email(to, f"AI started — {symbol} {mode}", _email_base(content))
+
+    <div style="font-size:12px;color:#4b5563;line-height:1.7;">
+      The AI only trades when all 4 signal layers align. Expect fewer trades than you might anticipate — this is by design. You will receive a notification for every trade that opens and closes.
+    </div>"""
+    send_email(to, f"AI started — {symbol} · {mode}", _email_base(content))
 
 
 def email_trade_opened(to: str, symbol: str, side: str, mode: str,
@@ -132,28 +146,27 @@ def email_trade_opened(to: str, symbol: str, side: str, mode: str,
     risk_pct   = abs(entry - sl) / entry * 100
     reward_pct = abs(tp - entry) / entry * 100
     content = f"""
-    <h2 style="margin:0 0 4px;font-size:20px;font-weight:900;color:#f1f5f9;">Trade Opened</h2>
-    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">{symbol} &nbsp;·&nbsp; {mode}</p>
+    <div style="font-size:19px;font-weight:800;color:#f1f5f9;margin-bottom:4px;">Trade Opened</div>
+    <div style="font-size:13px;color:#6b7280;margin-bottom:22px;">{symbol} &nbsp;&middot;&nbsp; {mode}</div>
 
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);
-                border-radius:14px;padding:20px;margin-bottom:14px;text-align:center;">
-      <div style="font-size:13px;color:#6b7280;margin-bottom:8px;">Direction</div>
-      <div style="font-size:32px;font-weight:900;color:{side_color};">{side}</div>
-      <div style="font-size:14px;color:{grade_color};margin-top:6px;font-weight:700;">
-        Grade {grade} &nbsp;·&nbsp; Score {score:.2f}
+    <div style="background:#0b1120;border:1px solid rgba(255,255,255,0.08);border-radius:12px;
+                padding:20px;margin-bottom:14px;text-align:center;">
+      <div style="font-size:11px;color:#4b5563;text-transform:uppercase;letter-spacing:0.07em;margin-bottom:10px;">Direction</div>
+      <div style="font-size:34px;font-weight:900;color:{side_color};letter-spacing:0.04em;">{side}</div>
+      <div style="margin-top:8px;display:inline-block;padding:3px 10px;border-radius:6px;
+                  background:rgba(255,255,255,0.05);font-size:12px;font-weight:700;color:{grade_color};">
+        Grade {grade} &nbsp;&middot;&nbsp; Score {score:.2f}
       </div>
     </div>
 
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);
-                border-radius:14px;padding:16px;">
-      <table style="width:100%;border-collapse:collapse;font-size:14px;">
-        {''.join(f'<tr><td style="padding:6px 0;color:#6b7280;width:140px;">{k}</td><td style="padding:6px 0;font-weight:900;color:{c};">{v}</td></tr>' for k,v,c in [
-            ("Entry price",   f"${entry:,.4f}",                    "#f1f5f9"),
-            ("Stop loss",     f"${sl:,.4f}  (−{risk_pct:.2f}%)",  "#ff5078"),
-            ("Take profit",   f"${tp:,.4f}  (+{reward_pct:.2f}%)", "#00ff9d"),
-            ("Equity",        f"${equity:,.2f} USDT",              "#f1f5f9"),
-        ])}
-      </table>
+    <div style="background:#0b1120;border:1px solid rgba(255,255,255,0.08);border-radius:12px;overflow:hidden;">
+      {''.join(f'<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid rgba(255,255,255,0.04);"><span style="font-size:12px;color:#6b7280;">{k}</span><span style="font-size:13px;font-weight:700;color:{c};">{v}</span></div>' for k,v,c in [
+          ("Entry price",   f"${entry:,.4f}",                    "#f1f5f9"),
+          ("Stop loss",     f"${sl:,.4f}  (−{risk_pct:.2f}%)",  "#ff5078"),
+          ("Take profit",   f"${tp:,.4f}  (+{reward_pct:.2f}%)", "#00ff9d"),
+          ("Account equity", f"${equity:,.2f} USDT",             "#f1f5f9"),
+      ])}
+      <div style="padding:8px 14px;font-size:11px;color:#374151;">Trade details</div>
     </div>"""
     subject = f"Trade opened — {side} {symbol} @ ${entry:,.4f}"
     send_email(to, subject, _email_base(content))
@@ -186,43 +199,38 @@ def email_trade_closed(to: str, symbol: str, side: str, mode: str,
     session_block = ""
     if session_trades > 0:
         session_block = f"""
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);
-                border-radius:14px;padding:16px;margin-top:14px;">
-      <div style="font-size:12px;color:#6b7280;margin-bottom:10px;text-transform:uppercase;
-                  letter-spacing:0.05em;">Today's Session</div>
-      <table style="width:100%;border-collapse:collapse;font-size:14px;">
-        {''.join(f'<tr><td style="padding:5px 0;color:#6b7280;width:130px;">{k}</td><td style="padding:5px 0;font-weight:900;color:{c};">{v}</td></tr>' for k,v,c in [
-            ("Trades",    str(session_trades),                        "#f1f5f9"),
-            ("Wins",      str(session_wins),                          "#00ff9d"),
-            ("Losses",    str(session_losses),                        "#ff5078"),
-            ("Net P&L",   f"{sess_sign}${session_pnl:.2f}",          sess_color),
-        ])}
-      </table>
+    <div style="background:#0b1120;border:1px solid rgba(255,255,255,0.08);border-radius:12px;overflow:hidden;margin-top:12px;">
+      <div style="padding:10px 14px;border-bottom:1px solid rgba(255,255,255,0.05);">
+        <span style="font-size:11px;font-weight:700;color:#4b5563;text-transform:uppercase;letter-spacing:0.06em;">Today's Session</span>
+      </div>
+      {''.join(f'<div style="display:flex;justify-content:space-between;align-items:center;padding:9px 14px;border-bottom:1px solid rgba(255,255,255,0.04);"><span style="font-size:12px;color:#6b7280;">{k}</span><span style="font-size:13px;font-weight:700;color:{c};">{v}</span></div>' for k,v,c in [
+          ("Trades today",  str(session_trades),                        "#f1f5f9"),
+          ("Wins",          str(session_wins),                          "#00ff9d"),
+          ("Losses",        str(session_losses),                        "#ff5078"),
+          ("Net P&L",       f"{sess_sign}${session_pnl:.2f}",          sess_color),
+      ])}
     </div>"""
 
     content = f"""
-    <h2 style="margin:0 0 4px;font-size:20px;font-weight:900;color:#f1f5f9;">{trade_label} Closed</h2>
-    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">{symbol} &nbsp;·&nbsp; {mode}</p>
+    <div style="font-size:19px;font-weight:800;color:#f1f5f9;margin-bottom:4px;">{trade_label} Closed</div>
+    <div style="font-size:13px;color:#6b7280;margin-bottom:22px;">{symbol} &nbsp;&middot;&nbsp; {mode}</div>
 
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);
-                border-radius:14px;padding:20px;margin-bottom:14px;text-align:center;">
-      <div style="font-size:13px;color:#6b7280;margin-bottom:8px;">
-        {outcome_label} {outcome_icon}
+    <div style="background:#0b1120;border:1px solid rgba(255,255,255,0.08);border-radius:12px;
+                padding:22px;margin-bottom:14px;text-align:center;">
+      <div style="font-size:11px;color:#4b5563;text-transform:uppercase;letter-spacing:0.07em;margin-bottom:10px;">
+        {outcome_label} &nbsp;{outcome_icon}
       </div>
-      <div style="font-size:38px;font-weight:900;color:{pnl_color};">{sign}{pnl_pct:.2f}%</div>
-      <div style="font-size:16px;font-weight:900;color:{pnl_color};margin-top:4px;">{sign}${pnl_value:.2f}</div>
+      <div style="font-size:40px;font-weight:900;color:{pnl_color};letter-spacing:-0.02em;">{sign}{pnl_pct:.2f}%</div>
+      <div style="font-size:16px;font-weight:700;color:{pnl_color};margin-top:4px;opacity:0.85;">{sign}${pnl_value:.2f}</div>
     </div>
 
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);
-                border-radius:14px;padding:16px;">
-      <table style="width:100%;border-collapse:collapse;font-size:14px;">
-        {''.join(f'<tr><td style="padding:6px 0;color:#6b7280;width:130px;">{k}</td><td style="padding:6px 0;font-weight:900;color:{c};">{v}</td></tr>' for k,v,c in [
-            ("Direction", side, side_color),
-            ("Entry price", f"${entry:,.4f}", "#f1f5f9"),
-            ("Exit price", f"${exit_price:,.4f}", "#f1f5f9"),
-            ("Equity after", f"${equity_after:,.2f}", "#f1f5f9"),
-        ])}
-      </table>
+    <div style="background:#0b1120;border:1px solid rgba(255,255,255,0.08);border-radius:12px;overflow:hidden;">
+      {''.join(f'<div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid rgba(255,255,255,0.04);"><span style="font-size:12px;color:#6b7280;">{k}</span><span style="font-size:13px;font-weight:700;color:{c};">{v}</span></div>' for k,v,c in [
+          ("Direction",     side,                          side_color),
+          ("Entry price",   f"${entry:,.4f}",              "#f1f5f9"),
+          ("Exit price",    f"${exit_price:,.4f}",         "#f1f5f9"),
+          ("Equity after",  f"${equity_after:,.2f} USDT",  "#f1f5f9"),
+      ])}
     </div>{session_block}"""
 
     # Subject: "{trade_label} {+$pnl} | Today: {+$session_pnl}"
@@ -239,81 +247,84 @@ def email_ai_stopped(to: str, symbol: str, reason: str, equity: float) -> None:
         "DURATION_END":   ("Session Ended",            "#00ffe0", "The AI completed its scheduled trading duration."),
     }
     title, color, detail = reason_map.get(reason, ("AI Stopped", "#94a3b8", f"Reason: {reason}"))
-    renewal_cta = ""
+    renewal_note = ""
     if reason == "DURATION_END":
-        renewal_cta = """
-    <a href="https://asymmetric-ai.vercel.app"
-       style="display:block;margin-top:16px;padding:13px 16px;background:linear-gradient(90deg,#00ff9d,#00ffe0);
-              color:#021018;font-weight:900;font-size:14px;text-align:center;border-radius:14px;
-              text-decoration:none;">
-      Start a new session &rarr;
-    </a>"""
+        renewal_note = """
+    <div style="margin-top:18px;background:rgba(0,255,224,0.05);border:1px solid rgba(0,255,224,0.15);
+                border-radius:10px;padding:13px 16px;font-size:13px;color:#a7f3d0;line-height:1.6;">
+      Ready to continue? Log in to Asymmetric AI, set a new duration, and start a new session whenever you're ready.
+    </div>"""
 
     content = f"""
-    <h2 style="margin:0 0 6px;font-size:20px;font-weight:900;color:#f1f5f9;">AI Trading Stopped</h2>
-    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">{symbol}</p>
-    <div style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);
-                border-radius:14px;padding:18px;margin-bottom:16px;">
-      <div style="font-size:16px;font-weight:900;color:{color};margin-bottom:8px;">{title}</div>
-      <div style="font-size:14px;opacity:0.85;line-height:1.6;">{detail}</div>
+    <div style="font-size:19px;font-weight:800;color:#f1f5f9;margin-bottom:4px;">AI Trading Stopped</div>
+    <div style="font-size:13px;color:#6b7280;margin-bottom:22px;">{symbol}</div>
+
+    <div style="background:#0b1120;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;margin-bottom:16px;">
+      <div style="font-size:14px;font-weight:800;color:{color};margin-bottom:8px;">{title}</div>
+      <div style="font-size:13px;color:#94a3b8;line-height:1.65;">{detail}</div>
     </div>
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:12px;
-                padding:14px;font-size:14px;">
-      <div style="opacity:0.6;margin-bottom:4px;">Current equity</div>
-      <div style="font-size:22px;font-weight:900;color:#f1f5f9;">${equity:,.2f}</div>
-    </div>
-    <p style="margin-top:16px;font-size:12px;color:#4b5563;">
-      Log in to Asymmetric AI to review your trades and restart when ready.
-    </p>{renewal_cta}"""
-    send_email(to, f"AI stopped — {symbol} ({title})", _email_base(content))
+
+    <div style="background:#0b1120;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px 16px;">
+      <div style="font-size:11px;color:#4b5563;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.05em;">Current equity</div>
+      <div style="font-size:24px;font-weight:900;color:#f1f5f9;">${equity:,.2f} <span style="font-size:13px;color:#6b7280;font-weight:500;">USDT</span></div>
+    </div>{renewal_note}
+
+    <div style="margin-top:18px;font-size:12px;color:#4b5563;line-height:1.6;">
+      Log in to Asymmetric AI to review your trade history and performance report.
+    </div>"""
+    send_email(to, f"AI stopped — {symbol} · {title}", _email_base(content))
 
 
 def email_otp_reset(to: str, code: str) -> None:
     content = f"""
-    <h2 style="margin:0 0 14px;font-size:20px;font-weight:900;color:#f1f5f9;">Reset Your Password</h2>
-    <p style="margin:0 0 20px;opacity:0.85;line-height:1.6;">
-      We received a request to reset the password for <b>{to}</b>.<br>
-      Enter this code in the app to continue:
-    </p>
-    <div style="background:#0f172a;border:1px solid rgba(0,255,224,0.25);border-radius:14px;
-                padding:28px;text-align:center;margin-bottom:20px;">
-      <div style="font-size:42px;font-weight:900;letter-spacing:12px;color:#00ffe0;
-                  font-family:monospace;">{code}</div>
-      <div style="margin-top:10px;font-size:12px;color:#6b7280;">Expires in 15 minutes</div>
+    <div style="font-size:19px;font-weight:800;color:#f1f5f9;margin-bottom:6px;">Reset Your Password</div>
+    <div style="font-size:13px;color:#6b7280;margin-bottom:22px;">
+      We received a request to reset the password for {to}.
     </div>
-    <div style="background:rgba(220,38,38,0.1);border:1px solid rgba(248,113,113,0.25);
-                border-radius:10px;padding:12px 16px;font-size:13px;color:#fecaca;">
-      If you did not request this, ignore this email. Your password has not been changed.
+
+    <div style="background:#0b1120;border:1px solid rgba(0,255,224,0.2);border-radius:12px;
+                padding:30px 20px;text-align:center;margin-bottom:18px;">
+      <div style="font-size:11px;color:#4b5563;text-transform:uppercase;letter-spacing:0.07em;margin-bottom:14px;">Your reset code</div>
+      <div style="font-size:38px;font-weight:900;letter-spacing:10px;color:#00ffe0;
+                  font-family:'Courier New',monospace;">{code}</div>
+      <div style="margin-top:12px;font-size:12px;color:#4b5563;">Expires in 15 minutes</div>
+    </div>
+
+    <div style="background:rgba(239,68,68,0.07);border:1px solid rgba(239,68,68,0.18);
+                border-radius:10px;padding:12px 16px;font-size:13px;color:#fca5a5;line-height:1.6;">
+      If you did not request a password reset, you can safely ignore this email. Your password has not been changed.
     </div>"""
-    send_email(to, "Asymmetric AI — Password Reset Code", _email_base(content))
+    send_email(to, "Asymmetric AI — Password reset code", _email_base(content))
 
 
 def email_support_reply(to: str, admin_message: str) -> None:
     content = f"""
-    <h2 style="margin:0 0 14px;font-size:20px;font-weight:900;color:#f1f5f9;">Support Reply</h2>
-    <p style="margin:0 0 18px;opacity:0.85;line-height:1.6;">
-      Our team has replied to your support ticket:
-    </p>
-    <div style="background:#0f172a;border:1px solid rgba(0,255,224,0.20);border-radius:14px;
-                padding:18px;margin-bottom:18px;font-size:14px;line-height:1.7;color:#f1f5f9;">
+    <div style="font-size:19px;font-weight:800;color:#f1f5f9;margin-bottom:6px;">Reply from Support</div>
+    <div style="font-size:13px;color:#6b7280;margin-bottom:22px;">Our team has responded to your message.</div>
+
+    <div style="background:#0b1120;border-left:3px solid #00ffe0;border-radius:0 10px 10px 0;
+                padding:16px 18px;margin-bottom:20px;font-size:14px;line-height:1.75;color:#e2e8f0;">
       {admin_message}
     </div>
-    <p style="margin:0;font-size:12px;color:#4b5563;">
-      Log in to Asymmetric AI to continue the conversation.
-    </p>"""
-    send_email(to, "Asymmetric AI — Support Reply", _email_base(content))
+
+    <div style="font-size:12px;color:#4b5563;line-height:1.6;">
+      Log in to Asymmetric AI to reply or continue the conversation from the support chat.
+    </div>"""
+    send_email(to, "Asymmetric AI — Reply from support", _email_base(content))
 
 
 def email_2fa_enabled(to: str) -> None:
     content = f"""
-    <h2 style="margin:0 0 14px;font-size:20px;font-weight:900;color:#f1f5f9;">Two-Factor Authentication Enabled</h2>
-    <p style="margin:0 0 14px;opacity:0.85;line-height:1.6;">
-      2FA has been successfully enabled on your account <b>{to}</b>.<br>
-      You will now need your authenticator app every time you log in.
-    </p>
-    <div style="background:rgba(0,255,157,0.08);border:1px solid rgba(0,255,157,0.25);
-                border-radius:12px;padding:12px 16px;font-size:13px;color:#a7f3d0;">
-      If you did not enable this, contact support immediately and change your password.
+    <div style="font-size:19px;font-weight:800;color:#f1f5f9;margin-bottom:6px;">Two-Factor Authentication Enabled</div>
+    <div style="font-size:13px;color:#6b7280;margin-bottom:20px;">Security update for {to}</div>
+
+    <div style="font-size:14px;color:#94a3b8;line-height:1.7;margin-bottom:18px;">
+      Two-factor authentication has been successfully enabled on your account. From now on, you will need your authenticator app every time you sign in.
+    </div>
+
+    <div style="background:rgba(0,255,157,0.06);border:1px solid rgba(0,255,157,0.2);
+                border-radius:10px;padding:13px 16px;font-size:13px;color:#a7f3d0;line-height:1.6;">
+      If you did not make this change, contact our support team immediately and change your password.
     </div>"""
     send_email(to, "2FA enabled on your Asymmetric AI account", _email_base(content))
 
@@ -322,106 +333,188 @@ def email_2fa_enabled(to: str) -> None:
 
 def email_welcome(to: str) -> None:
     content = f"""
-    <h2 style="margin:0 0 6px;font-size:22px;font-weight:900;color:#f1f5f9;">Welcome to Asymmetric AI</h2>
-    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">Your account is ready. One last step before you start.</p>
+    <div style="font-size:22px;font-weight:900;color:#f1f5f9;margin-bottom:4px;">Welcome to Asymmetric AI</div>
+    <div style="font-size:13px;color:#6b7280;margin-bottom:22px;">Your account is ready.</div>
 
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:18px;margin-bottom:18px;">
-      <div style="font-size:14px;color:#94a3b8;line-height:1.75;">
-        We've put together a <b style="color:#f1f5f9;">6-step interactive setup guide</b> inside the app that covers everything you need to know before placing your first trade — API key setup, how to choose your mode and style, how the risk engine protects your capital, and how to start in under 5 minutes.
-      </div>
+    <div style="font-size:14px;color:#94a3b8;line-height:1.75;margin-bottom:22px;">
+      We've prepared a <b style="color:#e2e8f0;">6-step setup guide</b> inside the app that walks you through everything — connecting your exchange API, choosing the right mode and style, understanding how the risk engine protects your capital, and placing your first trade.
     </div>
 
-    <a href="https://asymmetric-ai.vercel.app"
-       style="display:block;padding:14px 16px;background:linear-gradient(90deg,#00ff9d,#00ffe0);
-              color:#021018;font-weight:900;font-size:14px;text-align:center;border-radius:14px;
-              text-decoration:none;margin-bottom:16px;">
-      Open Asymmetric AI &rarr;
-    </a>
+    <div style="background:#0b1120;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:14px 16px;margin-bottom:22px;">
+      <div style="font-size:11px;font-weight:700;color:#4b5563;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:10px;">What the guide covers</div>
+      {''.join(f'<div style="display:flex;align-items:center;padding:5px 0;font-size:13px;color:#94a3b8;"><span style="color:#00ffe0;margin-right:10px;font-weight:700;">&#x2022;</span>{item}</div>' for item in [
+          "How to create a trade-only API key on Bybit, OKX, or Binance",
+          "Where to keep your funds (exchange trading account)",
+          "Modes and styles — which one is right for you",
+          "How the 4-layer signal system filters entries",
+          "Capital protection: hard floor, drawdown tiers, per-trade caps",
+          "How to start the AI in under 2 minutes",
+      ])}
+    </div>
 
     <div style="font-size:12px;color:#4b5563;line-height:1.6;">
-      Once you complete the setup guide in the app, you'll receive another email with your full reference guide to keep in your inbox.
+      Once you complete the guide, you'll receive a full reference email you can keep in your inbox — covering everything in one place for whenever you need a quick reminder.
     </div>"""
     send_email(
         to,
-        "Welcome to Asymmetric AI — Complete your setup",
+        "Welcome to Asymmetric AI — Let's get you set up",
         _email_base(content, footer="You are in control. The AI only trades with your API keys on your exchange account."),
     )
 
 
 def email_onboarding_complete(to: str) -> None:
-    content = """
-    <h2 style="margin:0 0 4px;font-size:22px;font-weight:900;color:#f1f5f9;">Your Complete Setup Reference</h2>
-    <p style="margin:0 0 18px;font-size:13px;color:#6b7280;">You've completed the setup guide. Keep this email — it covers everything in one place.</p>
+    def _section(title: str, body: str) -> str:
+        return f"""
+        <div style="margin-bottom:24px;">
+          <div style="display:flex;align-items:center;margin-bottom:12px;">
+            <div style="width:3px;height:18px;background:#00ffe0;border-radius:2px;margin-right:10px;flex-shrink:0;"></div>
+            <div style="font-size:13px;font-weight:800;color:#f1f5f9;text-transform:uppercase;letter-spacing:0.06em;">{title}</div>
+          </div>
+          {body}
+        </div>"""
 
-    <!-- CAPITAL -->
-    <div style="background:rgba(0,255,224,0.07);border:1px solid rgba(0,255,224,0.22);
-                border-radius:12px;padding:13px 16px;font-size:13px;color:#a7f3d0;line-height:1.6;margin-bottom:18px;">
-      <b>Minimum recommended capital: $50 USDT.</b> $100–$500 is the ideal starting range for meaningful results with controlled risk.
+    def _api_row(exchange: str, steps: str, funds: str) -> str:
+        return f"""
+        <div style="padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.05);">
+          <div style="font-size:12px;font-weight:800;color:#00ffe0;margin-bottom:4px;">{exchange}</div>
+          <div style="font-size:12px;color:#94a3b8;line-height:1.6;">{steps}</div>
+          <div style="font-size:11px;color:#6b7280;margin-top:3px;">Funds &rarr; {funds}</div>
+        </div>"""
+
+    def _layer_row(num: str, title: str, desc: str) -> str:
+        return f"""
+        <div style="display:flex;align-items:flex-start;padding:9px 0;border-bottom:1px solid rgba(255,255,255,0.04);">
+          <div style="min-width:22px;height:22px;background:rgba(0,255,224,0.1);border:1px solid rgba(0,255,224,0.25);
+                      border-radius:50%;display:flex;align-items:center;justify-content:center;
+                      font-size:10px;font-weight:900;color:#00ffe0;margin-right:12px;flex-shrink:0;
+                      line-height:22px;text-align:center;">{num}</div>
+          <div>
+            <div style="font-size:12px;font-weight:700;color:#e2e8f0;margin-bottom:1px;">{title}</div>
+            <div style="font-size:12px;color:#6b7280;">{desc}</div>
+          </div>
+        </div>"""
+
+    def _shield_row(label: str, value: str) -> str:
+        return f"""
+        <div style="display:flex;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.04);">
+          <div style="font-size:16px;margin-right:10px;">&#x2713;</div>
+          <div>
+            <span style="font-size:12px;font-weight:700;color:#e2e8f0;">{label} &nbsp;</span>
+            <span style="font-size:12px;color:#6b7280;">{value}</span>
+          </div>
+        </div>"""
+
+    def _mode_row(name: str, size: str, lev: str, best: str, flagship: bool = False) -> str:
+        bg = "rgba(0,255,224,0.06)" if flagship else "transparent"
+        badge = " &nbsp;<span style='font-size:9px;background:rgba(0,255,224,0.15);color:#00ffe0;border-radius:4px;padding:1px 5px;font-weight:800;'>FLAGSHIP</span>" if flagship else ""
+        return f"""
+        <tr style="background:{bg};">
+          <td style="padding:8px 10px;font-size:12px;font-weight:700;color:#00ffe0;white-space:nowrap;">{name}{badge}</td>
+          <td style="padding:8px 6px;font-size:12px;color:#94a3b8;text-align:center;">{size}</td>
+          <td style="padding:8px 6px;font-size:12px;color:#94a3b8;text-align:center;">{lev}</td>
+          <td style="padding:8px 6px;font-size:12px;color:#94a3b8;">{best}</td>
+        </tr>"""
+
+    capital_section = _section("Recommended Capital", """
+        <div style="background:rgba(0,255,224,0.05);border:1px solid rgba(0,255,224,0.15);border-radius:10px;padding:12px 16px;">
+          <div style="font-size:13px;color:#a7f3d0;font-weight:700;margin-bottom:4px;">Minimum: $50 USDT</div>
+          <div style="font-size:12px;color:#6b7280;line-height:1.6;">$100–$500 is the ideal starting range for meaningful results with controlled risk. Keep funds in your exchange trading account — not in your bank wallet.</div>
+        </div>""")
+
+    api_section = _section("API Key Setup", f"""
+        <div style="background:#0c1322;border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:0 14px;">
+          {_api_row("Bybit", "Profile &rarr; API Management &rarr; Create New Key &rarr; Enable <b style='color:#e2e8f0;'>Read</b> + <b style='color:#e2e8f0;'>Trade</b>. Disable Withdrawal.", "Unified Trading Account &middot; USDT")}
+          {_api_row("OKX", "Profile &rarr; API &rarr; Create V5 API Key &rarr; Enable <b style='color:#e2e8f0;'>Read</b> + <b style='color:#e2e8f0;'>Trade</b>, set a Passphrase. Disable Withdrawal.", "Trading Account &middot; USDT")}
+          <div style="padding:12px 0;">
+            <div style="font-size:12px;font-weight:800;color:#00ffe0;margin-bottom:4px;">Binance</div>
+            <div style="font-size:12px;color:#94a3b8;line-height:1.6;">Profile &rarr; API Management &rarr; Create API &rarr; Enable <b style='color:#e2e8f0;'>Reading</b> + <b style='color:#e2e8f0;'>Futures Trading</b>. Disable Withdrawal.</div>
+            <div style="font-size:11px;color:#6b7280;margin-top:3px;">Funds &rarr; Futures Account &middot; USDT</div>
+          </div>
+        </div>
+        <div style="font-size:11px;color:#6b7280;margin-top:8px;">Never enable Withdrawal permission. Asymmetric AI can only trade — it cannot move funds off your account.</div>""")
+
+    signal_section = _section("How the 4-Layer Signal Works", f"""
+        <div style="background:#0c1322;border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:0 14px;">
+          {_layer_row("1", "Regime", "ADX + ATR confirm a real trend is active — filters out choppy, low-quality markets.")}
+          {_layer_row("2", "Direction", "4h EMA21 vs EMA50 determines whether to go long or short.")}
+          {_layer_row("3", "Entry", "Price in a pullback zone, qualifying candle pattern, RSI confirmed.")}
+          {_layer_row("4", "Momentum", "Volume is real and recent candles confirm the move.")}
+        </div>
+        <div style="font-size:12px;color:#6b7280;margin-top:8px;line-height:1.6;">All 4 layers must align before any trade is placed. If even one is missing, the engine waits. This is why trade frequency is lower than you might expect — and why entry quality is higher.</div>""")
+
+    protection_section = _section("Capital Protection", f"""
+        <div style="background:#0c1322;border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:0 14px;">
+          {_shield_row("Hard Floor", "Engine stops entirely if equity drops 15% from its peak.")}
+          {_shield_row("Drawdown Tiers", "Position size shrinks at &minus;4% &rarr; 65%, &minus;7% &rarr; 40%, &minus;10% &rarr; 25%.")}
+          {_shield_row("Per-Trade Loss Cap", "Max 1.5% (Scalp) / 2% (Day Trade) / 3% (Swing) of equity per trade.")}
+          {_shield_row("Non-Custodial", "We hold no funds. We cannot withdraw. Trade permission only.")}
+        </div>""")
+
+    modes_section = _section("Modes &amp; Styles — Quick Reference", f"""
+        <div style="background:#0c1322;border:1px solid rgba(255,255,255,0.07);border-radius:10px;overflow:hidden;">
+          <table style="width:100%;border-collapse:collapse;">
+            <thead>
+              <tr style="border-bottom:1px solid rgba(255,255,255,0.08);">
+                <th style="padding:9px 10px;font-size:11px;font-weight:700;color:#4b5563;text-align:left;text-transform:uppercase;letter-spacing:0.05em;">Mode</th>
+                <th style="padding:9px 6px;font-size:11px;font-weight:700;color:#4b5563;text-align:center;text-transform:uppercase;letter-spacing:0.05em;">Size</th>
+                <th style="padding:9px 6px;font-size:11px;font-weight:700;color:#4b5563;text-align:center;text-transform:uppercase;letter-spacing:0.05em;">Lev</th>
+                <th style="padding:9px 6px;font-size:11px;font-weight:700;color:#4b5563;text-align:left;text-transform:uppercase;letter-spacing:0.05em;">Best For</th>
+              </tr>
+            </thead>
+            <tbody>
+              {_mode_row("ULTRA_SAFE", "30%", "2×", "First week, getting familiar")}
+              {_mode_row("SAFE", "45%", "3×", "Conservative, steady growth")}
+              {_mode_row("MINI_ASYM", "65%", "6×", "Most popular, balanced performance", flagship=True)}
+              {_mode_row("NORMAL", "60%", "5×", "Balanced exposure")}
+              {_mode_row("AGGRESSIVE", "85%", "8×", "Experienced traders only")}
+            </tbody>
+          </table>
+        </div>
+        <div style="margin-top:12px;background:#0c1322;border:1px solid rgba(255,255,255,0.07);border-radius:10px;padding:12px 14px;">
+          <div style="font-size:11px;font-weight:800;color:#4b5563;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Trade Styles</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;">
+            <div style="flex:1;min-width:100px;padding:8px 10px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);border-radius:8px;">
+              <div style="font-size:11px;font-weight:800;color:#e2e8f0;">SCALP</div>
+              <div style="font-size:11px;color:#6b7280;margin-top:2px;">15m chart · checks every 15 min</div>
+            </div>
+            <div style="flex:1;min-width:100px;padding:8px 10px;background:rgba(0,255,224,0.05);border:1px solid rgba(0,255,224,0.15);border-radius:8px;">
+              <div style="font-size:11px;font-weight:800;color:#00ffe0;">DAY TRADE &#x2605;</div>
+              <div style="font-size:11px;color:#6b7280;margin-top:2px;">1h chart · checks every hour</div>
+            </div>
+            <div style="flex:1;min-width:100px;padding:8px 10px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);border-radius:8px;">
+              <div style="font-size:11px;font-weight:800;color:#e2e8f0;">SWING</div>
+              <div style="font-size:11px;color:#6b7280;margin-top:2px;">4h chart · checks every 4 hours</div>
+            </div>
+          </div>
+        </div>""")
+
+    closing = """
+        <div style="margin-top:28px;padding-top:20px;border-top:1px solid rgba(255,255,255,0.06);">
+          <div style="font-size:13px;color:#94a3b8;line-height:1.7;">
+            You're all set. Log in to the app, configure your API keys in Settings, and start the AI when you're ready.<br><br>
+            If you have questions, reach out to our support team at any time — we're here to help.
+          </div>
+          <div style="margin-top:16px;font-size:12px;color:#4b5563;">
+            — The Asymmetric AI Team
+          </div>
+        </div>"""
+
+    content = f"""
+    <div style="margin-bottom:22px;">
+      <div style="font-size:20px;font-weight:900;color:#f1f5f9;margin-bottom:6px;">Setup Complete</div>
+      <div style="font-size:13px;color:#6b7280;line-height:1.6;">Your account is ready. This email is your permanent reference — bookmark it or save it for whenever you need a quick reminder of how everything works.</div>
     </div>
 
-    <!-- API SETUP -->
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:16px;">
-      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:12px;">API Key Setup</div>
-      <div style="font-size:13px;color:#94a3b8;line-height:1.7;">
-        <b style="color:#f1f5f9;">Bybit:</b> Profile → API Management → Create New Key → Enable Read + Trade. Disable Withdrawal.<br>
-        <b style="color:#f1f5f9;">OKX:</b> Profile → API → Create V5 API Key → Enable Read + Trade + set Passphrase. Disable Withdrawal.<br>
-        <b style="color:#f1f5f9;">Binance:</b> Profile → API Management → Create API → Enable Reading + Spot &amp; Margin / Futures Trading. Disable Withdrawal.<br><br>
-        <b style="color:#f1f5f9;">Funds location:</b> Bybit → Unified Trading Account · OKX → Trading Account · Binance → Futures/Trading Account — all in USDT.
-      </div>
-    </div>
-
-    <!-- HOW IT WORKS -->
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:16px;">
-      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:10px;">4-Layer Signal System</div>
-      <div style="font-size:13px;color:#94a3b8;line-height:1.7;">
-        <b style="color:#00ffe0;">Layer 1 — Regime:</b> ADX + ATR confirm a real trend, not chop.<br>
-        <b style="color:#00ffe0;">Layer 2 — Direction:</b> 4h EMA21 vs EMA50 determines trend bias (long or short).<br>
-        <b style="color:#00ffe0;">Layer 3 — Entry:</b> Price in pullback zone, qualifying candle pattern, RSI confirmed.<br>
-        <b style="color:#00ffe0;">Layer 4 — Momentum:</b> Volume real, recent candles confirming the move.<br><br>
-        All 4 must align. If any layer is missing, the engine waits. <b style="color:#f1f5f9;">Quality over quantity.</b>
-      </div>
-    </div>
-
-    <!-- PROTECTION -->
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:16px;">
-      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:10px;">Capital Protection</div>
-      <div style="font-size:13px;color:#94a3b8;line-height:1.7;">
-        • <b style="color:#f1f5f9;">Hard floor:</b> engine stops if equity drops 15% from peak.<br>
-        • <b style="color:#f1f5f9;">Drawdown tiers:</b> size shrinks at −4% → 65%, −7% → 40%, −10% → 25%.<br>
-        • <b style="color:#f1f5f9;">Per-trade cap:</b> max loss 1.5% (SCALP) / 2% (DAY_TRADE) / 3% (SWING) of equity.<br>
-        • <b style="color:#f1f5f9;">Non-custodial:</b> we can never withdraw your funds — trade permission only.
-      </div>
-    </div>
-
-    <!-- MODES TABLE -->
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:16px;">
-      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:10px;">Modes &amp; Styles — quick reference</div>
-      <table style="width:100%;border-collapse:collapse;font-size:12px;color:#94a3b8;">
-        <tr style="border-bottom:1px solid rgba(255,255,255,0.07);">
-          <td style="padding:6px 4px;font-weight:700;color:#f1f5f9;">Mode</td>
-          <td style="padding:6px 4px;">Size</td><td style="padding:6px 4px;">Lev</td><td style="padding:6px 4px;">Best for</td>
-        </tr>
-        <tr><td style="padding:6px 4px;color:#00ffe0;">ULTRA_SAFE</td><td style="padding:6px 4px;">30%</td><td style="padding:6px 4px;">2×</td><td style="padding:6px 4px;">First week, testing</td></tr>
-        <tr><td style="padding:6px 4px;color:#00ffe0;">SAFE</td><td style="padding:6px 4px;">45%</td><td style="padding:6px 4px;">3×</td><td style="padding:6px 4px;">Conservative, steady growth</td></tr>
-        <tr><td style="padding:6px 4px;color:#00ffe0;font-weight:800;">MINI_ASYM ★</td><td style="padding:6px 4px;">65%</td><td style="padding:6px 4px;">6×</td><td style="padding:6px 4px;">Flagship — most popular</td></tr>
-        <tr><td style="padding:6px 4px;color:#00ffe0;">NORMAL</td><td style="padding:6px 4px;">60%</td><td style="padding:6px 4px;">5×</td><td style="padding:6px 4px;">Balanced exposure</td></tr>
-        <tr><td style="padding:6px 4px;color:#00ffe0;">AGGRESSIVE</td><td style="padding:6px 4px;">85%</td><td style="padding:6px 4px;">8×</td><td style="padding:6px 4px;">Experienced traders only</td></tr>
-      </table>
-      <div style="margin-top:10px;font-size:12px;color:#94a3b8;">
-        <b style="color:#f1f5f9;">Styles:</b> SCALP (15m · every 15 min) · DAY_TRADE ★ (1h · every hour) · SWING (4h · every 4 hours)
-      </div>
-    </div>
-
-    <a href="https://asymmetric-ai.vercel.app"
-       style="display:block;padding:13px 16px;background:linear-gradient(90deg,#00ff9d,#00ffe0);
-              color:#021018;font-weight:900;font-size:14px;text-align:center;border-radius:14px;
-              text-decoration:none;">
-      Go to Dashboard &rarr;
-    </a>"""
+    {capital_section}
+    {api_section}
+    {signal_section}
+    {protection_section}
+    {modes_section}
+    {closing}"""
 
     send_email(
         to,
-        "Asymmetric AI — Your complete setup reference",
+        "Asymmetric AI — Setup complete. Your reference guide.",
         _email_base(content, footer="You are in control. The AI only trades with your API keys on your exchange account. We can never withdraw your funds."),
     )
 
