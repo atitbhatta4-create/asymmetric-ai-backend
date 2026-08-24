@@ -152,6 +152,7 @@ class SignupIn(AuthIn):
 class SessionOut(BaseModel):
     ok: bool
     email: Optional[str] = None
+    onboarding_complete: bool = False
 
 
 class ForgotIn(BaseModel):
@@ -287,12 +288,24 @@ def logout(response: Response, session: Optional[str] = Cookie(default=None)):
 @auth_router.get("/session", response_model=SessionOut)
 def session_me(session: Optional[str] = Cookie(default=None)):
     if not session:
-        return {"ok": False, "email": None}
+        return {"ok": False, "email": None, "onboarding_complete": False}
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("SELECT email FROM sessions WHERE token = %s", (session,))
         row = cur.fetchone()
-    return {"ok": bool(row), "email": row["email"] if row else None}
+    if not row:
+        return {"ok": False, "email": None, "onboarding_complete": False}
+    email = row["email"]
+    from user_state import get_onboarding_complete
+    ob_complete = get_onboarding_complete(email)
+    return {"ok": True, "email": email, "onboarding_complete": ob_complete}
+
+
+@auth_router.post("/onboarding/complete")
+def onboarding_complete_route(user=Depends(_require_user)):
+    from user_state import mark_onboarding_complete
+    mark_onboarding_complete(user["email"])
+    return {"ok": True}
 
 
 @auth_router.post("/auth/change-password")

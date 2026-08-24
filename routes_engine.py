@@ -62,7 +62,7 @@ class AutoStartIn(BaseModel):
     mode: RiskMode = "MINI_ASYM"
     max_trades_per_day: Optional[int] = Field(default=None, ge=1, le=50)
     stop_after_bad_trades: int = Field(default=2, ge=1, le=20)
-    duration_days: int = Field(default=0, ge=0, le=365)
+    duration_days: int = Field(default=7, ge=1, le=30)
     trend_filter: bool = True
     chop_min_sep_pct: float = Field(default=0.005, ge=0.001, le=0.05)
 

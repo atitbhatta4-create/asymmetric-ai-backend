@@ -491,6 +491,7 @@ def init_db() -> None:
         cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS floor_reset_at TEXT DEFAULT '[]'")
         cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS floor_equity REAL DEFAULT 0")
         cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS last_stop_reason TEXT DEFAULT NULL")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN NOT NULL DEFAULT FALSE")
         for col, coltype, defval in [
             ("adaptive_strictness",  "REAL",    "1.0"),
             ("last_trade_ts",        "REAL",    "0"),

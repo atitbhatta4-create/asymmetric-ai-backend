@@ -147,6 +147,23 @@ def update_peak_ath(email: str, peak: float, equity_after: float) -> None:
             conn.commit()
 
 
+# ── Onboarding completion ─────────────────────────────────────────────────────
+
+def get_onboarding_complete(email: str) -> bool:
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT onboarding_complete FROM user_state WHERE email = %s", (email,))
+        row = cur.fetchone()
+        return bool(row["onboarding_complete"]) if row else False
+
+
+def mark_onboarding_complete(email: str) -> None:
+    with db_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE user_state SET onboarding_complete = TRUE WHERE email = %s", (email,))
+        conn.commit()
+
+
 # ── First-trade milestone email ───────────────────────────────────────────────
 
 _FIRST_TRADE_SENT: set = set()

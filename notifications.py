@@ -239,6 +239,16 @@ def email_ai_stopped(to: str, symbol: str, reason: str, equity: float) -> None:
         "DURATION_END":   ("Session Ended",            "#00ffe0", "The AI completed its scheduled trading duration."),
     }
     title, color, detail = reason_map.get(reason, ("AI Stopped", "#94a3b8", f"Reason: {reason}"))
+    renewal_cta = ""
+    if reason == "DURATION_END":
+        renewal_cta = """
+    <a href="https://asymmetric-ai.vercel.app"
+       style="display:block;margin-top:16px;padding:13px 16px;background:linear-gradient(90deg,#00ff9d,#00ffe0);
+              color:#021018;font-weight:900;font-size:14px;text-align:center;border-radius:14px;
+              text-decoration:none;">
+      Start a new session &rarr;
+    </a>"""
+
     content = f"""
     <h2 style="margin:0 0 6px;font-size:20px;font-weight:900;color:#f1f5f9;">AI Trading Stopped</h2>
     <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">{symbol}</p>
@@ -254,7 +264,7 @@ def email_ai_stopped(to: str, symbol: str, reason: str, equity: float) -> None:
     </div>
     <p style="margin-top:16px;font-size:12px;color:#4b5563;">
       Log in to Asymmetric AI to review your trades and restart when ready.
-    </p>"""
+    </p>{renewal_cta}"""
     send_email(to, f"AI stopped — {symbol} ({title})", _email_base(content))
 
 
@@ -311,47 +321,97 @@ def email_2fa_enabled(to: str) -> None:
 # ── Onboarding emails ─────────────────────────────────────────────────────────
 
 def email_welcome(to: str) -> None:
-    content = f"""
-    <h2 style="margin:0 0 6px;font-size:22px;font-weight:900;color:#f1f5f9;">Welcome to Asymmetric AI</h2>
-    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">Your account is ready. Here is how to get started.</p>
+    def _step(n: str, title: str, body: str) -> str:
+        return f"""
+        <div style="display:flex;align-items:flex-start;margin-bottom:16px;">
+          <div style="min-width:28px;height:28px;background:#00ffe0;border-radius:50%;display:flex;align-items:center;
+                      justify-content:center;font-weight:900;font-size:13px;color:#050814;margin-right:12px;flex-shrink:0;">{n}</div>
+          <div>
+            <div style="font-weight:700;color:#f1f5f9;margin-bottom:4px;">{title}</div>
+            <div style="font-size:13px;color:#94a3b8;line-height:1.55;">{body}</div>
+          </div>
+        </div>"""
 
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:16px;">
-      <div style="display:flex;align-items:flex-start;margin-bottom:14px;">
-        <div style="min-width:28px;height:28px;background:#00ffe0;border-radius:50%;display:flex;align-items:center;
-                    justify-content:center;font-weight:900;font-size:13px;color:#050814;margin-right:12px;flex-shrink:0;">1</div>
-        <div>
-          <div style="font-weight:700;color:#f1f5f9;margin-bottom:4px;">Connect your exchange API keys</div>
-          <div style="font-size:13px;color:#6b7280;">Go to Settings and add your Bybit or OKX API keys (trade-only, no withdrawal permission needed).</div>
-        </div>
-      </div>
-      <div style="display:flex;align-items:flex-start;margin-bottom:14px;">
-        <div style="min-width:28px;height:28px;background:#00ffe0;border-radius:50%;display:flex;align-items:center;
-                    justify-content:center;font-weight:900;font-size:13px;color:#050814;margin-right:12px;flex-shrink:0;">2</div>
-        <div>
-          <div style="font-weight:700;color:#f1f5f9;margin-bottom:4px;">Choose your mode and coin</div>
-          <div style="font-size:13px;color:#6b7280;">Start with SAFE or MINI_ASYM mode with DAY_TRADE style. We recommend BTCUSDT or ETHUSDT to begin.</div>
-        </div>
-      </div>
-      <div style="display:flex;align-items:flex-start;">
-        <div style="min-width:28px;height:28px;background:#00ffe0;border-radius:50%;display:flex;align-items:center;
-                    justify-content:center;font-weight:900;font-size:13px;color:#050814;margin-right:12px;flex-shrink:0;">3</div>
-        <div>
-          <div style="font-weight:700;color:#f1f5f9;margin-bottom:4px;">Start the AI</div>
-          <div style="font-size:13px;color:#6b7280;">Press Start AI on the dashboard. The engine monitors the market every hour and only enters trades when all 4 signal layers align.</div>
-        </div>
+    content = f"""
+    <h2 style="margin:0 0 4px;font-size:22px;font-weight:900;color:#f1f5f9;">Welcome to Asymmetric AI</h2>
+    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">Your account is ready. Read this guide before you start — it will save you time.</p>
+
+    <!-- MINIMUM CAPITAL -->
+    <div style="background:rgba(0,255,224,0.07);border:1px solid rgba(0,255,224,0.22);
+                border-radius:12px;padding:13px 16px;font-size:13px;color:#a7f3d0;line-height:1.6;margin-bottom:18px;">
+      <b>Minimum recommended capital: $50 USDT.</b><br>
+      Smaller amounts work but fees will eat a larger percentage of each trade. $100–$500 is ideal to start.
+    </div>
+
+    <!-- SETUP STEPS -->
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:18px 16px;margin-bottom:18px;">
+      {_step("1", "Connect your Bybit or OKX API keys",
+        "Go to <b>Exchange</b> in the sidebar. Create a trade-only API key on Bybit or OKX. "
+        "Enable: <b>Read ✓</b> and <b>Trade ✓</b>. <b>Never enable Withdrawal</b> — we do not need it and it is a security risk.")}
+      {_step("2", "Keep your funds in the right place",
+        "On Bybit: funds must be in your <b>Unified Trading Account</b> as USDT. "
+        "On OKX: funds must be in your <b>Trading Account</b> as USDT. "
+        "The AI reads your USDT balance and sizes positions from there.")}
+      {_step("3", "Choose a coin, mode, and style",
+        "Start with <b>BTCUSDT</b> or <b>ETHUSDT</b> (most liquid, cleaner signals). "
+        "Recommended mode: <b>SAFE</b> or <b>MINI_ASYM</b>. Recommended style: <b>DAY_TRADE</b> (1h candles, checks every hour). "
+        "Avoid AGGRESSIVE until you are comfortable.")}
+      {_step("4", "Set a duration and start",
+        "Choose how many days you want the AI to run (1–30 days). It stops automatically at the end. "
+        "You can start a new session anytime. Press <b>Start AI</b> on the dashboard.")}
+    </div>
+
+    <!-- HOW IT WORKS -->
+    <div style="margin-bottom:14px;">
+      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:10px;">Why does it trade less than expected?</div>
+      <div style="font-size:13px;color:#94a3b8;line-height:1.65;">
+        The engine only enters a trade when <b>all 4 signal layers align</b> at the same time: trend strength (ADX),
+        direction (4h EMA), entry timing (pullback zone + candle pattern), and momentum (volume + candle direction).
+        If any layer is missing, it waits. <b>Quality over quantity</b> — fewer but higher-probability trades protect your capital better than trading every hour.
       </div>
     </div>
 
-    <div style="background:rgba(0,255,224,0.06);border:1px solid rgba(0,255,224,0.18);
-                border-radius:12px;padding:14px 16px;font-size:13px;color:#a7f3d0;line-height:1.6;">
-      <b>How the engine protects you:</b> It uses 4 signal layers (regime, direction, entry, momentum),
-      a hard drawdown floor, and position sizing based on volatility. It stops automatically if your
-      account drops below the floor to protect your capital.
+    <!-- RISK PROTECTION -->
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:18px;">
+      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:10px;">How it protects your money</div>
+      <div style="font-size:13px;color:#94a3b8;line-height:1.7;">
+        • <b>Hard floor:</b> if your account drops 15% from its peak, the engine stops completely.<br>
+        • <b>Drawdown tiers:</b> position size automatically shrinks at −4%, −7%, and −10% drawdown.<br>
+        • <b>Per-trade cap:</b> max loss per trade is 1.5–3% of your equity depending on your style.<br>
+        • <b>Non-custodial:</b> the AI only has trade permission — it can never withdraw your funds. You can disconnect or withdraw from your exchange at any time.
+      </div>
+    </div>
+
+    <!-- MODES + STYLES -->
+    <div style="margin-bottom:18px;">
+      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:10px;">Modes and Styles — quick reference</div>
+      <table style="width:100%;border-collapse:collapse;font-size:12px;color:#94a3b8;">
+        <tr style="border-bottom:1px solid rgba(255,255,255,0.07);">
+          <td style="padding:7px 4px;font-weight:700;color:#f1f5f9;">Mode</td>
+          <td style="padding:7px 4px;">Size</td><td style="padding:7px 4px;">Leverage</td><td style="padding:7px 4px;">Best for</td>
+        </tr>
+        <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
+          <td style="padding:7px 4px;color:#00ffe0;">ULTRA_SAFE</td><td style="padding:7px 4px;">30%</td><td style="padding:7px 4px;">2×</td><td style="padding:7px 4px;">First week, testing</td>
+        </tr>
+        <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
+          <td style="padding:7px 4px;color:#00ffe0;">SAFE</td><td style="padding:7px 4px;">45%</td><td style="padding:7px 4px;">3×</td><td style="padding:7px 4px;">Conservative, steady</td>
+        </tr>
+        <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
+          <td style="padding:7px 4px;color:#00ffe0;">MINI_ASYM</td><td style="padding:7px 4px;">65%</td><td style="padding:7px 4px;">6×</td><td style="padding:7px 4px;">Flagship, balanced</td>
+        </tr>
+        <tr>
+          <td style="padding:7px 4px;color:#00ffe0;">AGGRESSIVE</td><td style="padding:7px 4px;">85%</td><td style="padding:7px 4px;">8×</td><td style="padding:7px 4px;">Experienced only</td>
+        </tr>
+      </table>
+      <div style="margin-top:10px;font-size:12px;color:#94a3b8;">
+        <b>Styles:</b> SCALP (15m charts, checks every 15 min) · DAY_TRADE (1h, every hour) · SWING (4h, every 4 hours)
+      </div>
     </div>"""
+
     send_email(
         to,
-        "Welcome to Asymmetric AI — Get started in 3 steps",
-        _email_base(content, footer="You are in control. The AI only trades with your API keys on your exchange account."),
+        "Welcome to Asymmetric AI — Complete setup guide",
+        _email_base(content, footer="You are in control. The AI only trades with your API keys on your exchange account. We can never withdraw your funds."),
     )
 
 
