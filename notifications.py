@@ -42,23 +42,29 @@ def tg_alert(text: str) -> None:
 # ── Email helpers ─────────────────────────────────────────────────────────────
 
 def _letter_base(content: str, footer: str = "Automated trading involves risk. Never trade more than you can afford to lose.") -> str:
-    """Open, letter-style layout for welcome and guide emails."""
+    """Light-background letter layout for welcome and guide emails."""
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Asymmetric AI</title></head>
-<body style="margin:0;padding:0;background:#060a18;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#cbd5e1;">
-  <div style="max-width:600px;margin:0 auto;padding:52px 28px 60px;">
+<body style="margin:0;padding:0;background:#f0f2f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;">
+  <div style="max-width:580px;margin:0 auto;padding:40px 16px 48px;">
 
-    <div style="margin-bottom:36px;">
-      <span style="font-size:11px;font-weight:900;color:#00ffe0;letter-spacing:0.12em;text-transform:uppercase;">Asymmetric&nbsp;AI</span>
+    <!-- Logo -->
+    <div style="padding:0 8px 28px;">
+      <span style="font-size:16px;font-weight:900;color:#0a0f1e;letter-spacing:-0.01em;">Asymmetric</span><span style="font-size:16px;font-weight:900;color:#00b89c;letter-spacing:-0.01em;"> AI</span>
     </div>
 
-    <div>{content}</div>
+    <!-- White card -->
+    <div style="background:#ffffff;border-radius:12px;padding:36px 36px 32px;box-shadow:0 1px 4px rgba(0,0,0,0.08);">
 
-    <div style="margin-top:52px;padding-top:20px;border-top:1px solid rgba(255,255,255,0.06);
-                font-size:11px;color:#2d3748;line-height:1.8;">
+      {content}
+
+    </div>
+
+    <!-- Footer -->
+    <div style="padding:20px 8px 0;font-size:11px;color:#9ca3af;line-height:1.7;">
       {footer}<br>
-      &copy; Asymmetric AI &nbsp;&middot;&nbsp; You are receiving this because you have an account with us.
+      &copy; Asymmetric AI &nbsp;&middot;&nbsp; You received this because you have an account with us.
     </div>
   </div>
 </body></html>"""
@@ -355,50 +361,45 @@ def email_2fa_enabled(to: str) -> None:
 # ── Onboarding emails ─────────────────────────────────────────────────────────
 
 def email_welcome(to: str) -> None:
-    items = [
-        ("How to create a trade-only API key", "Bybit, OKX, or Binance — step by step."),
-        ("Where to keep your funds", "The right account type on your exchange."),
-        ("Modes and styles", "Which combination is right for your goals and risk tolerance."),
-        ("The 4-layer signal system", "Why the AI trades less than you expect — and why that's the point."),
-        ("Capital protection", "Hard floor, drawdown tiers, and per-trade loss caps explained."),
-        ("Starting the AI", "Set a coin, mode, style, duration, and go."),
-    ]
-    rows = "".join(
-        f"""<tr>
-          <td style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.05);vertical-align:top;width:16px;">
-            <span style="font-size:11px;font-weight:900;color:#00ffe0;">{i+1}</span>
-          </td>
-          <td style="padding:10px 0 10px 14px;border-bottom:1px solid rgba(255,255,255,0.05);">
-            <div style="font-size:14px;font-weight:600;color:#e2e8f0;margin-bottom:2px;">{title}</div>
-            <div style="font-size:13px;color:#6b7280;">{desc}</div>
-          </td>
-        </tr>"""
-        for i, (title, desc) in enumerate(items)
-    )
-    content = f"""
-    <p style="font-size:16px;color:#94a3b8;margin:0 0 28px;line-height:1;font-weight:300;">Hi,</p>
+    content = """
+      <p style="font-size:15px;color:#374151;margin:0 0 22px;line-height:1;">Hey!</p>
 
-    <h1 style="font-size:26px;font-weight:900;color:#f1f5f9;margin:0 0 16px;line-height:1.2;letter-spacing:-0.02em;">
-      Welcome to Asymmetric AI.
-    </h1>
+      <h1 style="font-size:24px;font-weight:800;color:#111827;margin:0 0 18px;line-height:1.25;letter-spacing:-0.02em;">
+        Welcome to Asymmetric AI.
+      </h1>
 
-    <p style="font-size:15px;color:#94a3b8;line-height:1.75;margin:0 0 28px;">
-      Your account is ready. Before you start trading, we'd like to walk you through a short setup guide inside the app. It covers everything you need to know and takes about five minutes.
-    </p>
+      <p style="font-size:15px;color:#4b5563;line-height:1.75;margin:0 0 16px;">
+        We're really glad to have you here. Your account is active and ready to use.
+      </p>
 
-    <p style="font-size:12px;font-weight:800;color:#00ffe0;text-transform:uppercase;letter-spacing:0.1em;margin:0 0 14px;">
-      What the guide covers
-    </p>
+      <p style="font-size:15px;color:#4b5563;line-height:1.75;margin:0 0 16px;">
+        Asymmetric AI is an AI-powered trading system that monitors the market 24/7 and places trades on your behalf using a 4-layer signal system — designed to find high-quality entries and protect your capital at every step. You stay in full control. The AI only uses your exchange API keys to trade, and can never access or withdraw your funds.
+      </p>
 
-    <table style="width:100%;border-collapse:collapse;margin-bottom:32px;">{rows}</table>
+      <p style="font-size:15px;color:#4b5563;line-height:1.75;margin:0 0 28px;">
+        Before you start, open the app and complete the short setup guide — it walks you through connecting your exchange, choosing your mode and style, and placing your first session. It takes about 5 minutes, and once you're done we'll send you a full reference guide to keep in your inbox.
+      </p>
 
-    <p style="font-size:15px;color:#94a3b8;line-height:1.75;margin:0 0 32px;">
-      Once you complete the guide, we'll send you a full reference email — every detail in one place for whenever you need a quick reminder.
-    </p>
+      <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:10px;padding:18px 20px;margin-bottom:28px;">
+        <p style="font-size:13px;font-weight:700;color:#111827;margin:0 0 10px;">What the setup guide covers</p>
+        <p style="font-size:14px;color:#6b7280;margin:0;line-height:1.9;">
+          &rarr; &nbsp;Connecting your exchange API (Bybit, OKX, or Binance)<br>
+          &rarr; &nbsp;Where to keep your funds on the exchange<br>
+          &rarr; &nbsp;Choosing the right Mode and Style for your goals<br>
+          &rarr; &nbsp;How the 4-layer signal system works<br>
+          &rarr; &nbsp;Capital protection: hard floor, drawdown tiers, per-trade caps<br>
+          &rarr; &nbsp;Starting your first session
+        </p>
+      </div>
 
-    <p style="font-size:14px;color:#6b7280;margin:0;">
-      The Asymmetric AI Team
-    </p>"""
+      <p style="font-size:15px;color:#4b5563;line-height:1.75;margin:0 0 28px;">
+        If you have any questions at any point, you can reach us through the support chat inside the app. We're here to help.
+      </p>
+
+      <p style="font-size:14px;color:#6b7280;margin:0;line-height:1.6;">
+        Welcome aboard,<br>
+        <span style="font-weight:700;color:#374151;">The Asymmetric AI Team</span>
+      </p>"""
     send_email(
         to,
         "Welcome to Asymmetric AI",
@@ -409,28 +410,28 @@ def email_welcome(to: str) -> None:
 def email_onboarding_complete(to: str) -> None:
     def _heading(text: str) -> str:
         return (
-            f'<p style="font-size:11px;font-weight:800;color:#00ffe0;text-transform:uppercase;'
-            f'letter-spacing:0.1em;margin:36px 0 14px;padding-bottom:10px;'
-            f'border-bottom:1px solid rgba(0,255,224,0.12);">{text}</p>'
+            f'<p style="font-size:11px;font-weight:800;color:#00957a;text-transform:uppercase;'
+            f'letter-spacing:0.1em;margin:32px 0 14px;padding-bottom:10px;'
+            f'border-bottom:1px solid #e5e7eb;">{text}</p>'
         )
 
     def _exchange_block(name: str, steps: str, funds: str) -> str:
         return (
-            f'<p style="font-size:13px;font-weight:700;color:#e2e8f0;margin:16px 0 4px;">{name}</p>'
-            f'<p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0 0 4px;">{steps}</p>'
-            f'<p style="font-size:12px;color:#4b5563;margin:0 0 12px;">Funds &rarr; {funds}</p>'
+            f'<p style="font-size:13px;font-weight:700;color:#111827;margin:16px 0 4px;">{name}</p>'
+            f'<p style="font-size:14px;color:#4b5563;line-height:1.7;margin:0 0 4px;">{steps}</p>'
+            f'<p style="font-size:12px;color:#9ca3af;margin:0 0 12px;">Funds &rarr; {funds}</p>'
         )
 
     def _layer(num: str, title: str, desc: str) -> str:
         return (
             f'<tr>'
             f'<td style="padding:10px 14px 10px 0;vertical-align:top;width:28px;">'
-            f'<span style="display:inline-block;width:22px;height:22px;line-height:22px;text-align:center;'
-            f'background:rgba(0,255,224,0.08);border:1px solid rgba(0,255,224,0.2);border-radius:50%;'
-            f'font-size:10px;font-weight:900;color:#00ffe0;">{num}</span>'
+            f'<span style="display:inline-block;width:24px;height:24px;line-height:24px;text-align:center;'
+            f'background:#f0fdf9;border:1px solid #6ee7d4;border-radius:50%;'
+            f'font-size:11px;font-weight:800;color:#00957a;">{num}</span>'
             f'</td>'
-            f'<td style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.05);">'
-            f'<div style="font-size:14px;font-weight:600;color:#e2e8f0;margin-bottom:3px;">{title}</div>'
+            f'<td style="padding:10px 0;border-bottom:1px solid #f3f4f6;">'
+            f'<div style="font-size:14px;font-weight:600;color:#111827;margin-bottom:3px;">{title}</div>'
             f'<div style="font-size:13px;color:#6b7280;line-height:1.6;">{desc}</div>'
             f'</td></tr>'
         )
@@ -438,56 +439,56 @@ def email_onboarding_complete(to: str) -> None:
     def _shield(label: str, value: str) -> str:
         return (
             f'<tr><td style="padding:9px 14px 9px 0;vertical-align:top;width:16px;">'
-            f'<span style="color:#00ffe0;font-size:13px;font-weight:700;">&#x2714;</span></td>'
-            f'<td style="padding:9px 0;border-bottom:1px solid rgba(255,255,255,0.05);">'
-            f'<span style="font-size:14px;font-weight:600;color:#e2e8f0;">{label}</span> &nbsp;'
-            f'<span style="font-size:13px;color:#6b7280;">{value}</span>'
+            f'<span style="color:#00957a;font-size:14px;font-weight:700;">&#x2714;</span></td>'
+            f'<td style="padding:9px 0;border-bottom:1px solid #f3f4f6;">'
+            f'<span style="font-size:14px;font-weight:600;color:#111827;">{label}</span>'
+            f'<span style="font-size:13px;color:#6b7280;"> &mdash; {value}</span>'
             f'</td></tr>'
         )
 
     def _mode(name: str, size: str, lev: str, best: str, flagship: bool = False) -> str:
         name_cell = (
-            f'<span style="font-size:13px;font-weight:700;color:#00ffe0;">{name}</span>'
+            f'<span style="font-size:13px;font-weight:700;color:#00957a;">{name}</span>'
             + (
-                ' &nbsp;<span style="font-size:9px;background:rgba(0,255,224,0.12);color:#00ffe0;'
-                'border-radius:3px;padding:1px 5px;font-weight:800;letter-spacing:0.05em;">FLAGSHIP</span>'
+                ' &nbsp;<span style="font-size:9px;background:#f0fdf9;color:#00957a;border:1px solid #6ee7d4;'
+                'border-radius:3px;padding:1px 6px;font-weight:800;letter-spacing:0.05em;">FLAGSHIP</span>'
                 if flagship else ""
             )
         )
-        row_bg = 'background:rgba(0,255,224,0.04);' if flagship else ''
+        row_bg = 'background:#f9fffe;' if flagship else ''
         return (
             f'<tr style="{row_bg}">'
-            f'<td style="padding:9px 10px 9px 0;border-bottom:1px solid rgba(255,255,255,0.05);">{name_cell}</td>'
-            f'<td style="padding:9px 8px;border-bottom:1px solid rgba(255,255,255,0.05);font-size:13px;color:#6b7280;text-align:center;">{size}</td>'
-            f'<td style="padding:9px 8px;border-bottom:1px solid rgba(255,255,255,0.05);font-size:13px;color:#6b7280;text-align:center;">{lev}</td>'
-            f'<td style="padding:9px 0 9px 8px;border-bottom:1px solid rgba(255,255,255,0.05);font-size:13px;color:#6b7280;">{best}</td>'
+            f'<td style="padding:9px 10px 9px 0;border-bottom:1px solid #f3f4f6;">{name_cell}</td>'
+            f'<td style="padding:9px 8px;border-bottom:1px solid #f3f4f6;font-size:13px;color:#6b7280;text-align:center;">{size}</td>'
+            f'<td style="padding:9px 8px;border-bottom:1px solid #f3f4f6;font-size:13px;color:#6b7280;text-align:center;">{lev}</td>'
+            f'<td style="padding:9px 0 9px 8px;border-bottom:1px solid #f3f4f6;font-size:13px;color:#6b7280;">{best}</td>'
             f'</tr>'
         )
 
     content = f"""
-    <p style="font-size:16px;color:#94a3b8;margin:0 0 28px;font-weight:300;">Hi,</p>
+      <p style="font-size:15px;color:#374151;margin:0 0 22px;line-height:1;">Hey!</p>
 
-    <h1 style="font-size:26px;font-weight:900;color:#f1f5f9;margin:0 0 16px;line-height:1.2;letter-spacing:-0.02em;">
-      Your setup is complete.
-    </h1>
+      <h1 style="font-size:24px;font-weight:800;color:#111827;margin:0 0 16px;line-height:1.25;letter-spacing:-0.02em;">
+        Welcome to Asymmetric AI — here&rsquo;s everything you need to know.
+      </h1>
 
-    <p style="font-size:15px;color:#94a3b8;line-height:1.75;margin:0 0 8px;">
-      This is your permanent reference guide — save this email for whenever you need a quick reminder of how Asymmetric AI works.
-    </p>
+      <p style="font-size:15px;color:#4b5563;line-height:1.75;margin:0 0 28px;">
+        Your account is set up and ready. This email is your permanent reference guide — save it for whenever you need a quick reminder of how the software works. It covers everything from connecting your exchange to understanding how the AI protects your capital.
+      </p>
 
     {_heading("Minimum Capital")}
 
-    <p style="font-size:15px;color:#94a3b8;line-height:1.75;margin:0 0 8px;">
-      <span style="color:#e2e8f0;font-weight:700;">Minimum: $50 USDT.</span> &nbsp;$100–$500 is the ideal starting range for meaningful results with controlled risk.
+    <p style="font-size:15px;color:#4b5563;line-height:1.75;margin:0 0 8px;">
+      <span style="color:#111827;font-weight:700;">Minimum: $50 USDT.</span> &nbsp;$100–$500 is the ideal starting range for meaningful results with controlled risk.
     </p>
     <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0;">
-      Keep your funds in your exchange <b style="color:#94a3b8;">trading account</b>, not in a bank or funding wallet. The AI can only access and trade funds in the trading account.
+      Keep your funds in your exchange <b style="color:#374151;">trading account</b>, not in a bank or funding wallet. The AI can only access and trade funds in the trading account.
     </p>
 
     {_heading("Connecting Your Exchange")}
 
-    <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0 0 4px;">
-      Create a <b style="color:#94a3b8;">trade-only API key</b> on your exchange. Always enable <b style="color:#94a3b8;">Read</b> and <b style="color:#94a3b8;">Trade</b> permissions. <b style="color:#ff8080;">Never enable Withdrawal</b> — Asymmetric AI cannot and should not be able to move your funds.
+    <p style="font-size:14px;color:#4b5563;line-height:1.7;margin:0 0 4px;">
+      Create a <b style="color:#111827;">trade-only API key</b> on your exchange. Always enable <b style="color:#111827;">Read</b> and <b style="color:#111827;">Trade</b> permissions. <b style="color:#dc2626;">Never enable Withdrawal</b> — Asymmetric AI cannot and should not be able to move your funds.
     </p>
 
     {_exchange_block(
@@ -508,8 +509,8 @@ def email_onboarding_complete(to: str) -> None:
 
     {_heading("How the 4-Layer Signal Works")}
 
-    <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0 0 14px;">
-      Every trade must pass all four layers before it is placed. If any layer fails, the AI waits. This is what keeps entry quality high — and why you'll see fewer trades than you might expect.
+    <p style="font-size:14px;color:#4b5563;line-height:1.75;margin:0 0 14px;">
+      Every trade must pass all four layers before it is placed. If any layer fails, the AI waits. This is what keeps entry quality high — and why you'll see fewer trades than you might expect. Quality over quantity.
     </p>
 
     <table style="width:100%;border-collapse:collapse;margin-bottom:8px;">
@@ -521,30 +522,30 @@ def email_onboarding_complete(to: str) -> None:
 
     {_heading("Capital Protection")}
 
-    <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0 0 14px;">
-      The risk engine operates continuously in the background, independent of the signal. These controls are always active.
+    <p style="font-size:14px;color:#4b5563;line-height:1.75;margin:0 0 14px;">
+      The risk engine runs continuously in the background — independent of the signal. These protections are always active and cannot be turned off.
     </p>
 
     <table style="width:100%;border-collapse:collapse;margin-bottom:8px;">
-      {_shield("Hard floor", "The engine stops entirely if your equity drops 15% from its peak.")}
-      {_shield("Drawdown tiers", "Position size automatically shrinks at &minus;4% &rarr; 65%, &minus;7% &rarr; 40%, &minus;10% &rarr; 25%.")}
-      {_shield("Per-trade loss cap", "Maximum 1.5% (Scalp) / 2% (Day Trade) / 3% (Swing) of equity per trade.")}
+      {_shield("Hard floor", "Engine stops entirely if equity drops 15% from its peak.")}
+      {_shield("Drawdown tiers", "Position size shrinks automatically at &minus;4% &rarr; 65%, &minus;7% &rarr; 40%, &minus;10% &rarr; 25%.")}
+      {_shield("Per-trade loss cap", "Max 1.5% (Scalp) / 2% (Day Trade) / 3% (Swing) of equity per trade.")}
       {_shield("Non-custodial", "We hold no funds and cannot withdraw. API keys grant trade permission only.")}
     </table>
 
     {_heading("Modes &amp; Styles")}
 
-    <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0 0 14px;">
-      Choose a <b style="color:#94a3b8;">Mode</b> (how aggressively the AI sizes positions) and a <b style="color:#94a3b8;">Style</b> (which timeframe it trades on). If you're unsure, start with <b style="color:#00ffe0;">MINI_ASYM</b> mode and <b style="color:#00ffe0;">DAY_TRADE</b> style.
+    <p style="font-size:14px;color:#4b5563;line-height:1.75;margin:0 0 14px;">
+      Choose a <b style="color:#111827;">Mode</b> (how aggressively the AI sizes positions) and a <b style="color:#111827;">Style</b> (which timeframe it trades on). If you're unsure, start with <b style="color:#00957a;">MINI_ASYM</b> mode and <b style="color:#00957a;">DAY_TRADE</b> style — the most popular combination.
     </p>
 
     <table style="width:100%;border-collapse:collapse;margin-bottom:20px;">
       <thead>
-        <tr>
-          <th style="padding:0 10px 8px 0;font-size:11px;color:#374151;text-align:left;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Mode</th>
-          <th style="padding:0 8px 8px;font-size:11px;color:#374151;text-align:center;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Size</th>
-          <th style="padding:0 8px 8px;font-size:11px;color:#374151;text-align:center;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Lev</th>
-          <th style="padding:0 0 8px 8px;font-size:11px;color:#374151;text-align:left;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Best for</th>
+        <tr style="border-bottom:2px solid #e5e7eb;">
+          <th style="padding:0 10px 10px 0;font-size:11px;color:#9ca3af;text-align:left;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Mode</th>
+          <th style="padding:0 8px 10px;font-size:11px;color:#9ca3af;text-align:center;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Size</th>
+          <th style="padding:0 8px 10px;font-size:11px;color:#9ca3af;text-align:center;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Lev</th>
+          <th style="padding:0 0 10px 8px;font-size:11px;color:#9ca3af;text-align:left;font-weight:700;text-transform:uppercase;letter-spacing:0.06em;">Best for</th>
         </tr>
       </thead>
       <tbody>
@@ -556,32 +557,33 @@ def email_onboarding_complete(to: str) -> None:
       </tbody>
     </table>
 
-    <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0 0 4px;">
-      <b style="color:#94a3b8;">SCALP</b> &mdash; 15-minute chart, checks every 15 minutes.<br>
-      <b style="color:#00ffe0;">DAY_TRADE</b> &mdash; 1-hour chart, checks every hour. <span style="color:#00ffe0;">Recommended.</span><br>
-      <b style="color:#94a3b8;">SWING</b> &mdash; 4-hour chart, checks every 4 hours.
+    <p style="font-size:14px;color:#4b5563;line-height:1.9;margin:0 0 4px;">
+      <b style="color:#374151;">SCALP</b> &mdash; 15-minute chart, checks every 15 minutes.<br>
+      <b style="color:#00957a;">DAY_TRADE</b> &mdash; 1-hour chart, checks every hour. <span style="color:#00957a;font-weight:600;">Recommended.</span><br>
+      <b style="color:#374151;">SWING</b> &mdash; 4-hour chart, checks every 4 hours.
     </p>
 
     {_heading("Starting the AI")}
 
-    <p style="font-size:15px;color:#94a3b8;line-height:1.75;margin:0 0 8px;">
-      From the Dashboard: add your API keys in Settings, choose a coin, select your Mode and Style, set a duration (1–30 days), and press <b style="color:#e2e8f0;">Start AI</b>. That's it.
+    <p style="font-size:15px;color:#4b5563;line-height:1.75;margin:0 0 10px;">
+      From the Dashboard: add your API keys in Settings, select a coin, choose your Mode and Style, set a duration (1–30 days), and press <b style="color:#111827;">Start AI</b>. That's it.
     </p>
     <p style="font-size:14px;color:#6b7280;line-height:1.7;margin:0;">
-      The AI will send you an email every time a trade opens or closes. When your session ends, you'll receive a notification and can start a new one whenever you're ready.
+      You'll receive an email every time a trade opens or closes. When your session ends, you can start a new one anytime.
     </p>
 
-    <p style="font-size:14px;color:#6b7280;margin:40px 0 0;line-height:1.6;">
-      If you have any questions, reach out through the support chat inside the app — we're here to help.
+    <p style="font-size:15px;color:#4b5563;margin:36px 0 0;line-height:1.6;">
+      If you have any questions, open the support chat inside the app and our team will get back to you. We're here to help.
     </p>
 
-    <p style="font-size:14px;color:#6b7280;margin:20px 0 0;">
-      The Asymmetric AI Team
+    <p style="font-size:14px;color:#6b7280;margin:24px 0 0;line-height:1.6;">
+      Welcome aboard,<br>
+      <span style="font-weight:700;color:#374151;">The Asymmetric AI Team</span>
     </p>"""
 
     send_email(
         to,
-        "Your Asymmetric AI setup guide",
+        "Welcome to Asymmetric AI — your setup guide",
         _letter_base(content, footer="You are in control. The AI only trades with your API keys on your exchange account. We can never withdraw your funds."),
     )
 
