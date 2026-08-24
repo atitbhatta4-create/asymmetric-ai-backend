@@ -304,7 +304,10 @@ def session_me(session: Optional[str] = Cookie(default=None)):
 @auth_router.post("/onboarding/complete")
 def onboarding_complete_route(user=Depends(_require_user)):
     from user_state import mark_onboarding_complete
-    mark_onboarding_complete(user["email"])
+    from notifications import email_onboarding_complete
+    email = user["email"]
+    mark_onboarding_complete(email)
+    email_onboarding_complete(email)
     return {"ok": True}
 
 

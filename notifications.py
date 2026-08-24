@@ -321,96 +321,107 @@ def email_2fa_enabled(to: str) -> None:
 # ── Onboarding emails ─────────────────────────────────────────────────────────
 
 def email_welcome(to: str) -> None:
-    def _step(n: str, title: str, body: str) -> str:
-        return f"""
-        <div style="display:flex;align-items:flex-start;margin-bottom:16px;">
-          <div style="min-width:28px;height:28px;background:#00ffe0;border-radius:50%;display:flex;align-items:center;
-                      justify-content:center;font-weight:900;font-size:13px;color:#050814;margin-right:12px;flex-shrink:0;">{n}</div>
-          <div>
-            <div style="font-weight:700;color:#f1f5f9;margin-bottom:4px;">{title}</div>
-            <div style="font-size:13px;color:#94a3b8;line-height:1.55;">{body}</div>
-          </div>
-        </div>"""
-
     content = f"""
-    <h2 style="margin:0 0 4px;font-size:22px;font-weight:900;color:#f1f5f9;">Welcome to Asymmetric AI</h2>
-    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">Your account is ready. Read this guide before you start — it will save you time.</p>
+    <h2 style="margin:0 0 6px;font-size:22px;font-weight:900;color:#f1f5f9;">Welcome to Asymmetric AI</h2>
+    <p style="margin:0 0 20px;font-size:13px;color:#6b7280;">Your account is ready. One last step before you start.</p>
 
-    <!-- MINIMUM CAPITAL -->
-    <div style="background:rgba(0,255,224,0.07);border:1px solid rgba(0,255,224,0.22);
-                border-radius:12px;padding:13px 16px;font-size:13px;color:#a7f3d0;line-height:1.6;margin-bottom:18px;">
-      <b>Minimum recommended capital: $50 USDT.</b><br>
-      Smaller amounts work but fees will eat a larger percentage of each trade. $100–$500 is ideal to start.
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:18px;margin-bottom:18px;">
+      <div style="font-size:14px;color:#94a3b8;line-height:1.75;">
+        We've put together a <b style="color:#f1f5f9;">6-step interactive setup guide</b> inside the app that covers everything you need to know before placing your first trade — API key setup, how to choose your mode and style, how the risk engine protects your capital, and how to start in under 5 minutes.
+      </div>
     </div>
 
-    <!-- SETUP STEPS -->
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:18px 16px;margin-bottom:18px;">
-      {_step("1", "Connect your Bybit or OKX API keys",
-        "Go to <b>Exchange</b> in the sidebar. Create a trade-only API key on Bybit or OKX. "
-        "Enable: <b>Read ✓</b> and <b>Trade ✓</b>. <b>Never enable Withdrawal</b> — we do not need it and it is a security risk.")}
-      {_step("2", "Keep your funds in the right place",
-        "On Bybit: funds must be in your <b>Unified Trading Account</b> as USDT. "
-        "On OKX: funds must be in your <b>Trading Account</b> as USDT. "
-        "The AI reads your USDT balance and sizes positions from there.")}
-      {_step("3", "Choose a coin, mode, and style",
-        "Start with <b>BTCUSDT</b> or <b>ETHUSDT</b> (most liquid, cleaner signals). "
-        "Recommended mode: <b>SAFE</b> or <b>MINI_ASYM</b>. Recommended style: <b>DAY_TRADE</b> (1h candles, checks every hour). "
-        "Avoid AGGRESSIVE until you are comfortable.")}
-      {_step("4", "Set a duration and start",
-        "Choose how many days you want the AI to run (1–30 days). It stops automatically at the end. "
-        "You can start a new session anytime. Press <b>Start AI</b> on the dashboard.")}
+    <a href="https://asymmetric-ai.vercel.app"
+       style="display:block;padding:14px 16px;background:linear-gradient(90deg,#00ff9d,#00ffe0);
+              color:#021018;font-weight:900;font-size:14px;text-align:center;border-radius:14px;
+              text-decoration:none;margin-bottom:16px;">
+      Open Asymmetric AI &rarr;
+    </a>
+
+    <div style="font-size:12px;color:#4b5563;line-height:1.6;">
+      Once you complete the setup guide in the app, you'll receive another email with your full reference guide to keep in your inbox.
+    </div>"""
+    send_email(
+        to,
+        "Welcome to Asymmetric AI — Complete your setup",
+        _email_base(content, footer="You are in control. The AI only trades with your API keys on your exchange account."),
+    )
+
+
+def email_onboarding_complete(to: str) -> None:
+    content = """
+    <h2 style="margin:0 0 4px;font-size:22px;font-weight:900;color:#f1f5f9;">Your Complete Setup Reference</h2>
+    <p style="margin:0 0 18px;font-size:13px;color:#6b7280;">You've completed the setup guide. Keep this email — it covers everything in one place.</p>
+
+    <!-- CAPITAL -->
+    <div style="background:rgba(0,255,224,0.07);border:1px solid rgba(0,255,224,0.22);
+                border-radius:12px;padding:13px 16px;font-size:13px;color:#a7f3d0;line-height:1.6;margin-bottom:18px;">
+      <b>Minimum recommended capital: $50 USDT.</b> $100–$500 is the ideal starting range for meaningful results with controlled risk.
+    </div>
+
+    <!-- API SETUP -->
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:16px;">
+      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:12px;">API Key Setup</div>
+      <div style="font-size:13px;color:#94a3b8;line-height:1.7;">
+        <b style="color:#f1f5f9;">Bybit:</b> Profile → API Management → Create New Key → Enable Read + Trade. Disable Withdrawal.<br>
+        <b style="color:#f1f5f9;">OKX:</b> Profile → API → Create V5 API Key → Enable Read + Trade + set Passphrase. Disable Withdrawal.<br>
+        <b style="color:#f1f5f9;">Binance:</b> Profile → API Management → Create API → Enable Reading + Spot &amp; Margin / Futures Trading. Disable Withdrawal.<br><br>
+        <b style="color:#f1f5f9;">Funds location:</b> Bybit → Unified Trading Account · OKX → Trading Account · Binance → Futures/Trading Account — all in USDT.
+      </div>
     </div>
 
     <!-- HOW IT WORKS -->
-    <div style="margin-bottom:14px;">
-      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:10px;">Why does it trade less than expected?</div>
-      <div style="font-size:13px;color:#94a3b8;line-height:1.65;">
-        The engine only enters a trade when <b>all 4 signal layers align</b> at the same time: trend strength (ADX),
-        direction (4h EMA), entry timing (pullback zone + candle pattern), and momentum (volume + candle direction).
-        If any layer is missing, it waits. <b>Quality over quantity</b> — fewer but higher-probability trades protect your capital better than trading every hour.
-      </div>
-    </div>
-
-    <!-- RISK PROTECTION -->
-    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:18px;">
-      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:10px;">How it protects your money</div>
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:16px;">
+      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:10px;">4-Layer Signal System</div>
       <div style="font-size:13px;color:#94a3b8;line-height:1.7;">
-        • <b>Hard floor:</b> if your account drops 15% from its peak, the engine stops completely.<br>
-        • <b>Drawdown tiers:</b> position size automatically shrinks at −4%, −7%, and −10% drawdown.<br>
-        • <b>Per-trade cap:</b> max loss per trade is 1.5–3% of your equity depending on your style.<br>
-        • <b>Non-custodial:</b> the AI only has trade permission — it can never withdraw your funds. You can disconnect or withdraw from your exchange at any time.
+        <b style="color:#00ffe0;">Layer 1 — Regime:</b> ADX + ATR confirm a real trend, not chop.<br>
+        <b style="color:#00ffe0;">Layer 2 — Direction:</b> 4h EMA21 vs EMA50 determines trend bias (long or short).<br>
+        <b style="color:#00ffe0;">Layer 3 — Entry:</b> Price in pullback zone, qualifying candle pattern, RSI confirmed.<br>
+        <b style="color:#00ffe0;">Layer 4 — Momentum:</b> Volume real, recent candles confirming the move.<br><br>
+        All 4 must align. If any layer is missing, the engine waits. <b style="color:#f1f5f9;">Quality over quantity.</b>
       </div>
     </div>
 
-    <!-- MODES + STYLES -->
-    <div style="margin-bottom:18px;">
-      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:10px;">Modes and Styles — quick reference</div>
+    <!-- PROTECTION -->
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:16px;">
+      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:10px;">Capital Protection</div>
+      <div style="font-size:13px;color:#94a3b8;line-height:1.7;">
+        • <b style="color:#f1f5f9;">Hard floor:</b> engine stops if equity drops 15% from peak.<br>
+        • <b style="color:#f1f5f9;">Drawdown tiers:</b> size shrinks at −4% → 65%, −7% → 40%, −10% → 25%.<br>
+        • <b style="color:#f1f5f9;">Per-trade cap:</b> max loss 1.5% (SCALP) / 2% (DAY_TRADE) / 3% (SWING) of equity.<br>
+        • <b style="color:#f1f5f9;">Non-custodial:</b> we can never withdraw your funds — trade permission only.
+      </div>
+    </div>
+
+    <!-- MODES TABLE -->
+    <div style="background:#0f172a;border:1px solid rgba(255,255,255,0.07);border-radius:14px;padding:16px;margin-bottom:16px;">
+      <div style="font-size:14px;font-weight:800;color:#f1f5f9;margin-bottom:10px;">Modes &amp; Styles — quick reference</div>
       <table style="width:100%;border-collapse:collapse;font-size:12px;color:#94a3b8;">
         <tr style="border-bottom:1px solid rgba(255,255,255,0.07);">
-          <td style="padding:7px 4px;font-weight:700;color:#f1f5f9;">Mode</td>
-          <td style="padding:7px 4px;">Size</td><td style="padding:7px 4px;">Leverage</td><td style="padding:7px 4px;">Best for</td>
+          <td style="padding:6px 4px;font-weight:700;color:#f1f5f9;">Mode</td>
+          <td style="padding:6px 4px;">Size</td><td style="padding:6px 4px;">Lev</td><td style="padding:6px 4px;">Best for</td>
         </tr>
-        <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
-          <td style="padding:7px 4px;color:#00ffe0;">ULTRA_SAFE</td><td style="padding:7px 4px;">30%</td><td style="padding:7px 4px;">2×</td><td style="padding:7px 4px;">First week, testing</td>
-        </tr>
-        <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
-          <td style="padding:7px 4px;color:#00ffe0;">SAFE</td><td style="padding:7px 4px;">45%</td><td style="padding:7px 4px;">3×</td><td style="padding:7px 4px;">Conservative, steady</td>
-        </tr>
-        <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
-          <td style="padding:7px 4px;color:#00ffe0;">MINI_ASYM</td><td style="padding:7px 4px;">65%</td><td style="padding:7px 4px;">6×</td><td style="padding:7px 4px;">Flagship, balanced</td>
-        </tr>
-        <tr>
-          <td style="padding:7px 4px;color:#00ffe0;">AGGRESSIVE</td><td style="padding:7px 4px;">85%</td><td style="padding:7px 4px;">8×</td><td style="padding:7px 4px;">Experienced only</td>
-        </tr>
+        <tr><td style="padding:6px 4px;color:#00ffe0;">ULTRA_SAFE</td><td style="padding:6px 4px;">30%</td><td style="padding:6px 4px;">2×</td><td style="padding:6px 4px;">First week, testing</td></tr>
+        <tr><td style="padding:6px 4px;color:#00ffe0;">SAFE</td><td style="padding:6px 4px;">45%</td><td style="padding:6px 4px;">3×</td><td style="padding:6px 4px;">Conservative, steady growth</td></tr>
+        <tr><td style="padding:6px 4px;color:#00ffe0;font-weight:800;">MINI_ASYM ★</td><td style="padding:6px 4px;">65%</td><td style="padding:6px 4px;">6×</td><td style="padding:6px 4px;">Flagship — most popular</td></tr>
+        <tr><td style="padding:6px 4px;color:#00ffe0;">NORMAL</td><td style="padding:6px 4px;">60%</td><td style="padding:6px 4px;">5×</td><td style="padding:6px 4px;">Balanced exposure</td></tr>
+        <tr><td style="padding:6px 4px;color:#00ffe0;">AGGRESSIVE</td><td style="padding:6px 4px;">85%</td><td style="padding:6px 4px;">8×</td><td style="padding:6px 4px;">Experienced traders only</td></tr>
       </table>
       <div style="margin-top:10px;font-size:12px;color:#94a3b8;">
-        <b>Styles:</b> SCALP (15m charts, checks every 15 min) · DAY_TRADE (1h, every hour) · SWING (4h, every 4 hours)
+        <b style="color:#f1f5f9;">Styles:</b> SCALP (15m · every 15 min) · DAY_TRADE ★ (1h · every hour) · SWING (4h · every 4 hours)
       </div>
-    </div>"""
+    </div>
+
+    <a href="https://asymmetric-ai.vercel.app"
+       style="display:block;padding:13px 16px;background:linear-gradient(90deg,#00ff9d,#00ffe0);
+              color:#021018;font-weight:900;font-size:14px;text-align:center;border-radius:14px;
+              text-decoration:none;">
+      Go to Dashboard &rarr;
+    </a>"""
 
     send_email(
         to,
-        "Welcome to Asymmetric AI — Complete setup guide",
+        "Asymmetric AI — Your complete setup reference",
         _email_base(content, footer="You are in control. The AI only trades with your API keys on your exchange account. We can never withdraw your funds."),
     )
 
