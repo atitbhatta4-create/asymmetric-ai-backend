@@ -296,18 +296,22 @@ def session_me(session: Optional[str] = Cookie(default=None)):
     if not row:
         return {"ok": False, "email": None, "onboarding_complete": False}
     email = row["email"]
-    from user_state import get_onboarding_complete
+    from user_state import get_onboarding_complete, check_and_mark_reference_email
     ob_complete = get_onboarding_complete(email)
+    if ob_complete and check_and_mark_reference_email(email):
+        from notifications import email_onboarding_complete
+        email_onboarding_complete(email)
     return {"ok": True, "email": email, "onboarding_complete": ob_complete}
 
 
 @auth_router.post("/onboarding/complete")
 def onboarding_complete_route(user=Depends(_require_user)):
-    from user_state import mark_onboarding_complete
+    from user_state import mark_onboarding_complete, check_and_mark_reference_email
     from notifications import email_onboarding_complete
     email = user["email"]
     mark_onboarding_complete(email)
-    email_onboarding_complete(email)
+    if check_and_mark_reference_email(email):
+        email_onboarding_complete(email)
     return {"ok": True}
 
 
