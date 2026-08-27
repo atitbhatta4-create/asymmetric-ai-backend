@@ -2615,21 +2615,29 @@ class AutoRunner:
                 "side": res.get("side"), "market_regime": self.global_regime,
             }
 
-        # ── Change 3: Hour-of-day volume confirmation ─────────────────────────
+        # ── Hour-of-day volume confirmation (with high-score bypass) ──────────
         if res.get("ok") and klines:
+            _signal_score = res.get("score", 0.0)
             _cp = get_coin_params(self.symbol)
-            _vol_ok, _vol_curr, _vol_req = check_volume_hour_confirmed(klines, _cp)
-            if not _vol_ok:
-                return {
-                    "ok": False,
-                    "blocked": (
-                        f"VOLUME_HOUR: {_vol_curr:.0f} < required {_vol_req:.0f} "
-                        f"(hour-of-day avg × {_cp['volume_confirmation_mult']}×)"
-                    ),
-                    "signal": "BLOCKED", "score": res.get("score", 0.0),
-                    "breakdown": res.get("breakdown", {}),
-                    "side": res.get("side"), "market_regime": self.global_regime,
-                }
+            if _signal_score >= 0.72:
+                # 6-7 filters already confirmed — volume check is redundant at this level
+                self.log(
+                    f"[VOLUME BYPASS] Score {_signal_score:.2f} exceeds 0.72 override "
+                    f"threshold. Volume check skipped. Proceeding to entry."
+                )
+            else:
+                _vol_ok, _vol_curr, _vol_req = check_volume_hour_confirmed(klines, _cp)
+                if not _vol_ok:
+                    return {
+                        "ok": False,
+                        "blocked": (
+                            f"VOLUME_HOUR: {_vol_curr:.0f} < required {_vol_req:.0f} "
+                            f"(hour-of-day avg × {_cp['volume_confirmation_mult']}×)"
+                        ),
+                        "signal": "BLOCKED", "score": _signal_score,
+                        "breakdown": res.get("breakdown", {}),
+                        "side": res.get("side"), "market_regime": self.global_regime,
+                    }
 
         self.last_breakdown = res.get("breakdown", {})
         self.last_score     = res.get("score", 0.0)
