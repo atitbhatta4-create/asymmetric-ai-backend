@@ -1189,7 +1189,11 @@ def check_volume_hour_confirmed(
         vols = sorted(c.get("volume", 0.0) for c in candles[-22:-2] if c.get("volume"))
         avg  = vols[len(vols) // 2] if vols else 0.0
     else:
-        avg = sum(c["volume"] for c in same_hour) / len(same_hour)
+        # Trim top 20% to exclude news-event spikes that inflate the baseline
+        vols = sorted(c["volume"] for c in same_hour)
+        trim_count = max(1, len(vols) // 5)
+        trimmed = vols[:-trim_count]
+        avg = sum(trimmed) / len(trimmed)
 
     required_mult = coin_params.get("volume_confirmation_mult", 1.2)
     required      = avg * required_mult
