@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import secrets
@@ -2464,7 +2465,7 @@ class AutoRunner:
         """Return cached weekly BTC candles, refreshing every 6 hours."""
         now_ts = time.time()
         if not self._weekly_btc_cache or (now_ts - self._weekly_btc_cache_ts) > 21600:
-            candles = _fetch_btc_weekly_candles(limit=210)
+            candles = _fetch_btc_weekly_candles(limit=52)
             if candles:
                 self._weekly_btc_cache    = candles
                 self._weekly_btc_cache_ts = now_ts
@@ -3807,6 +3808,11 @@ class AutoRunner:
                         scope.set_tag("mode", self.mode)
                         sentry_sdk.capture_exception(e)
             finally:
+                # Force Python to release kline/candle memory fetched this iteration.
+                # Each signal check fetches ~620 candle objects — without this, CPython
+                # keeps them in its internal free-list and Render's 512MB limit is hit
+                # within a few hours of multiple runners being active.
+                gc.collect()
                 # Sleep in 30-second chunks so the loop wakes up quickly when
                 # the mid-candle monitor opens a trade and sets pending_trades.
                 _rem = self.interval_sec
