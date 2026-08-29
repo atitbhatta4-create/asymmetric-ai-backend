@@ -65,6 +65,7 @@ class AutoStartIn(BaseModel):
     duration_days: int = Field(default=7, ge=1, le=30)
     trend_filter: bool = True
     chop_min_sep_pct: float = Field(default=0.005, ge=0.001, le=0.05)
+    floor_override: bool = False  # user confirmed restart after hard floor hit
 
     @field_validator("symbol")
     @classmethod
@@ -358,7 +359,49 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
             ),
         )
 
-    # ── Check 2: Bad-trade daily limit — enforce mode minimum ─────────────────
+    # ── Check 2: Hard floor — require explicit user confirmation to restart ───
+    try:
+        with db_conn() as _hf_conn:
+            _hf_cur = _hf_conn.cursor()
+            _hf_cur.execute(
+                "SELECT last_stop_reason, equity, peak_equity FROM user_state WHERE email=%s",
+                (email,),
+            )
+            _hf_row = _hf_cur.fetchone()
+        _last_reason = (_hf_row or {}).get("last_stop_reason") or ""
+        if _last_reason == "HARD_FLOOR":
+            _cur_eq  = float((_hf_row or {}).get("equity") or 0)
+            _new_floor = round(_cur_eq * 0.85, 2)
+            if not payload.floor_override:
+                # Return 409 so the frontend knows to show the confirmation modal
+                raise HTTPException(
+                    status_code=409,
+                    detail=json.dumps({
+                        "code": "HARD_FLOOR_CONFIRM",
+                        "current_equity": round(_cur_eq, 2),
+                        "new_floor": _new_floor,
+                        "message": (
+                            f"Your hard floor was hit and the AI stopped to protect your account. "
+                            f"To restart, your floor will be reset to ${_new_floor:.2f} "
+                            f"(85% of current equity ${_cur_eq:.2f}). "
+                            f"Confirm to proceed."
+                        ),
+                    }),
+                )
+            # floor_override=True — reset peak/floor to current equity and clear stop reason
+            with db_conn() as _hf_reset:
+                _hf_reset.cursor().execute(
+                    "UPDATE user_state SET peak_equity=%s, floor_equity=%s, "
+                    "last_stop_reason=NULL WHERE email=%s",
+                    (_cur_eq, _new_floor, email),
+                )
+                _hf_reset.commit()
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # DB error — allow start
+
+    # ── Check 3: Bad-trade daily limit — enforce mode minimum ─────────────────
     mode_min_stop_after = {"ULTRA_SAFE": 1, "SAFE": 1, "NORMAL": 2, "MINI_ASYM": 2, "AGGRESSIVE": 3}
     effective_stop_after = max(int(payload.stop_after_bad_trades), mode_min_stop_after.get(payload.mode, 2))
     try:
