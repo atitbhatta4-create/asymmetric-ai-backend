@@ -4103,6 +4103,18 @@ def place_real_order(
     ex = _make_ccxt_exchange(row)
     ex_id = (row.get("exchange") or "bybit").lower()
 
+    # Pre-trade API key validation — catch IP whitelist / expired key BEFORE entering
+    # a position. An auth error here means SL placement will also fail, which would
+    # leave the user with a naked position and no way to close it programmatically.
+    try:
+        _ccxt_call(ex.fetch_balance, label=f"api_key_check {ex_id}", retries=0)
+    except Exception as _auth_check_err:
+        if "EXCHANGE_AUTH_ERROR" in str(_auth_check_err):
+            raise ValueError(
+                f"EXCHANGE_AUTH_ERROR: API key rejected by {ex_id} before trade entry. "
+                f"Check your API key IP whitelist or key permissions. Trade blocked."
+            )
+
     # Convert LONG/SHORT to buy/sell
     order_side = "buy" if side == "LONG" else "sell"
     sl_mult    = (1 - sl_pct) if side == "LONG" else (1 + sl_pct)
@@ -4326,16 +4338,43 @@ def _ensure_sl_or_close(runner: "AutoRunner", ex, ex_id: str,
             return True
         except Exception as sl_err:
             runner.log(f"SL attempt {attempt}/3 failed: {sl_err}")
+
+            # Auth error = the API key itself is rejected (IP whitelist / expired key).
+            # Retrying and closing will both fail for the same reason — stop immediately
+            # so we don't waste time and send a clear alert to the user.
+            if "EXCHANGE_AUTH_ERROR" in str(sl_err):
+                runner.log(
+                    f"⚠️ API KEY REJECTED — SL cannot be placed on {ex_id}. "
+                    f"Your API key is blocked (wrong IP or key expired). "
+                    f"AI stopped. Go to your exchange and MANUALLY close the open "
+                    f"{side} {symbol} position, then reconnect your API key."
+                )
+                _tg_alert(
+                    f"🚨 <b>API Key Rejected — Naked Position</b>\n"
+                    f"{runner.email} | {symbol} {side}\n"
+                    f"SL placement blocked: IP not whitelisted or key expired.\n"
+                    f"<b>Open {side} {symbol} position has NO stop-loss.</b>\n"
+                    f"User must manually close on {ex_id}. Email sent."
+                )
+                try:
+                    email_api_key_expired(runner.email, symbol)
+                except Exception:
+                    pass
+                runner.blocked_reason = "API_KEY_REJECTED"
+                runner.stop_event.set()
+                return None   # keep pending_trades — engine stopped, user must close manually
+
             if attempt < 3:
                 time.sleep(2)
 
-    # All 3 attempts failed — close position immediately, never leave naked
+    # All 3 attempts failed (non-auth error) — close position immediately, never leave naked
     runner.log("SL PLACEMENT FAILED AFTER 3 ATTEMPTS — closing position immediately for safety.")
     try:
         result = close_real_order(runner.email, symbol, side)
         runner.log(f"Position closed for safety: {result}")
         return False   # closed safely — caller should clear pending_trades
     except Exception as close_err:
+        _close_err_str = str(close_err)
         runner.log(
             f"CRITICAL: SL failed AND close failed: {close_err}. "
             f"MANUAL ACTION REQUIRED on {ex_id} — open {side} {symbol} with NO stop-loss."
@@ -4346,6 +4385,10 @@ def _ensure_sl_or_close(runner: "AutoRunner", ex, ex_id: str,
             f"SL placement failed (3 attempts) AND emergency close failed.\n"
             f"<b>MANUAL ACTION REQUIRED on {ex_id}.</b>"
         )
+        if "EXCHANGE_AUTH_ERROR" in _close_err_str:
+            # Auth error on close too — same root cause, stop the engine
+            runner.blocked_reason = "API_KEY_REJECTED"
+            runner.stop_event.set()
         return None   # position may still be open — caller must keep pending_trades
 
 
