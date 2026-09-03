@@ -328,18 +328,27 @@ def email_otp_reset(to: str, code: str) -> None:
 
 def email_support_reply(to: str, admin_message: str) -> None:
     content = f"""
-    <div style="font-size:19px;font-weight:800;color:#f1f5f9;margin-bottom:6px;">Reply from Support</div>
-    <div style="font-size:13px;color:#6b7280;margin-bottom:22px;">Our team has responded to your message.</div>
+    <div style="font-size:15px;color:#94a3b8;margin-bottom:18px;">Hi,</div>
+
+    <div style="font-size:14px;color:#94a3b8;line-height:1.8;margin-bottom:20px;">
+      You have a new message from our support team:
+    </div>
 
     <div style="background:#0b1120;border-left:3px solid #00ffe0;border-radius:0 10px 10px 0;
-                padding:16px 18px;margin-bottom:20px;font-size:14px;line-height:1.75;color:#e2e8f0;">
+                padding:16px 18px;margin-bottom:24px;font-size:14px;line-height:1.85;color:#e2e8f0;">
       {admin_message}
     </div>
 
-    <div style="font-size:12px;color:#4b5563;line-height:1.6;">
-      Log in to Asymmetric AI to reply or continue the conversation from the support chat.
+    <div style="font-size:13px;color:#94a3b8;line-height:1.75;margin-bottom:28px;">
+      You can reply directly from the <b style="color:#f1f5f9;">Support</b> section inside the Asymmetric AI app.
+      We typically respond within a few hours.
+    </div>
+
+    <div style="font-size:13px;color:#64748b;line-height:1.7;">
+      Warm regards,<br>
+      <b style="color:#94a3b8;">The Asymmetric AI Team</b>
     </div>"""
-    send_email(to, "Asymmetric AI — Reply from support", _email_base(content))
+    send_email(to, "Message from the Asymmetric AI Team", _email_base(content))
 
 
 def email_2fa_enabled(to: str) -> None:
@@ -690,6 +699,111 @@ def email_api_key_expired(to: str, symbol: str) -> None:
       No trades were affected — the AI stopped before attempting any new positions.
     </p>"""
     send_email(to, f"Action required — API key expired ({symbol})", _email_base(content))
+
+
+def email_low_margin(to: str, symbol: str, exchange_id: str, available: float, mode: str) -> None:
+    """Sent when the engine skips a trade because available margin is $0 or too low."""
+    exchange_id = (exchange_id or "bybit").lower()
+    wallet_map = {
+        "bybit":   ("Bybit",   "Unified Trading Account",
+                    "bybit.com &rarr; Assets &rarr; Unified Trading Account &rarr; transfer USDT from your Spot or Funding wallet"),
+        "binance": ("Binance", "Futures Wallet",
+                    "binance.com &rarr; Wallet &rarr; Futures &rarr; Transfer USDT from your Spot wallet into your Futures wallet"),
+        "okx":     ("OKX",    "Trading Account",
+                    "okx.com &rarr; Assets &rarr; Transfer &rarr; move USDT from your Funding Account into your Trading Account"),
+    }
+    ex_name, wallet_name, transfer_steps = wallet_map.get(exchange_id, wallet_map["bybit"])
+    min_rec = {"ULTRA_SAFE": 50, "SAFE": 60, "NORMAL": 80, "MINI_ASYM": 80, "AGGRESSIVE": 100}.get(mode, 80)
+    bal_str = "($0.00)" if available == 0 else f"(${available:.2f} USDT)"
+
+    content = f"""
+    <div style="font-size:15px;color:#94a3b8;margin-bottom:18px;">Hi,</div>
+
+    <div style="font-size:14px;color:#94a3b8;line-height:1.85;margin-bottom:22px;">
+      We wanted to let you know that your AI identified a valid trading signal on <b style="color:#f1f5f9;">{symbol}</b> today,
+      but was unable to place the trade. Your available balance in your
+      <b style="color:#f1f5f9;">{ex_name} {wallet_name}</b> was too low {bal_str} at the time the signal fired,
+      so the trade was skipped to prevent any errors on the exchange.
+    </div>
+
+    <div style="font-size:14px;color:#94a3b8;line-height:1.85;margin-bottom:22px;">
+      Your AI is still running and will continue scanning for signals — no action is needed on that side.
+      However, to make sure the next opportunity isn't missed, you'll want to top up your trading wallet.
+    </div>
+
+    <div style="background:#0b1120;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:18px;margin-bottom:18px;">
+      <div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:12px;">What to do</div>
+      <div style="font-size:13px;color:#94a3b8;line-height:1.95;">
+        Your funds need to be sitting inside your <b style="color:#f1f5f9;">{wallet_name}</b> on {ex_name} —
+        not in your Spot, Funding, or any other wallet. To move them:<br><br>
+        <span style="color:#f1f5f9;">{transfer_steps}</span><br><br>
+        For <b style="color:#f1f5f9;">{mode}</b> mode, we recommend keeping at least
+        <b style="color:#f1f5f9;">${min_rec} USDT</b> available in that wallet at all times.
+      </div>
+    </div>
+
+    <div style="font-size:13px;color:#94a3b8;line-height:1.85;margin-bottom:28px;">
+      Just to clarify — Asymmetric AI never holds your funds and has no ability to move them.
+      Everything stays on your exchange at all times. We only place trades on your behalf using your API key.
+      <br><br>
+      If you have any questions, feel free to reach out through the <b style="color:#f1f5f9;">Support</b> section inside the app.
+    </div>
+
+    <div style="font-size:13px;color:#64748b;line-height:1.7;">
+      Warm regards,<br>
+      <b style="color:#94a3b8;">The Asymmetric AI Team</b>
+    </div>"""
+    send_email(
+        to,
+        f"Action needed — your {symbol} trade was skipped due to low balance",
+        _email_base(content),
+    )
+
+
+def email_exchange_not_connected_reminder(to: str) -> None:
+    """Sent every 3-4 days to users who have never connected an exchange."""
+    content = """
+    <div style="font-size:15px;color:#94a3b8;margin-bottom:18px;">Hi,</div>
+
+    <div style="font-size:14px;color:#94a3b8;line-height:1.85;margin-bottom:22px;">
+      We noticed your Asymmetric AI account is fully set up, but your exchange hasn't been connected yet.
+      Until you link your exchange, the AI has nowhere to trade and will stay inactive — so you won't be
+      getting any signals or positions placed on your behalf.
+    </div>
+
+    <div style="font-size:14px;color:#94a3b8;line-height:1.85;margin-bottom:22px;">
+      The good news is it only takes a couple of minutes to get sorted.
+    </div>
+
+    <div style="background:#0b1120;border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:18px;margin-bottom:18px;">
+      <div style="font-size:13px;font-weight:700;color:#f1f5f9;margin-bottom:12px;">How to connect your exchange</div>
+      <div style="font-size:13px;color:#94a3b8;line-height:2.0;">
+        1. Log in to <b style="color:#f1f5f9;">Asymmetric AI</b><br>
+        2. Head to <b style="color:#f1f5f9;">Settings &rarr; Exchange</b><br>
+        3. Choose your exchange — we support <b style="color:#f1f5f9;">Bybit, Binance, and OKX</b>
+           (Bybit is our top recommendation for speed and fees)<br>
+        4. Enter your API Key and Secret — enable <b style="color:#f1f5f9;">Read and Trade</b> permissions,
+           but do <b style="color:#f87171;">not</b> enable withdrawal<br>
+        5. Hit <b style="color:#f1f5f9;">Save</b> — your balance will appear on the Dashboard within a few seconds
+      </div>
+    </div>
+
+    <div style="font-size:14px;color:#94a3b8;line-height:1.85;margin-bottom:28px;">
+      Once connected, you're ready to start your first AI session whenever you like.
+      <br><br>
+      Not sure how to create an API key? No problem — open the <b style="color:#f1f5f9;">Support</b> section
+      inside the app and our team will walk you through it step by step.
+    </div>
+
+    <div style="font-size:13px;color:#64748b;line-height:1.7;">
+      Warm regards,<br>
+      <b style="color:#94a3b8;">The Asymmetric AI Team</b>
+    </div>"""
+    send_email(
+        to,
+        "Your Asymmetric AI account is ready — one step left",
+        _email_base(content),
+    )
 
 
 def email_exchange_disconnected_open_trade(to: str, symbol: str, trade_count: int) -> None:

@@ -105,6 +105,22 @@ def admin_stop_all_ai(admin=Depends(_require_admin)):
     return {"ok": True, "stopped_ai_for": stopped}
 
 
+@admin_router.post("/admin/stop-runner/{email:path}")
+def admin_stop_runner(email: str, admin=Depends(_require_admin)):
+    """Stop the AI for a single user without affecting anyone else."""
+    from main import AUTO_RUNNERS, AUTO_LOCK
+    email = (email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email required")
+    with AUTO_LOCK:
+        runner = AUTO_RUNNERS.get(email)
+        if not runner:
+            raise HTTPException(status_code=404, detail="No active AI runner for this user")
+        runner.stop("Stopped by admin.")
+        del AUTO_RUNNERS[email]
+    return {"ok": True, "stopped_ai_for": email}
+
+
 @admin_router.post("/admin/reset-user")
 def admin_reset_user(email: str, admin=Depends(_require_admin)):
     from user_state import ensure_user_state, set_equity, get_session_id, set_session_id

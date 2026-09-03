@@ -33,6 +33,7 @@ from notifications import (
     email_trade_closed, email_ai_stopped,
     email_first_trade,
     email_api_key_expired, email_exchange_disconnected_open_trade,
+    email_low_margin, email_exchange_not_connected_reminder,
 )
 from indicators import (
     _ema, _rsi, _atr, _adx, _rsi_series,
@@ -494,6 +495,7 @@ def init_db() -> None:
         cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS last_stop_reason TEXT DEFAULT NULL")
         cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN NOT NULL DEFAULT FALSE")
         cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS reference_email_sent BOOLEAN NOT NULL DEFAULT FALSE")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS last_exchange_reminder REAL DEFAULT 0")
         for col, coltype, defval in [
             ("adaptive_strictness",  "REAL",    "1.0"),
             ("last_trade_ts",        "REAL",    "0"),
@@ -1169,7 +1171,7 @@ class AutoRunner:
         if self.duration_days > 0:
             end_dt = now_dubai() + timedelta(days=self.duration_days)
             self.end_at_ts = end_dt.timestamp()
-        self.history: Deque[Dict[str, str]] = deque(maxlen=200)
+        self.history: Deque[Dict[str, str]] = deque(maxlen=500)
         self.ai_session_id: Optional[int] = None  # DB row id for this AI run
         self.pending_trades: List[Dict] = []
         self._pt_lock: threading.Lock = threading.Lock()
@@ -1207,6 +1209,7 @@ class AutoRunner:
         self._last_drawdown_log_ts: float = 0.0  # throttle repeated drawdown tier logs
         self._last_dd_tier: int = 0              # 0=none 1=65% 2=40% 3=25% 4=stop
         self._last_mc_log_ts: float = 0.0        # throttle mid-candle noise logs
+        self._last_margin_email_ts: float = 0.0  # 24h cooldown for SKIP_LOW_MARGIN emails
         # Session-end-with-open-trade: defer engine stop until trade closes naturally
         self.waiting_for_trade_close: bool = False
         self._delayed_stop_reason: Optional[str] = None
@@ -1361,12 +1364,12 @@ class AutoRunner:
                     self.ai_session_id = int(sess_row["id"])
                     cur.execute(
                         "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
-                        "ORDER BY id DESC LIMIT 200",
+                        "ORDER BY id DESC LIMIT 500",
                         (self.email, self.ai_session_id),
                     )
                 else:
                     cur.execute(
-                        "SELECT t, msg FROM ai_logs WHERE email=%s ORDER BY id DESC LIMIT 200",
+                        "SELECT t, msg FROM ai_logs WHERE email=%s ORDER BY id DESC LIMIT 500",
                         (self.email,),
                     )
                 rows = cur.fetchall()
@@ -2884,11 +2887,22 @@ class AutoRunner:
                                                 with self._pt_lock:
                                                     self._opening_trade = False
                                                 self.log(f"MID_CANDLE REAL ORDER FAILED — {_re}")
-                                                _tg_alert(
-                                                    f"❌ <b>Real order failed (mid-candle)</b>\n"
-                                                    f"{self.email} | {self.symbol} {signal_side}\n"
-                                                    f"<code>{str(_re)[:250]}</code>"
-                                                )
+                                                _re_str = str(_re)
+                                                if "SKIP_LOW_MARGIN" in _re_str:
+                                                    _avail_str = _re_str.split("$")[1].split(" ")[0] if "$" in _re_str else "0"
+                                                    try:
+                                                        _avail_val = float(_avail_str)
+                                                    except ValueError:
+                                                        _avail_val = 0.0
+                                                    if time.time() - self._last_margin_email_ts > 86400:
+                                                        email_low_margin(self.email, self.symbol, self._exchange_id, _avail_val, self.mode)
+                                                        self._last_margin_email_ts = time.time()
+                                                else:
+                                                    _tg_alert(
+                                                        f"❌ <b>Real order failed (mid-candle)</b>\n"
+                                                        f"{self.email} | {self.symbol} {signal_side}\n"
+                                                        f"<code>{_re_str[:250]}</code>"
+                                                    )
                                                 raise _MidCandleSkip()
 
                                         base_trade = {
@@ -3568,11 +3582,22 @@ class AutoRunner:
                             with self._pt_lock:
                                 self._opening_trade = False
                             self.log(f"REAL ORDER FAILED — trade skipped: {_re}")
-                            _tg_alert(
-                                f"❌ <b>Real order failed</b>\n"
-                                f"{self.email} | {self.symbol} {desired_side}\n"
-                                f"<code>{str(_re)[:250]}</code>"
-                            )
+                            _re_str = str(_re)
+                            if "SKIP_LOW_MARGIN" in _re_str:
+                                _avail_str = _re_str.split("$")[1].split(" ")[0] if "$" in _re_str else "0"
+                                try:
+                                    _avail_val = float(_avail_str)
+                                except ValueError:
+                                    _avail_val = 0.0
+                                if time.time() - self._last_margin_email_ts > 86400:
+                                    email_low_margin(self.email, self.symbol, self._exchange_id, _avail_val, self.mode)
+                                    self._last_margin_email_ts = time.time()
+                            else:
+                                _tg_alert(
+                                    f"❌ <b>Real order failed</b>\n"
+                                    f"{self.email} | {self.symbol} {desired_side}\n"
+                                    f"<code>{_re_str[:250]}</code>"
+                                )
                             continue
 
                         # ── FIX 1: Entry succeeded — log position to DB BEFORE SL ──
@@ -4973,6 +4998,47 @@ def _purge_expired_sessions() -> None:
         pass
 
 _threading.Thread(target=_purge_expired_sessions, daemon=True).start()
+
+
+def _exchange_reminder_loop() -> None:
+    """Every 6 hours, check for users with no exchange connected.
+    Send a reminder email once every 3-4 days (345600 seconds) until they connect."""
+    import random as _random
+    while True:
+        try:
+            with db_conn() as _conn:
+                _cur = _conn.cursor()
+                # All users who have never connected an exchange
+                _cur.execute("""
+                    SELECT u.email, COALESCE(us.last_exchange_reminder, 0) AS last_reminder
+                    FROM users u
+                    LEFT JOIN user_state us ON us.email = u.email
+                    WHERE u.email NOT IN (SELECT email FROM exchange_keys WHERE email IS NOT NULL)
+                """)
+                _rows = _cur.fetchall()
+            _now = time.time()
+            # 3–4 day window: 3 days + random 0-24h jitter so not everyone gets email same second
+            _interval = 3 * 86400 + _random.randint(0, 86400)
+            for _row in _rows:
+                _email = _row["email"]
+                _last  = float(_row["last_reminder"] or 0)
+                if _now - _last >= _interval:
+                    try:
+                        email_exchange_not_connected_reminder(_email)
+                        with db_conn() as _uc:
+                            _uc.cursor().execute(
+                                "UPDATE user_state SET last_exchange_reminder=%s WHERE email=%s",
+                                (_now, _email),
+                            )
+                            _uc.commit()
+                    except Exception as _em:
+                        print(f"[exchange-reminder] failed for {_email}: {_em}", flush=True)
+        except Exception as _e:
+            print(f"[exchange-reminder] loop error: {_e}", flush=True)
+        time.sleep(6 * 3600)
+
+
+_threading.Thread(target=_exchange_reminder_loop, daemon=True).start()
 
 
 # ── Deploy/restart notification ───────────────────────────────────────────────

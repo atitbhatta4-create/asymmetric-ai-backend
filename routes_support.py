@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from auth_helpers import require_user as _require_user, require_admin as _require_admin
@@ -142,6 +142,12 @@ class MessageIn(BaseModel):
 
 
 class ReplyIn(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
+
+
+class InitiateIn(BaseModel):
+    user_email: str
+    subject: str = Field(default="Message from Support", max_length=200)
     message: str = Field(..., min_length=1, max_length=2000)
 
 
@@ -407,3 +413,50 @@ def admin_resolve(ticket_id: int, admin=Depends(_require_admin)):
         cur.execute("UPDATE support_tickets SET status='resolved' WHERE id=%s", (ticket_id,))
         conn.commit()
     return {"ok": True}
+
+
+@support_router.post("/admin/support/initiate")
+def admin_initiate(body: InitiateIn, admin=Depends(_require_admin)):
+    """Admin opens a new support ticket for a user and sends the first message.
+    The user receives an email notification so they know to check Support."""
+    user_email = body.user_email.strip().lower()
+    subject = body.subject.strip() or "Message from Support"
+    message = body.message.strip()
+
+    with db_conn() as conn:
+        cur = conn.cursor()
+        # Check user exists
+        cur.execute("SELECT email FROM users WHERE email=%s", (user_email,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="User not found")
+
+        # Re-use existing open ticket if one exists, otherwise open a new one
+        cur.execute(
+            "SELECT id FROM support_tickets WHERE user_email=%s AND status='open' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (user_email,),
+        )
+        row = cur.fetchone()
+        if row:
+            ticket_id = row["id"]
+        else:
+            cur.execute(
+                "INSERT INTO support_tickets(user_email, status, subject) "
+                "VALUES(%s,'open',%s) RETURNING id",
+                (user_email, subject),
+            )
+            ticket_id = cur.fetchone()["id"]
+
+        cur.execute(
+            "INSERT INTO support_messages(ticket_id, sender, message) VALUES(%s,'admin',%s)",
+            (ticket_id, message),
+        )
+        cur.execute(
+            "UPDATE support_tickets SET last_admin_reply_at=NOW() WHERE id=%s",
+            (ticket_id,),
+        )
+        conn.commit()
+
+    # Email the user so they know to open Support
+    email_support_reply(user_email, message)
+    return {"ok": True, "ticket_id": ticket_id}
