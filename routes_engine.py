@@ -189,7 +189,7 @@ def auto_status(user=Depends(require_user)):
 
 
 @engine_router.get("/auto/history")
-def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1, le=200)):
+def auto_history(user=Depends(require_user), limit: int = Query(default=100, ge=1, le=500)):
     from main import AUTO_RUNNERS, AUTO_LOCK
     email = user["email"]
     with AUTO_LOCK:
