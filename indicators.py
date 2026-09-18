@@ -787,6 +787,16 @@ def _compute_signal_layers(
     }
 
     # ── Layer 3: Entry — pullback + candle pattern + RSI + divergence check ──
+    # ADX-dynamic pullback tolerance — strong trends run far from EMA21
+    # and should not be blocked by a tight distance gate calibrated for ranges.
+    if adx is not None:
+        _adx_pb_floor = (0.15 if adx >= 50 else
+                         0.10 if adx >= 40 else
+                         0.05 if adx >= 30 else
+                         0.03 if adx >= 20 else None)
+        if _adx_pb_floor is not None:
+            p["pullback_max"] = max(p["pullback_max"], _adx_pb_floor)
+
     pb_pct = abs(price - ema21[-1]) / max(1e-9, ema21[-1])
     pullback_score = max(0.0, 1.0 - pb_pct / p["pullback_max"]) if pb_pct <= p["pullback_max"] else 0.0
 
