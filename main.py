@@ -2204,7 +2204,8 @@ class AutoRunner:
                     # of base size — a $6 loss on a $5.60 T2 position shows -107% (impossible).
                     pnl_pct_leveraged = real_pnl / equity_before if equity_before > 0 else 0.0
                 _old_outcome = outcome
-                if real_pnl > 0 and outcome in ("SL_HIT", "TRAIL_STOP"):
+                _min_tp_value = (size_dollar * tp_pct * 0.5) if size_dollar > 0 else 0.50
+                if real_pnl >= _min_tp_value and outcome in ("SL_HIT", "TRAIL_STOP"):
                     outcome = "TP_HIT"
                 elif real_pnl < -(equity_before * 0.005) and outcome == "TP_HIT":
                     outcome = "SL_HIT"
@@ -2785,225 +2786,21 @@ class AutoRunner:
                                     if signal_side != expected_side:
                                         pass  # direction mismatch — silent
                                     else:
-                                        # ── Fire trade ────────────────────────────
-                                        entry_price = self._fetch_price_sync(self.symbol)
-                                        grade = self.market_grade
-                                        c   = presets_for_mode(self.mode)
-                                        st  = TRADE_STYLE_PARAMS.get(self.trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
-                                        sl_pct_open = min(self.last_atr_pct * st["sl_atr"], st["sl_max"] / 100.0)
-                                        tp_pct_open = min(self.last_atr_pct * st["tp_atr"], st["tp_max"] / 100.0)
-
-                                        # BTC correlation check for mid-candle (skip BTC itself)
-                                        _btc_mc_mult = 1.0
-                                        if "BTC" not in self.symbol.upper():
-                                            _btc_mc = _get_btc_momentum(self.tf)
-                                            if _btc_mc is not None:
-                                                _mc_against = ((signal_side == "LONG"  and _btc_mc < -0.02) or
-                                                               (signal_side == "SHORT" and _btc_mc >  0.02))
-                                                if _mc_against:
-                                                    if abs(_btc_mc) >= 0.04:
-                                                        raise _MidCandleSkip()  # strong conflict — skip
-                                                    _btc_mc_mult = 0.60
-
-                                        if REAL_TRADING:
-                                            real_bal = get_real_usdt_balance(self.email, force=True)
-                                            if real_bal is None:
-                                                self.log("MID_CANDLE REAL ORDER SKIPPED — could not fetch balance")
-                                                raise _MidCandleSkip()
-                                            equity_now = real_bal
-                                            set_equity(self.email, real_bal)
-                                        else:
-                                            equity_now = get_equity(self.email)
-
-                                        # Hard floor guard — mirrors _run_loop check.
-                                        # Must be here because stop_event.set() from _run_loop
-                                        # may not be seen until this thread's next iteration.
-                                        if equity_now < self.floor_equity:
+                                        # ── Flag for next candle open — never enter at top of a fast move ──
+                                        # Mid-candle monitor detects the setup; the main loop enters
+                                        # at the open of the next candle so we avoid chasing the peak.
+                                        with self._pt_lock:
+                                            _already_active = bool(self.pending_trades) or self._opening_trade
+                                        if not _already_active and not self.signal_pending:
+                                            self.signal_pending = True
+                                            self.pending_signal_side = expected_side
+                                            self.pending_signal_score = score
+                                            self.candles_since_signal = 0
                                             self.log(
-                                                f"MID_CANDLE SKIPPED — equity ${equity_now:.2f} below "
-                                                f"floor ${self.floor_equity:.2f}. Hard floor protection."
+                                                f"[MID-CANDLE SIGNAL] {abs_move*100:.1f}% move on {self.symbol} — "
+                                                f"flagged {expected_side} (score={score:.2f}), "
+                                                f"entering at next candle open"
                                             )
-                                            raise _MidCandleSkip()
-
-                                        # Claim the trade slot atomically — prevents double-entry
-                                        # if _run_loop is simultaneously completing signal computation
-                                        # and both threads see pending_trades = [] at the same time.
-                                        with self._pt_lock:
-                                            if self.pending_trades or self._opening_trade:
-                                                raise _MidCandleSkip()
-                                            self._opening_trade = True
-
-                                        real_order_id   = None
-                                        real_b_result   = None
-                                        _mc_real_result = None
-                                        if REAL_TRADING:
-                                            try:
-                                                # Apply vol and drawdown size adjustments — same
-                                                # logic as _run_loop fix; no mtf mult here because
-                                                # mid-candle trades don't go through MTF confirmation.
-                                                _atr_bl_mc = {"15m": 0.0040, "1h": 0.0090, "4h": 0.0180, "1d": 0.0350}
-                                                _atr_nm_mc = _atr_bl_mc.get(self.tf, 0.0050)
-                                                _vol_sm_mc = (max(0.4, _atr_nm_mc / self.last_atr_pct)
-                                                              if self.last_atr_pct > _atr_nm_mc else 1.0)
-                                                _dd_now_mc = (max(0.0, (self.peak_equity - equity_now) / self.peak_equity)
-                                                              if self.peak_equity > 0 else 0.0)
-                                                _dd_sm_mc  = (0.25 if _dd_now_mc >= 0.10 else
-                                                              0.40 if _dd_now_mc >= 0.07 else
-                                                              0.65 if _dd_now_mc >= 0.04 else 1.0)
-                                                _mc_fund_mult = 1.0
-                                                _mc_fr = _get_funding_rate(self.email, self.symbol)
-                                                if _mc_fr is not None:
-                                                    _mc_fr_against = ((signal_side == "LONG"  and _mc_fr >  0.001) or
-                                                                      (signal_side == "SHORT" and _mc_fr < -0.001))
-                                                    if _mc_fr_against:
-                                                        _mc_fund_mult = 0.50 if abs(_mc_fr) >= 0.003 else 0.70
-                                                        self.log(f"MID_CANDLE funding {_mc_fr*100:.4f}%/8h against {signal_side} — size × {_mc_fund_mult:.2f}")
-                                                size_pct  = float(c["size"]) * _vol_sm_mc * _dd_sm_mc * _btc_mc_mult * _mc_fund_mult
-                                                usdt_size = equity_now * size_pct
-                                                self.log(
-                                                    f"MID-CANDLE REAL ORDER SIZE: base={float(c['size'])*100:.0f}% "
-                                                    f"× vol={_vol_sm_mc:.2f} × dd={_dd_sm_mc:.2f} "
-                                                    f"× btc={_btc_mc_mult:.2f} × fund={_mc_fund_mult:.2f} "
-                                                    f"= {size_pct*100:.1f}% → ${usdt_size:.2f}"
-                                                )
-                                                if grade == "B":
-                                                    real_b_result = place_real_grade_b_order(
-                                                        email=self.email, symbol=self.symbol,
-                                                        side=signal_side, usdt_size=usdt_size,
-                                                        leverage=int(c["leverage"]),
-                                                        sl_pct=sl_pct_open,
-                                                        t1_tp_pct=tp_pct_open * 0.80,
-                                                        t2_tp_pct=tp_pct_open * 1.00,
-                                                    )
-                                                else:
-                                                    _mc_real_result = place_real_order(
-                                                        email=self.email, symbol=self.symbol,
-                                                        side=signal_side, usdt_size=usdt_size,
-                                                        leverage=int(c["leverage"]),
-                                                        sl_pct=sl_pct_open, tp_pct=tp_pct_open,
-                                                    )
-                                                    real_order_id = _mc_real_result.get("order_id")
-                                            except Exception as _re:
-                                                with self._pt_lock:
-                                                    self._opening_trade = False
-                                                self.log(f"MID_CANDLE REAL ORDER FAILED — {_re}")
-                                                _re_str = str(_re)
-                                                if "SKIP_LOW_MARGIN" in _re_str:
-                                                    _avail_str = _re_str.split("$")[1].split(" ")[0] if "$" in _re_str else "0"
-                                                    try:
-                                                        _avail_val = float(_avail_str)
-                                                    except ValueError:
-                                                        _avail_val = 0.0
-                                                    if time.time() - self._last_margin_email_ts > 86400:
-                                                        email_low_margin(self.email, self.symbol, self._exchange_id, _avail_val, self.mode)
-                                                        self._last_margin_email_ts = time.time()
-                                                else:
-                                                    _tg_alert(
-                                                        f"❌ <b>Real order failed (mid-candle)</b>\n"
-                                                        f"{self.email} | {self.symbol} {signal_side}\n"
-                                                        f"<code>{_re_str[:250]}</code>"
-                                                    )
-                                                raise _MidCandleSkip()
-
-                                        base_trade = {
-                                            "entry_price":    entry_price,
-                                            "side":           signal_side,
-                                            "mode":           self.mode,
-                                            "signal":         self.last_signal,
-                                            "open_ts":        time.time(),
-                                            "sl_pct_open":    sl_pct_open,
-                                            "tp_pct_open":    tp_pct_open,
-                                            "mid_candle":     True,
-                                            "usdt_size_base": usdt_size if REAL_TRADING else 0,
-                                            "leverage_used":  int(c["leverage"]),
-                                            "score_open":     self.last_score,
-                                            "regime_open":    self.market_regime,
-                                            "atr_pct_open":   self.last_atr_pct,
-                                        }
-                                        if grade == "B" and REAL_TRADING:
-                                            self.pending_trades = [
-                                                {**base_trade, "grade": "B", "size_mult": 0.60,
-                                                 "tp_mult": 1.00, "is_primary": True, "label": "T1",
-                                                 "order_id": real_b_result.get("order_id"),
-                                                 "t1_tp_id": real_b_result.get("t1_tp_id"),
-                                                 "t1_sl_id": None},
-                                                {**base_trade, "grade": "B", "size_mult": 0.40,
-                                                 "tp_mult": 1.00, "is_primary": False, "label": "T2",
-                                                 "breakeven_after_t1": True, "t2_sl_id": None,
-                                                 "t2_qty": real_b_result.get("t2_qty")},
-                                            ]
-                                        elif grade == "B":
-                                            self.pending_trades = [
-                                                {**base_trade, "grade": "B", "size_mult": 0.60,
-                                                 "tp_mult": 1.00, "is_primary": True, "label": "T1"},
-                                                {**base_trade, "grade": "B", "size_mult": 0.40,
-                                                 "tp_mult": 1.00, "is_primary": False, "label": "T2",
-                                                 "breakeven_after_t1": True},
-                                            ]
-                                        else:
-                                            self.pending_trades = [
-                                                {**base_trade, "grade": "A", "size_mult": 1.00,
-                                                 "tp_mult": 1.00, "is_primary": True,
-                                                 **({"order_id": real_order_id} if real_order_id else {})},
-                                            ]
-
-                                        # FIX 1: Log position BEFORE SL attempt
-                                        self.last_trade_ts = time.time()
-                                        with self._pt_lock:
-                                            self._opening_trade = False   # slot claimed — pending_trades is set
-                                        _save_runner_state(self)
-
-                                        self.log(
-                                            f"MID_CANDLE TRADE OPENED Grade {grade} ({signal_side}) "
-                                            f"@ {entry_price:.4f} | score={score:.2f} | "
-                                            f"{abs_move*100:.1f}% price move triggered"
-                                        )
-                                        _mc_sl_px = entry_price * (1 + sl_pct_open) if signal_side == "SHORT" else entry_price * (1 - sl_pct_open)
-                                        _mc_tp_px = entry_price * (1 - tp_pct_open) if signal_side == "SHORT" else entry_price * (1 + tp_pct_open)
-                                        try:
-                                            email_trade_opened(
-                                                to=self.email, symbol=self.symbol, side=signal_side, mode=self.mode,
-                                                grade=grade, entry=entry_price, sl=_mc_sl_px, tp=_mc_tp_px,
-                                                score=score, equity=equity_now,
-                                            )
-                                            _check_first_trade_email(self.email, self.symbol, signal_side, grade, equity_now)
-                                        except Exception:
-                                            pass
-
-                                        # Place SL — Grade B: two separate stops; Grade A: position SL
-                                        if REAL_TRADING:
-                                            if grade == "B":
-                                                _mc_b_ex    = real_b_result["ex"]
-                                                _mc_b_ex_id = real_b_result["ex_id"]
-                                                _mc_b_sl    = real_b_result["sl_price"]
-                                                # Independent T1 + T2 stops on all exchanges
-                                                _mc_t1_sl = _place_grade_b_stop_order(
-                                                    self, _mc_b_ex, _mc_b_ex_id, self.symbol,
-                                                    signal_side, _mc_b_sl,
-                                                    real_b_result["t1_qty"], "T1_SL",
-                                                )
-                                                _mc_t2_sl = _place_grade_b_stop_order(
-                                                    self, _mc_b_ex, _mc_b_ex_id, self.symbol,
-                                                    signal_side, _mc_b_sl,
-                                                    real_b_result["t2_qty"], "T2_SL",
-                                                )
-                                                self.pending_trades[0]["t1_sl_id"] = _mc_t1_sl
-                                                self.pending_trades[1]["t2_sl_id"] = _mc_t2_sl
-                                                _save_runner_state(self)
-                                                if not _mc_t1_sl or not _mc_t2_sl:
-                                                    self.log(f"MID_CANDLE Grade B partial stop failed — position SL fallback")
-                                                    _mc_sl_ok = _ensure_sl_or_close(self, _mc_b_ex, _mc_b_ex_id, self.symbol, signal_side, _mc_b_sl)
-                                                    if _mc_sl_ok is False:
-                                                        self.pending_trades = []
-                                                        _save_runner_state(self)
-                                            else:
-                                                _mc_sl_ok = _ensure_sl_or_close(
-                                                    self, _mc_real_result["ex"], _mc_real_result["ex_id"],
-                                                    self.symbol, signal_side, _mc_real_result["sl_price"],
-                                                )
-                                                if _mc_sl_ok is False:  # False=closed safely; None=still open, keep tracking
-                                                    self.pending_trades = []
-                                                    _save_runner_state(self)
 
             except _MidCandleSkip:
                 # If _opening_trade was set before the skip, clear it so the next
