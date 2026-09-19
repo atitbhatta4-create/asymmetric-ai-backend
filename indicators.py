@@ -803,6 +803,17 @@ def _compute_signal_layers(
     # Candle pattern at pullback zone (replaces simple bounce check)
     pattern_name, pattern_score = _candle_pattern(klines, desired_side)
 
+    # ADX-dynamic RSI zone — strong trends keep RSI elevated for many candles.
+    # A fixed zone (e.g. 35–68) blocks every entry when RSI holds above 70 all day.
+    _strong_trend_adx = adx is not None and adx >= 45
+    if adx is not None:
+        if adx >= 45:
+            p["rsi_min"] = min(p["rsi_min"], 35 if desired_side == "LONG" else 20)
+            p["rsi_max"] = max(p["rsi_max"], 80 if desired_side == "LONG" else 65)
+        elif adx >= 30:
+            p["rsi_min"] = min(p["rsi_min"], 33 if desired_side == "LONG" else 28)
+            p["rsi_max"] = max(p["rsi_max"], 72 if desired_side == "LONG" else 67)
+
     # RSI: closer to center of the range = better entry quality
     rsi_in_range = rsi is not None and p["rsi_min"] <= rsi <= p["rsi_max"]
     if rsi is not None and rsi_in_range:
@@ -812,11 +823,14 @@ def _compute_signal_layers(
     else:
         rsi_score = 0.0
 
-    # RSI divergence — price extreme not confirmed by RSI = weakening setup
+    # RSI divergence — price extreme not confirmed by RSI = weakening setup.
+    # In a strong trend (ADX ≥ 45) RSI divergence is expected — price leads and
+    # RSI lags. Applying the penalty here would block every entry in a sustained move.
     div_detected, div_penalty = _rsi_divergence(closes, rsi_vals, desired_side, n=12)
+    _eff_div_penalty = 0.0 if _strong_trend_adx else div_penalty
 
     entry_score = round(
-        max(0.0, pullback_score * 0.35 + pattern_score * 0.35 + rsi_score * 0.30 - div_penalty),
+        max(0.0, pullback_score * 0.35 + pattern_score * 0.35 + rsi_score * 0.30 - _eff_div_penalty),
         3,
     )
     # against_trend: last candle closed against the trade direction at the entry zone.
@@ -825,7 +839,8 @@ def _compute_signal_layers(
     # the entry is not ready yet. Wait for a bullish close to confirm the bounce.
     against_trend_candle = pattern_name == "against_trend"
     ent_reason = (
-        f"RSI divergence — price at new extreme but RSI disagrees, trend may be weakening" if div_detected
+        f"RSI divergence noted — ignored in strong trend (ADX {adx:.0f}≥45)" if (div_detected and _strong_trend_adx)
+        else f"RSI divergence — price at new extreme but RSI disagrees, trend may be weakening" if div_detected
         else f"Price {pb_pct*100:.1f}% from EMA21 — need <{p['pullback_max']*100:.1f}% to enter" if pullback_score == 0
         else f"RSI {rsi:.0f} outside entry zone {p['rsi_min']}–{p['rsi_max']}" if not rsi_in_range
         else f"Candle closed against trade direction — wait for {'bullish' if desired_side == 'LONG' else 'bearish'} close to confirm bounce" if against_trend_candle
@@ -1102,16 +1117,39 @@ def check_pullback_entry(
     before entering.  Prevents chasing extended candles.
 
     Returns:
-        "ENTER"     — pullback complete, confirmed bounce, enter now
-        "WAIT"      — still waiting for pullback
-        "TIMEOUT"   — too many candles elapsed, cancel signal
-        "IMMEDIATE" — PARABOLIC regime, enter on signal without waiting
+        "ENTER"              — pullback complete, confirmed bounce, enter now
+        "WAIT"               — still waiting for pullback
+        "TIMEOUT"            — too many candles elapsed, cancel signal
+        "IMMEDIATE"          — PARABOLIC regime, enter on signal without waiting
+        "ENTER_STRONG_TREND" — ADX ≥ 45 and timeout reached; enter without pullback
+                               (caller uses wider 2×ATR SL to compensate)
     """
     if regime == "PARABOLIC":
         return "IMMEDIATE"
 
-    timeout = 3 if trade_style == "DAY_TRADE" else 5
+    # Compute current ADX to detect a very strong trend.
+    # In strong trends price does not pull back — waiting for EMA9 touch causes TIMEOUT
+    # on every candle, missing the entire move.
+    _highs  = [c["high"]  for c in candles]
+    _lows   = [c["low"]   for c in candles]
+    _closes = [c["close"] for c in candles]
+    _adx_val = _adx(_highs, _lows, _closes, 14) if len(candles) >= 28 else None
+    _strong_trend = _adx_val is not None and _adx_val >= 45
+
+    # Strong trend: extend the pullback window from 3 → 6 candles (DAY_TRADE)
+    # so the signal survives a sustained move before giving up.
+    if _strong_trend:
+        timeout = 6
+    elif trade_style == "DAY_TRADE":
+        timeout = 3
+    else:
+        timeout = 5
+
     if candles_since_signal >= timeout:
+        if _strong_trend:
+            # Price has not pulled back in 6 candles — trend is very strong.
+            # Enter without pullback; caller applies 2×ATR SL for extra room.
+            return "ENTER_STRONG_TREND"
         return "TIMEOUT"
 
     closes = [c["close"] for c in candles]
