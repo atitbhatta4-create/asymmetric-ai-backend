@@ -3215,6 +3215,7 @@ class AutoRunner:
 
                 self.candles_since_signal += 1
 
+                _strong_trend_entry = False
                 if _style_cfg_pb.get("pullback_required", True):
                     _pb_klines = _fetch_klines_sync(self.symbol, self.tf, limit=50, exchange=self._exchange_id)
                     _cp_pb = get_coin_params(self.symbol)
@@ -3237,13 +3238,19 @@ class AutoRunner:
                         continue
 
                     if _pb_result == "WAIT":
-                        _max_c = _style_cfg_pb.get("pullback_timeout", 3)
+                        _max_c = 6 if self.candles_since_signal >= 3 else _style_cfg_pb.get("pullback_timeout", 3)
                         self.log(f"Pullback wait [{self.candles_since_signal}/{_max_c}] — {self.pending_signal_side} | price not yet at EMA")
                         continue
 
-                    # ENTER or IMMEDIATE — confirmed, proceed to trade
+                    # ENTER, IMMEDIATE, or ENTER_STRONG_TREND — proceed to trade
                     if _pb_result == "ENTER":
                         self.log(f"Pullback confirmed — entering {self.pending_signal_side} (score={self.pending_signal_score:.2f})")
+                    elif _pb_result == "ENTER_STRONG_TREND":
+                        self.log(
+                            f"STRONG TREND ENTRY — no pullback after {self.candles_since_signal} candles "
+                            f"({self.pending_signal_side}). Using 2×ATR SL for extra room."
+                        )
+                        _strong_trend_entry = True
 
                 # Confirmed entry — clear pending state and lock in direction
                 desired_side = self.pending_signal_side
@@ -3267,6 +3274,8 @@ class AutoRunner:
                     # T16 reversal overrides SL/TP multipliers (1.5×ATR SL, 3×ATR TP)
                     _sl_atr = self.sl_atr_override if self.sl_atr_override else st["sl_atr"]
                     _tp_atr = self.tp_atr_override if self.tp_atr_override else st["tp_atr"]
+                    if _strong_trend_entry:
+                        _sl_atr = max(_sl_atr, 2.0)  # wider SL — strong trend candles are large
 
                     # ── BTC Correlation filter (all symbols except BTC itself) ───────
                     _btc_mult = 1.0
