@@ -1902,13 +1902,19 @@ class AutoRunner:
         _t2_waiting = pt.get("breakeven_after_t1") and not pt.get("breakeven") and not pt.get("breakeven_next")
 
         if candle_high > 0 and not intrabar_tp and not _t2_waiting:
-            if best_move >= tp_pct * 0.70:
-                # Deep in profit — trail SL to lock in half the SL distance as profit
-                trail_locked_pct  = sl_pct_orig * 0.50
+            if best_move >= tp_pct * 0.90:
+                # Level 3 (90% of TP): very close to target — lock 75% of profit made.
+                # e.g. entry=3.50 TP=3.70, price hits 3.68 → profit=0.18 → lock 0.135 → SL=3.635
+                trail_locked_pct  = best_move * 0.75
+                trailing_activated = True
+            elif best_move >= tp_pct * 0.70:
+                # Level 2 (70% of TP): deep in profit — lock 50% of profit made.
+                # e.g. entry=3.50 TP=3.70, price hits 3.64 → profit=0.14 → lock 0.07 → SL=3.57
+                trail_locked_pct  = best_move * 0.50
                 trailing_activated = True
             elif best_move >= tp_pct * 0.40 and best_move >= atr * 0.50:
-                # Breakeven trigger — only activate if price moved at least 0.5× ATR
-                # in profit direction. Prevents trail firing on noise below ATR floor.
+                # Level 1 (40% of TP): breakeven — only activate if price moved at least
+                # 0.5×ATR so noise below the ATR floor doesn't trigger a breakeven exit.
                 trail_locked_pct  = 0.0
                 trailing_activated = True
 
@@ -2150,7 +2156,7 @@ class AutoRunner:
             f"  Leverage:    {c['leverage']:.0f}×",
             f"  SL (1×ATR):  {sl_pct_orig * 100:.3f}%   |   TP ({tp_mult:.1f}×ATR): {tp_pct * 100:.3f}%",
             f"  ATR:         {atr * 100:.3f}%",
-            f"  Trailing:    {'activated — locked ' + f'{trail_locked_pct*100:.2f}%' if trailing_activated else 'not triggered'}",
+            f"  Trailing:    {('L3 (90%) — locked ' + f'{trail_locked_pct*100:.2f}%') if (trailing_activated and best_move >= tp_pct * 0.90) else ('L2 (70%) — locked ' + f'{trail_locked_pct*100:.2f}%') if (trailing_activated and trail_locked_pct > 0) else 'L1 (40%) — breakeven' if trailing_activated else 'not triggered'}",
             f"  Vol adj:     {vol_size_mult*100:.0f}%  |  DD adj: {dd_size_mult*100:.0f}%",
             "",
             "Account",
