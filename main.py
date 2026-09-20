@@ -1974,10 +1974,22 @@ class AutoRunner:
                 _now = time.time()
                 if _now - self._last_holding_log_ts >= self.interval_sec:
                     self._last_holding_log_ts = _now
+                    _trail_log = ""
+                    if trailing_activated:
+                        _ex_sl_stored = float(pt.get("trail_sl_on_exchange", 0.0))
+                        if REAL_TRADING and _ex_sl_stored > 0:
+                            _match = abs(_ex_sl_stored - sl_price) <= 0.0002
+                            _trail_log = (
+                                f" | trail_SL={sl_price:.4f} "
+                                f"exchange_SL={_ex_sl_stored:.4f} "
+                                f"{'✅' if _match else '⚠️ MISMATCH'}"
+                            )
+                        else:
+                            _trail_log = f" | trail_SL={sl_price:.4f}"
                     self.log(
                         f"Holding ({side} @ {entry:.4f}) — candle {candles_held_so_far + 1} | "
                         f"close {exit_price:.4f} ({((exit_price - entry)/entry if side=='LONG' else (entry - exit_price)/entry)*100:+.3f}%) | "
-                        f"SL={sl_price:.4f}  TP={tp_price:.4f}"
+                        f"SL={sl_price:.4f}  TP={tp_price:.4f}{_trail_log}"
                     )
 
                 # ── Momentum Scaling (Pyramiding) — Grade A only, both paper and real ──
@@ -2031,6 +2043,55 @@ class AutoRunner:
                             f"(threshold 3.0×ATR={3.0*_atr_now*100:.2f}%). "
                             f"SL locked at +{1.5*_atr_now*100:.2f}%. Total size {pt['size_mult']*100:.0f}% of mode."
                         )
+
+                # ── Push trail SL to real exchange when level changes ─────────────
+                # Paper sim updates sl_price; this pushes the same price to Bybit/OKX/Binance
+                # so the exchange actually protects locked profit, not just the paper sim.
+                # Grade A: always update. Grade B T2: update after breakeven is set.
+                # Grade B T1: skip — T1 carries its own TP order; moving the position SL
+                # risks interfering with the independent T2 stop management.
+                if REAL_TRADING and trailing_activated:
+                    _tr_grade = pt.get("grade", "A")
+                    _tr_is_t2 = (pt.get("label") == "T2")
+                    _tr_eligible = (_tr_grade == "A") or (_tr_is_t2 and pt.get("breakeven"))
+                    if _tr_eligible:
+                        _prev_ex_sl = float(pt.get("trail_sl_on_exchange", 0.0))
+                        _sl_moved = (
+                            (side == "LONG"  and sl_price > _prev_ex_sl + 0.0002) or
+                            (side == "SHORT" and (_prev_ex_sl == 0.0 or sl_price < _prev_ex_sl - 0.0002))
+                        )
+                        if _sl_moved:
+                            _tr_label = (
+                                f"breakeven ({sl_price:.4f})"
+                                if trail_locked_pct == 0.0
+                                else f"lock +{trail_locked_pct*100:.2f}% ({sl_price:.4f})"
+                            )
+                            _tr_pushed = False
+                            for _tr_attempt in range(2):
+                                try:
+                                    _tr_row = get_exchange(self.email)
+                                    if _tr_row:
+                                        _tr_ex = _make_ccxt_exchange(_tr_row)
+                                        _tr_ex_id = (_tr_row.get("exchange") or "bybit").lower()
+                                        _set_position_sl(_tr_ex, _tr_ex_id, self.symbol, side, sl_price)
+                                        pt["trail_sl_on_exchange"] = sl_price
+                                        _tr_pushed = True
+                                        if _tr_attempt == 0:
+                                            self.log(f"TRAIL REAL: SL → {_tr_label} | {self.symbol} {side}")
+                                        else:
+                                            self.log(f"TRAIL RETRY OK: SL → {_tr_label}")
+                                        _tg_alert(
+                                            f"🔒 <b>Trailing stop moved</b>\n"
+                                            f"{self.email} | {self.symbol} {side}\n"
+                                            f"Real SL → <b>{_tr_label}</b>\n"
+                                            f"Best move so far: +{best_move*100:.2f}%"
+                                        )
+                                        break
+                                except Exception as _tr_err:
+                                    if _tr_attempt == 0:
+                                        self.log(f"TRAIL ERROR: SL update failed — {_tr_err}. Retrying...")
+                                    else:
+                                        self.log(f"TRAIL ERROR: Retry also failed — {_tr_err}. Manual check needed for {self.symbol}.")
 
                 return None
 
@@ -2207,7 +2268,7 @@ class AutoRunner:
                 _min_tp_value = (size_dollar * tp_pct * 0.5) if size_dollar > 0 else 0.50
                 if real_pnl >= _min_tp_value and outcome in ("SL_HIT", "TRAIL_STOP"):
                     outcome = "TP_HIT"
-                elif real_pnl < -(equity_before * 0.005) and outcome == "TP_HIT":
+                elif real_pnl < -(equity_before * 0.005) and outcome in ("TP_HIT", "TRAIL_STOP"):
                     outcome = "SL_HIT"
                 if outcome != _old_outcome:
                     self.log(
