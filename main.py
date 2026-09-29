@@ -1130,6 +1130,22 @@ class AutoState:
 
 # AutoStartIn, FloorResetIn, CorrectTradeIn → routes_engine.py
 
+# ── Trail stop levels ─────────────────────────────────────────────────────────
+# (tp_fraction, lock_fraction, level_name)
+# tp_fraction:   price must reach this % of the TP target
+# lock_fraction: how much of best_move to lock as profit (0.0 = breakeven only)
+# Ratchet rule: locked profit can only increase — SL never moves backward.
+TRAIL_LEVELS = [
+    (0.35, 0.00, "L1-BE"),   # 35% of TP → SL to breakeven (never lose)
+    (0.40, 0.05, "L2"),      # 40% of TP → lock 5% of profit made
+    (0.50, 0.25, "L3"),      # 50% of TP → lock 25% of profit made
+    (0.60, 0.35, "L4"),      # 60% of TP → lock 35% of profit made
+    (0.70, 0.50, "L5"),      # 70% of TP → lock 50% of profit made
+    (0.80, 0.65, "L6"),      # 80% of TP → lock 65% of profit made
+    (0.90, 0.80, "L7"),      # 90% of TP → lock 80% of profit made
+]
+
+
 class _MidCandleSkip(Exception):
     """Raised inside _run_mid_candle_monitor to break out of nested blocks cleanly."""
 
@@ -1517,6 +1533,9 @@ class AutoRunner:
         self.thread.start()
         # Mid-candle monitor runs in parallel — fires early trades on big price moves
         threading.Thread(target=self._run_mid_candle_monitor, daemon=True).start()
+        # Active trade watcher — polls live price every 60s when a trade is open,
+        # moves trail SL immediately when a new level is crossed (never on a timer).
+        threading.Thread(target=self._run_trade_watcher, daemon=True).start()
 
     def stop(self, reason="Stopped by user."):
         if self.pending_trades and not self.waiting_for_trade_close:
@@ -1902,21 +1921,15 @@ class AutoRunner:
         _t2_waiting = pt.get("breakeven_after_t1") and not pt.get("breakeven") and not pt.get("breakeven_next")
 
         if candle_high > 0 and not intrabar_tp and not _t2_waiting:
-            if best_move >= tp_pct * 0.90:
-                # Level 3 (90% of TP): very close to target — lock 75% of profit made.
-                # e.g. entry=3.50 TP=3.70, price hits 3.68 → profit=0.18 → lock 0.135 → SL=3.635
-                trail_locked_pct  = best_move * 0.75
-                trailing_activated = True
-            elif best_move >= tp_pct * 0.70:
-                # Level 2 (70% of TP): deep in profit — lock 50% of profit made.
-                # e.g. entry=3.50 TP=3.70, price hits 3.64 → profit=0.14 → lock 0.07 → SL=3.57
-                trail_locked_pct  = best_move * 0.50
-                trailing_activated = True
-            elif best_move >= tp_pct * 0.40 and best_move >= atr * 0.50:
-                # Level 1 (40% of TP): breakeven — only activate if price moved at least
-                # 0.5×ATR so noise below the ATR floor doesn't trigger a breakeven exit.
-                trail_locked_pct  = 0.0
-                trailing_activated = True
+            for _tl_tp_frac, _tl_lock_frac, _tl_name in reversed(TRAIL_LEVELS):
+                if best_move >= tp_pct * _tl_tp_frac:
+                    # Breakeven level (lock_frac=0): require price moved ≥0.5×ATR
+                    # so micro-noise below the ATR floor never triggers a BE exit.
+                    if _tl_lock_frac == 0.0 and atr and best_move < atr * 0.50:
+                        continue
+                    trail_locked_pct  = best_move * _tl_lock_frac
+                    trailing_activated = True
+                    break
 
         # Ratchet: if a profit lock was established in a prior candle, keep it
         # even if the current candle didn't re-reach the trigger threshold.
@@ -2886,6 +2899,149 @@ class AutoRunner:
                 if self.stop_event.is_set():
                     return
                 time.sleep(10)
+
+    def _run_trade_watcher(self) -> None:
+        """
+        Active trade watcher — runs for the lifetime of the runner alongside the
+        main loop and mid-candle monitor.
+
+        When a trade is open:
+          - Polls live price every 60 seconds (30s for SCALP).
+          - Tracks the best price seen since entry (ratchet — can only improve).
+          - On every poll, checks which TRAIL_LEVELS threshold has been reached.
+          - If a NEW higher level is crossed: immediately updates the trail SL,
+            pushes it to the real exchange, logs ONE clean line, and sends Telegram.
+          - Silent if no level changes — zero log noise on normal polls.
+
+        When no trade is open: sleeps and does nothing.
+        Stops cleanly when stop_event is set.
+        """
+        poll_sec = 30 if self.trade_style == "SCALP" else 60
+
+        while not self.stop_event.is_set():
+            # Sleep in 1-second chunks so stop_event wakes us up quickly
+            for _ in range(poll_sec):
+                if self.stop_event.is_set():
+                    return
+                time.sleep(1)
+
+            # Quick check — no trade open, nothing to do
+            with self._pt_lock:
+                if not self.pending_trades:
+                    continue
+
+            # Fetch live price outside the lock (network call — can take 1-2 seconds)
+            try:
+                current_price = self._fetch_price_sync(self.symbol)
+                if not current_price or current_price <= 0:
+                    continue
+            except Exception:
+                continue
+
+            # Process each open position
+            with self._pt_lock:
+                for pt in self.pending_trades:
+                    # T2 holds its original SL until T1 hits TP — skip until breakeven is set
+                    _t2_waiting = (
+                        pt.get("breakeven_after_t1") and
+                        not pt.get("breakeven") and
+                        not pt.get("breakeven_next")
+                    )
+                    if _t2_waiting:
+                        continue
+
+                    entry  = float(pt.get("entry_price", 0.0))
+                    side   = pt.get("side", "LONG")
+                    tp_pct = float(pt.get("tp_pct_open", 0.02))
+                    if entry <= 0 or tp_pct <= 0:
+                        continue
+
+                    # Ratchet: best price seen since trade opened (only improves)
+                    prev_best = float(pt.get("watcher_best_price", entry))
+                    if side == "LONG":
+                        best_price = max(prev_best, current_price)
+                    else:
+                        best_price = min(prev_best, current_price) if prev_best != entry else min(entry, current_price)
+                    pt["watcher_best_price"] = best_price
+
+                    # Best move as a fraction of entry
+                    if side == "LONG":
+                        best_move = (best_price - entry) / entry
+                    else:
+                        best_move = (entry - best_price) / entry
+
+                    if best_move <= 0:
+                        continue
+
+                    # Find the highest TRAIL_LEVELS threshold reached
+                    new_locked_pct = None
+                    new_level_name = None
+                    for _tp_frac, _lock_frac, _lname in reversed(TRAIL_LEVELS):
+                        if best_move >= tp_pct * _tp_frac:
+                            new_locked_pct = best_move * _lock_frac
+                            new_level_name = _lname
+                            break
+
+                    if new_locked_pct is None:
+                        continue  # No level reached yet
+
+                    # Ratchet: only move forward — never reduce locked profit
+                    prev_locked = float(pt.get("trail_locked_pct", -1.0))
+                    if new_locked_pct <= prev_locked:
+                        continue  # Same or lower level — nothing to do
+
+                    # Compute new SL price
+                    if side == "LONG":
+                        new_sl_price = entry * (1.0 + new_locked_pct)
+                    else:
+                        new_sl_price = entry * (1.0 - new_locked_pct)
+
+                    # Update trail state on the position dict
+                    pt["trail_locked_pct"] = new_locked_pct
+                    pt["trail_best_move"]  = max(float(pt.get("trail_best_move", 0.0)), best_move)
+
+                    # Build log label
+                    reach_pct  = int(best_move / tp_pct * 100) if tp_pct > 0 else 0
+                    lock_label = (
+                        "breakeven" if new_locked_pct == 0.0
+                        else f"+{new_locked_pct * 100:.2f}% profit locked"
+                    )
+
+                    # ── AI log — only fires when SL actually moves ────────────
+                    self.log(
+                        f"🔒 TRAIL {new_level_name} — {self.symbol} {side} | "
+                        f"price reached {reach_pct}% of TP | "
+                        f"SL → {new_sl_price:.4f} ({lock_label})"
+                    )
+
+                    # ── Push to real exchange immediately ─────────────────────
+                    if REAL_TRADING:
+                        _wt_grade  = pt.get("grade", "A")
+                        _wt_is_t2  = (pt.get("label") == "T2")
+                        _wt_eligible = (_wt_grade == "A") or (_wt_is_t2 and pt.get("breakeven"))
+                        _prev_ex_sl  = float(pt.get("trail_sl_on_exchange", 0.0))
+                        _sl_moved = (
+                            (side == "LONG"  and new_sl_price > _prev_ex_sl + 0.0001) or
+                            (side == "SHORT" and (_prev_ex_sl == 0.0 or new_sl_price < _prev_ex_sl - 0.0001))
+                        )
+                        if _wt_eligible and _sl_moved:
+                            try:
+                                _wt_row = get_exchange(self.email)
+                                if _wt_row:
+                                    _wt_ex    = _make_ccxt_exchange(_wt_row)
+                                    _wt_ex_id = (_wt_row.get("exchange") or "bybit").lower()
+                                    _set_position_sl(_wt_ex, _wt_ex_id, self.symbol, side, new_sl_price)
+                                    pt["trail_sl_on_exchange"] = new_sl_price
+                            except Exception as _wt_err:
+                                self.log(f"⚠️ TRAIL WATCHER: exchange SL push failed — {_wt_err}")
+
+                    # ── Telegram notification ─────────────────────────────────
+                    _tg_alert(
+                        f"🔒 <b>Trail stop updated</b> [{new_level_name}]\n"
+                        f"{self.symbol} {side} | {self.email}\n"
+                        f"Price reached <b>{reach_pct}%</b> of TP target\n"
+                        f"SL → <b>{new_sl_price:.4f}</b> ({lock_label})"
+                    )
 
     def _reconcile_exchange_positions(self) -> None:
         """
