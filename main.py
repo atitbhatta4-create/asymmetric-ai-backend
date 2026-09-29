@@ -2925,12 +2925,13 @@ class AutoRunner:
                     return
                 time.sleep(1)
 
-            # Quick check — no trade open, nothing to do
+            # Fetch live price BEFORE acquiring the lock — network call, can take 1-2 seconds.
+            # Check pending_trades first so we skip the fetch when no trade is open.
             with self._pt_lock:
-                if not self.pending_trades:
-                    continue
+                _has_trade = bool(self.pending_trades)
+            if not _has_trade:
+                continue
 
-            # Fetch live price outside the lock (network call — can take 1-2 seconds)
             try:
                 current_price = self._fetch_price_sync(self.symbol)
                 if not current_price or current_price <= 0:
@@ -2938,7 +2939,12 @@ class AutoRunner:
             except Exception:
                 continue
 
-            # Process each open position
+            # ── Phase 1: compute updates under lock (fast — no network calls) ──
+            # Collect all SL moves needed, then release the lock before doing any
+            # exchange or Telegram calls. Holding _pt_lock for exchange calls (up to
+            # 10 seconds) would block the main loop's candle processing.
+            _pending_notifications: list = []
+
             with self._pt_lock:
                 for pt in self.pending_trades:
                     # T2 holds its original SL until T1 hits TP — skip until breakeven is set
@@ -2956,24 +2962,20 @@ class AutoRunner:
                     if entry <= 0 or tp_pct <= 0:
                         continue
 
-                    # Ratchet: best price seen since trade opened (only improves)
+                    # Ratchet: best price seen since trade opened (only ever improves)
                     prev_best = float(pt.get("watcher_best_price", entry))
-                    if side == "LONG":
-                        best_price = max(prev_best, current_price)
-                    else:
-                        best_price = min(prev_best, current_price) if prev_best != entry else min(entry, current_price)
+                    best_price = max(prev_best, current_price) if side == "LONG" else min(prev_best, current_price)
                     pt["watcher_best_price"] = best_price
 
-                    # Best move as a fraction of entry
-                    if side == "LONG":
-                        best_move = (best_price - entry) / entry
-                    else:
-                        best_move = (entry - best_price) / entry
-
+                    # Best move as a fraction of entry price
+                    best_move = (
+                        (best_price - entry) / entry if side == "LONG"
+                        else (entry - best_price) / entry
+                    )
                     if best_move <= 0:
                         continue
 
-                    # Find the highest TRAIL_LEVELS threshold reached
+                    # Find the highest TRAIL_LEVELS threshold price has reached
                     new_locked_pct = None
                     new_level_name = None
                     for _tp_frac, _lock_frac, _lname in reversed(TRAIL_LEVELS):
@@ -2988,60 +2990,86 @@ class AutoRunner:
                     # Ratchet: only move forward — never reduce locked profit
                     prev_locked = float(pt.get("trail_locked_pct", -1.0))
                     if new_locked_pct <= prev_locked:
-                        continue  # Same or lower level — nothing to do
+                        continue  # Same level, no improvement — nothing to do
 
                     # Compute new SL price
-                    if side == "LONG":
-                        new_sl_price = entry * (1.0 + new_locked_pct)
-                    else:
-                        new_sl_price = entry * (1.0 - new_locked_pct)
+                    new_sl_price = (
+                        entry * (1.0 + new_locked_pct) if side == "LONG"
+                        else entry * (1.0 - new_locked_pct)
+                    )
 
-                    # Update trail state on the position dict
+                    # Update trail state immediately inside the lock (fast dict writes)
                     pt["trail_locked_pct"] = new_locked_pct
                     pt["trail_best_move"]  = max(float(pt.get("trail_best_move", 0.0)), best_move)
 
-                    # Build log label
                     reach_pct  = int(best_move / tp_pct * 100) if tp_pct > 0 else 0
                     lock_label = (
                         "breakeven" if new_locked_pct == 0.0
                         else f"+{new_locked_pct * 100:.2f}% profit locked"
                     )
 
-                    # ── AI log — only fires when SL actually moves ────────────
+                    # AI log fires inside the lock — self.log() just queues a string (fast)
                     self.log(
                         f"🔒 TRAIL {new_level_name} — {self.symbol} {side} | "
                         f"price reached {reach_pct}% of TP | "
                         f"SL → {new_sl_price:.4f} ({lock_label})"
                     )
 
-                    # ── Push to real exchange immediately ─────────────────────
-                    if REAL_TRADING:
-                        _wt_grade  = pt.get("grade", "A")
-                        _wt_is_t2  = (pt.get("label") == "T2")
-                        _wt_eligible = (_wt_grade == "A") or (_wt_is_t2 and pt.get("breakeven"))
-                        _prev_ex_sl  = float(pt.get("trail_sl_on_exchange", 0.0))
-                        _sl_moved = (
-                            (side == "LONG"  and new_sl_price > _prev_ex_sl + 0.0001) or
-                            (side == "SHORT" and (_prev_ex_sl == 0.0 or new_sl_price < _prev_ex_sl - 0.0001))
-                        )
-                        if _wt_eligible and _sl_moved:
-                            try:
-                                _wt_row = get_exchange(self.email)
-                                if _wt_row:
-                                    _wt_ex    = _make_ccxt_exchange(_wt_row)
-                                    _wt_ex_id = (_wt_row.get("exchange") or "bybit").lower()
-                                    _set_position_sl(_wt_ex, _wt_ex_id, self.symbol, side, new_sl_price)
-                                    pt["trail_sl_on_exchange"] = new_sl_price
-                            except Exception as _wt_err:
-                                self.log(f"⚠️ TRAIL WATCHER: exchange SL push failed — {_wt_err}")
+                    # Queue exchange push + Telegram for after the lock is released
+                    _prev_ex_sl = float(pt.get("trail_sl_on_exchange", 0.0))
+                    _wt_grade   = pt.get("grade", "A")
+                    _wt_is_t2   = (pt.get("label") == "T2")
+                    _pending_notifications.append({
+                        "side":          side,
+                        "entry":         entry,
+                        "new_sl_price":  new_sl_price,
+                        "new_locked_pct": new_locked_pct,
+                        "new_level_name": new_level_name,
+                        "reach_pct":     reach_pct,
+                        "lock_label":    lock_label,
+                        "eligible":      (_wt_grade == "A") or (_wt_is_t2 and pt.get("breakeven")),
+                        "prev_ex_sl":    _prev_ex_sl,
+                        "open_ts":       pt.get("open_ts", 0.0),  # used to re-identify pt after lock
+                    })
 
-                    # ── Telegram notification ─────────────────────────────────
-                    _tg_alert(
-                        f"🔒 <b>Trail stop updated</b> [{new_level_name}]\n"
-                        f"{self.symbol} {side} | {self.email}\n"
-                        f"Price reached <b>{reach_pct}%</b> of TP target\n"
-                        f"SL → <b>{new_sl_price:.4f}</b> ({lock_label})"
+            # ── Phase 2: exchange push + Telegram — outside the lock ──────────
+            # Exchange API can take up to 10 seconds; Telegram ~1 second.
+            # Doing these outside _pt_lock means the main loop is never blocked.
+            for _n in _pending_notifications:
+                _side        = _n["side"]
+                _new_sl      = _n["new_sl_price"]
+                _lock_label  = _n["lock_label"]
+                _level_name  = _n["new_level_name"]
+                _reach_pct   = _n["reach_pct"]
+                _prev_ex_sl  = _n["prev_ex_sl"]
+
+                if REAL_TRADING and _n["eligible"]:
+                    _sl_moved = (
+                        (_side == "LONG"  and _new_sl > _prev_ex_sl + 0.0001) or
+                        (_side == "SHORT" and (_prev_ex_sl == 0.0 or _new_sl < _prev_ex_sl - 0.0001))
                     )
+                    if _sl_moved:
+                        try:
+                            _wt_row = get_exchange(self.email)
+                            if _wt_row:
+                                _wt_ex    = _make_ccxt_exchange(_wt_row)
+                                _wt_ex_id = (_wt_row.get("exchange") or "bybit").lower()
+                                _set_position_sl(_wt_ex, _wt_ex_id, self.symbol, _side, _new_sl)
+                                # Re-acquire lock briefly to write the confirmed SL back to pt
+                                with self._pt_lock:
+                                    for _pt2 in self.pending_trades:
+                                        if _pt2.get("open_ts") == _n["open_ts"] and _pt2.get("side") == _side:
+                                            _pt2["trail_sl_on_exchange"] = _new_sl
+                                            break
+                        except Exception as _wt_err:
+                            self.log(f"⚠️ TRAIL WATCHER: exchange SL push failed — {_wt_err}")
+
+                _tg_alert(
+                    f"🔒 <b>Trail stop updated</b> [{_level_name}]\n"
+                    f"{self.symbol} {_side} | {self.email}\n"
+                    f"Price reached <b>{_reach_pct}%</b> of TP target\n"
+                    f"SL → <b>{_new_sl:.4f}</b> ({_lock_label})"
+                )
 
     def _reconcile_exchange_positions(self) -> None:
         """
