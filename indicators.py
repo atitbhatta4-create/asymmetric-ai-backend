@@ -279,6 +279,42 @@ def _candle_pattern(klines: List[Dict], side: str) -> tuple:
     return "against_trend", 0.10
 
 
+def _candle_structure_check(klines: List[Dict], side: str) -> tuple:
+    """
+    Compares the last closed candle's body against the 3–4 prior opposing candles.
+    Catches the "3 red candles then one explosive green" pattern the engine was missing.
+
+    Looks at the 4 candles before klines[-1]:
+      - 3+ oppose trade direction → compute avg opposing body
+      - ratio = last_body / avg_opp_body
+      > 1.5 → EXPLOSIVE_REVERSAL (zero penalty — this is the setup we want)
+      < 0.5 → WEAK_BOUNCE (penalty 0.10 — tiny candle after heavy opposition, low conviction)
+      else  → NEUTRAL
+
+    Returns (label: str, penalty: float)
+    """
+    if len(klines) < 5:
+        return "NEUTRAL", 0.0
+    curr = klines[-1]
+    curr_body = abs(curr["close"] - curr["open"])
+    prior = klines[-5:-1]
+    if side == "LONG":
+        opposing = [k for k in prior if k["close"] < k["open"]]
+    else:
+        opposing = [k for k in prior if k["close"] > k["open"]]
+    if len(opposing) < 3:
+        return "NEUTRAL", 0.0
+    avg_opp_body = sum(abs(k["close"] - k["open"]) for k in opposing) / len(opposing)
+    if avg_opp_body < 1e-10:
+        return "NEUTRAL", 0.0
+    ratio = curr_body / avg_opp_body
+    if ratio > 1.5:
+        return "EXPLOSIVE_REVERSAL", 0.0
+    if ratio < 0.5:
+        return "WEAK_BOUNCE", 0.10
+    return "NEUTRAL", 0.0
+
+
 def _rsi_divergence(closes: List[float], rsi_vals: List[float], side: str, n: int = 12) -> tuple:
     """
     Detect RSI divergence — price makes new extreme but RSI disagrees.
@@ -803,6 +839,9 @@ def _compute_signal_layers(
     # Candle pattern at pullback zone (replaces simple bounce check)
     pattern_name, pattern_score = _candle_pattern(klines, desired_side)
 
+    # Structure check: was the reversal candle explosive vs a weak bounce?
+    struct_label, struct_penalty = _candle_structure_check(klines, desired_side)
+
     # ADX-dynamic RSI zone — strong trends keep RSI elevated for many candles.
     # A fixed zone (e.g. 35–68) blocks every entry when RSI holds above 70 all day.
     _strong_trend_adx = adx is not None and adx >= 45
@@ -830,7 +869,7 @@ def _compute_signal_layers(
     _eff_div_penalty = 0.0 if _strong_trend_adx else div_penalty
 
     entry_score = round(
-        max(0.0, pullback_score * 0.35 + pattern_score * 0.35 + rsi_score * 0.30 - _eff_div_penalty),
+        max(0.0, pullback_score * 0.35 + pattern_score * 0.35 + rsi_score * 0.30 - _eff_div_penalty - struct_penalty),
         3,
     )
     # against_trend: last candle closed against the trade direction at the entry zone.
@@ -845,6 +884,7 @@ def _compute_signal_layers(
         else f"RSI {rsi:.0f} outside entry zone {p['rsi_min']}–{p['rsi_max']}" if not rsi_in_range
         else f"Candle closed against trade direction — wait for {'bullish' if desired_side == 'LONG' else 'bearish'} close to confirm bounce" if against_trend_candle
         else f"Candle pattern weak ({pattern_name}) — wait for pin bar or engulfing at EMA21" if pattern_score < 0.40
+        else f"Weak bounce — reversal candle body too small vs prior opposing move" if struct_label == "WEAK_BOUNCE"
         else ""
     )
     breakdown_entry = {
@@ -852,6 +892,8 @@ def _compute_signal_layers(
         "pullback_max_pct":   round(p["pullback_max"] * 100, 1),
         "candle_pattern":     pattern_name,
         "pattern_score":      round(pattern_score, 2),
+        "candle_structure":   struct_label,
+        "structure_penalty":  round(struct_penalty, 2),
         "rsi":                round(rsi or 0, 1),
         "rsi_range":          f"{p['rsi_min']}–{p['rsi_max']}",
         "rsi_divergence":     div_detected,
@@ -926,7 +968,20 @@ def _compute_signal_layers(
     )
     total_score = round(raw_score * sess_score, 3)
     min_score = p.get("min_score", 0.62)
-    breakdown["session"] = {"label": sess_label, "quality": round(sess_score, 2), "raw_score": round(raw_score, 3), "ok": True, "reason": ""}
+
+    # Asia / overnight session (00:00–08:00 Dubai): raise floor to Grade A conviction.
+    # Grade B setups in thin overnight hours have near-0% historical WR — require ≥0.78.
+    _dubai_hour = now_dubai().hour
+    _asia_floor = 0 <= _dubai_hour < 8
+    if _asia_floor:
+        min_score = max(min_score, 0.78)
+
+    breakdown["session"] = {
+        "label": sess_label, "quality": round(sess_score, 2),
+        "raw_score": round(raw_score, 3), "ok": True, "reason": "",
+        "asia_grade_a_floor": _asia_floor,
+        "effective_min_score": round(min_score, 2),
+    }
     breakdown["weights"] = {**_w, "s4_active": enable_s4, "regime_type": _regime_type, "ok": True}
 
     # Market grade for trades that FIRE (ok=True path only):
