@@ -315,6 +315,88 @@ def _candle_structure_check(klines: List[Dict], side: str) -> tuple:
     return "NEUTRAL", 0.0
 
 
+def _market_structure(klines: List[Dict], side: str) -> tuple:
+    """
+    Detects swing HH/HL (uptrend) or LH/LL (downtrend) from the last 30 candles.
+    Catches trend direction 3-5 candles before EMA crossover — faster signal than EMA alone.
+
+    Pivot rule (lb=2): candle i is a swing high if highs[i] is the maximum in the
+    5-candle window [i-2 .. i+2]. Same for swing lows (minimum).
+    Needs ≥3 swing highs AND ≥3 swing lows to classify; otherwise returns NEUTRAL.
+
+    Returns (label: str, score_adj: float)
+      UPTREND  agrees with side  → +0.05
+      DOWNTREND agrees with side → +0.05
+      Either disagrees with side → -0.05
+      NEUTRAL                   →  0.0
+    """
+    if len(klines) < 10:
+        return "NEUTRAL", 0.0
+
+    window = klines[-30:] if len(klines) >= 30 else klines
+    highs  = [k["high"] for k in window]
+    lows   = [k["low"]  for k in window]
+    n      = len(window)
+    lb     = 2
+
+    swing_highs, swing_lows = [], []
+    for i in range(lb, n - lb):
+        if highs[i] == max(highs[i - lb : i + lb + 1]):
+            swing_highs.append(highs[i])
+        if lows[i] == min(lows[i - lb : i + lb + 1]):
+            swing_lows.append(lows[i])
+
+    if len(swing_highs) < 3 or len(swing_lows) < 3:
+        return "NEUTRAL", 0.0
+
+    sh = swing_highs[-3:]
+    sl = swing_lows[-3:]
+
+    hh = sh[0] < sh[1] < sh[2]
+    hl = sl[0] < sl[1] < sl[2]
+    lh = sh[0] > sh[1] > sh[2]
+    ll = sl[0] > sl[1] > sl[2]
+
+    if hh and hl:
+        label = "UPTREND"
+    elif lh and ll:
+        label = "DOWNTREND"
+    else:
+        label = "NEUTRAL"
+
+    if label == "NEUTRAL":
+        return "NEUTRAL", 0.0
+
+    agrees = (label == "UPTREND" and side == "LONG") or (label == "DOWNTREND" and side == "SHORT")
+    return label, 0.05 if agrees else -0.05
+
+
+def _daily_bias(daily_klines: List[Dict]) -> str:
+    """
+    Daily trend bias from up to 30 daily candles.
+    Price above a rising EMA21 = BULL. Below a falling EMA21 = BEAR. Otherwise NEUTRAL.
+    Returns "BULL" | "BEAR" | "NEUTRAL"
+    """
+    if not daily_klines or len(daily_klines) < 5:
+        return "NEUTRAL"
+
+    closes  = [k["close"] for k in daily_klines]
+    ema21   = _ema(closes, min(21, len(closes) - 1))
+
+    if len(ema21) < 2:
+        return "NEUTRAL"
+
+    price   = closes[-1]
+    slope_n = min(5, len(ema21) - 1)
+    slope   = ema21[-1] - ema21[-1 - slope_n]
+
+    if price > ema21[-1] and slope > 0:
+        return "BULL"
+    if price < ema21[-1] and slope < 0:
+        return "BEAR"
+    return "NEUTRAL"
+
+
 def _rsi_divergence(closes: List[float], rsi_vals: List[float], side: str, n: int = 12) -> tuple:
     """
     Detect RSI divergence — price makes new extreme but RSI disagrees.
@@ -530,6 +612,7 @@ def _compute_signal_layers(
     enable_s4: bool = False,
     symbol: str = "BTCUSDT",
     _precomp: Optional[Dict] = None,
+    daily_klines: Optional[List[Dict]] = None,
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -725,6 +808,19 @@ def _compute_signal_layers(
 
     desired_side: Side = "LONG" if htf_bull else "SHORT"
 
+    # ── Market structure (4h swing HH/HL) + daily bias ───────────────────
+    # Both are soft score adjustments: agree = +0.05, disagree = -0.05, neutral = 0.
+    # daily_klines=None (default) → _db_adj=0.0 — zero regression on all existing callers.
+    _ms_label, _ms_adj = _market_structure(higher_klines or [], desired_side)
+    _db_label = _daily_bias(daily_klines or [])
+    _db_adj = (
+         0.05 if (_db_label == "BULL"  and desired_side == "LONG")  else
+        -0.05 if (_db_label == "BULL"  and desired_side == "SHORT") else
+         0.05 if (_db_label == "BEAR"  and desired_side == "SHORT") else
+        -0.05 if (_db_label == "BEAR"  and desired_side == "LONG")  else
+        0.0
+    )
+
     # ── Direction-dependent RSI shift ─────────────────────────────────────
     # LONG setups enter near oversold, so shift window lower.
     # SHORT setups enter near overbought, so shift window higher.
@@ -799,9 +895,10 @@ def _compute_signal_layers(
     # EMA spread widening = trend accelerating = better entry quality
     spread_widening, spread_score = _ema_spread_trend(ema9, ema21, n=4)
 
-    direction_score = round(min(1.0,
+    direction_score = round(min(1.0, max(0.0,
         htf_score * 0.45 + local_score * 0.25 + ema9_bonus * 0.15 + spread_score * 0.15
-    ), 3)
+        + _ms_adj + _db_adj
+    )), 3)
     # Threshold raised 0.55 → 0.65: requires meaningful local + HTF agreement.
     # At 0.55, HTF alone (0.45) + neutral spread (0.075) = 0.525 could barely pass.
     # At 0.65, you need at least HTF confirmed + local OR HTF + ema9 + good spread.
@@ -818,6 +915,8 @@ def _compute_signal_layers(
         "local_trend": "BULL" if local_bull else "BEAR",
         "ema9_momentum": "aligned" if ema9_aligned else "not aligned",
         "ema_spread": "widening" if spread_widening else "narrowing",
+        "market_structure": _ms_label, "ms_adj": round(_ms_adj, 2),
+        "daily_bias": _db_label,       "db_adj": round(_db_adj, 2),
         "signal": sig, "side": desired_side,
         "score": direction_score, "ok": direction_score >= _DIR_PASS, "reason": dir_reason,
     }
