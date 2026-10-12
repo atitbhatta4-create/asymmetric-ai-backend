@@ -1261,6 +1261,7 @@ class AutoRunner:
         self.peak_equity: float   = max(get_equity(email), _saved_peak)
         self.start_capital: float = _saved_sc  # first-ever balance — used for R1 hybrid floor
         self.consecutive_wins: int = 0    # reset strictness after 3 wins in a row
+        self._htf_block_start: Optional[float] = None   # timestamp when HTF blocking began
         # R1 Hybrid floor: flat 85% until 2× start capital, then tightens to 90% from peak.
         self.floor_equity: float = _compute_floor(self.peak_equity, self.start_capital)
         # Persist the correct peak immediately so /balance endpoint shows the right floor
@@ -2680,6 +2681,14 @@ class AutoRunner:
             }
             _allowed_sides = ["LONG"]   # parabolic = bull mania, long only
 
+        # HTF timeout: inject htf_score_floor after 12h/24h of consecutive HTF blocking
+        if self._htf_block_start is not None:
+            _htf_hrs = (time.time() - self._htf_block_start) / 3600
+            if _htf_hrs >= 24:
+                _param_overrides = {**(_param_overrides or {}), "htf_score_floor": 0.60}
+            elif _htf_hrs >= 12:
+                _param_overrides = {**(_param_overrides or {}), "htf_score_floor": 0.35}
+
         res = _compute_signal_layers(
             klines, self.mode, self.adaptive_strictness,
             higher_klines, self.trade_style, mtf_klines,
@@ -2704,10 +2713,10 @@ class AutoRunner:
         if res.get("ok") and klines:
             _signal_score = res.get("score", 0.0)
             _cp = get_coin_params(self.symbol)
-            if _signal_score >= 0.72:
+            if _signal_score >= 0.68:
                 # 6-7 filters already confirmed — volume check is redundant at this level
                 self.log(
-                    f"[VOLUME BYPASS] Score {_signal_score:.2f} exceeds 0.72 override "
+                    f"[VOLUME BYPASS] Score {_signal_score:.2f} exceeds 0.68 override "
                     f"threshold. Volume check skipped. Proceeding to entry."
                 )
             else:
@@ -3433,12 +3442,39 @@ class AutoRunner:
                         self.pending_signal_score = 0.0
                         self.candles_since_signal = 0
                     self.blocked_reason = res.get("blocked") or "BLOCKED"
-                    _side_lbl = res.get("side", "?")
+                    _side_lbl  = res.get("side", "?")
                     _score_lbl = f"{res.get('score', 0.0):.2f}"
-                    _raw = res.get("blocked") or "signal not ready"
-                    # "BLOCKED (entry): Price 4.3% from EMA21" → "Price 4.3% from EMA21"
+                    _raw       = res.get("blocked") or "signal not ready"
                     _reason_lbl = _raw.split("): ", 1)[-1] if "): " in _raw else _raw
-                    self.log(f"Market check — {_side_lbl} score={_score_lbl} | {_reason_lbl}")
+
+                    # Threshold source — always visible in every market check log line
+                    _sess_bd    = res.get("breakdown", {}).get("session", {})
+                    _eff_thresh = _sess_bd.get("effective_min_score", "?")
+                    _thresh_src = _sess_bd.get("threshold_source", "?")
+                    self.log(
+                        f"Market check — {_side_lbl} score={_score_lbl} "
+                        f"threshold={_eff_thresh} source={_thresh_src} | {_reason_lbl}"
+                    )
+
+                    # ── HTF timeout: track consecutive hours blocked by weak HTF ──
+                    _is_htf_block = "HTF trend weak" in _raw or "direction" in _raw.lower()
+                    if _is_htf_block:
+                        if self._htf_block_start is None:
+                            self._htf_block_start = time.time()
+                        _htf_blocked_hours = (time.time() - self._htf_block_start) / 3600
+                        if _htf_blocked_hours >= 24:
+                            self.log(
+                                f"HTF timeout: {_htf_blocked_hours:.1f}h blocked — "
+                                f"HTF filter suspended. Other layers decide."
+                            )
+                        elif _htf_blocked_hours >= 12:
+                            self.log(
+                                f"HTF timeout: {_htf_blocked_hours:.1f}h blocked — "
+                                f"EMA separation requirement reduced 30%."
+                            )
+                    else:
+                        self._htf_block_start = None   # reset when no longer HTF-blocked
+
                     continue
 
                 self.blocked_reason = None
