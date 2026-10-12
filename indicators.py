@@ -501,6 +501,92 @@ def _reversal_signal(klines: List[Dict], rsi: Optional[float], adx: Optional[flo
     }
 
 
+def _bollinger_bands(closes: List[float], period: int = 20, std_dev: float = 2.0) -> tuple:
+    """Returns (upper_bb, middle_bb, lower_bb) for the most recent candle."""
+    if len(closes) < period:
+        return None, None, None
+    window = closes[-period:]
+    middle = sum(window) / period
+    variance = sum((c - middle) ** 2 for c in window) / period
+    std = variance ** 0.5
+    return middle + std_dev * std, middle, middle - std_dev * std
+
+
+def _mean_reversion_signal(
+    klines: List[Dict], rsi: Optional[float], adx: Optional[float], atr: Optional[float]
+) -> Dict:
+    """
+    Mean Reversion — fires when price touches a Bollinger Band in a ranging market.
+    Complements T16 reversal (extreme RSI bounce): fires at milder RSI, no volume spike required.
+
+    Conditions:
+      1. ADX < 20 (ranging — low trend strength)
+      2. Price at or beyond Bollinger Band (20-period, 2 std dev)
+      3. RSI < 45 for LONG, RSI > 55 for SHORT
+      4. Volume ≥ 0.5× median (market is active, not dead)
+
+    TP: middle Bollinger Band (20-period SMA), expressed as ATR multiples
+    SL: 1.0× ATR beyond entry (tight — ranging markets don't run far)
+    Grade A only
+    """
+    if rsi is None or adx is None or atr is None or len(klines) < 25:
+        return {"ok": False}
+
+    if adx >= 20:
+        return {"ok": False}
+
+    closes  = [k["close"]  for k in klines]
+    volumes = [k["volume"] for k in klines]
+    price   = closes[-1]
+
+    upper_bb, middle_bb, lower_bb = _bollinger_bands(closes)
+    if upper_bb is None:
+        return {"ok": False}
+
+    long_signal  = price <= lower_bb
+    short_signal = price >= upper_bb
+    if not (long_signal or short_signal):
+        return {"ok": False}
+    side = "LONG" if long_signal else "SHORT"
+
+    if side == "LONG"  and rsi >= 45:
+        return {"ok": False}
+    if side == "SHORT" and rsi <= 55:
+        return {"ok": False}
+
+    vol_window = sorted(volumes[-22:-2]) if len(volumes) >= 22 else sorted(volumes[:-2])
+    avg_vol   = vol_window[len(vol_window) // 2] if vol_window else 0.0
+    vol_ratio = volumes[-2] / avg_vol if avg_vol > 0 else 0.0
+    if vol_ratio < 0.5:
+        return {"ok": False}
+
+    dist_to_middle = abs(middle_bb - price)
+    tp_atr = min(5.0, max(1.5, dist_to_middle / atr)) if atr > 0 else 2.0
+
+    score = 0.72
+    bb_width  = max(upper_bb - lower_bb, 1e-9)
+    depth_pct = abs(price - (lower_bb if side == "LONG" else upper_bb)) / bb_width
+    score += min(0.05, depth_pct * 0.2)
+    if side == "LONG":
+        score += min(0.05, (45 - rsi) / 100)
+    else:
+        score += min(0.05, (rsi - 55) / 100)
+
+    band_word = "lower" if side == "LONG" else "upper"
+    band_val  = lower_bb if side == "LONG" else upper_bb
+    log_msg = (
+        f"MEAN REVERSION: ADX {adx:.1f} (ranging) + price at {band_word} BB "
+        f"({price:.4f} vs band {band_val:.4f}) + RSI {rsi:.1f} → {side}, "
+        f"TP at middle BB ({middle_bb:.4f}, {tp_atr:.1f}×ATR)"
+    )
+    return {
+        "ok": True, "side": side, "score": round(min(0.82, score), 3),
+        "signal_type": "MEAN_REVERSION", "grade": "A",
+        "sl_atr_override": 1.0, "tp_atr_override": round(tp_atr, 2),
+        "log": log_msg,
+    }
+
+
 def _classify_regime(
     highs: List[float], lows: List[float], closes: List[float],
     adx: Optional[float], atr_pct: float,
@@ -672,19 +758,26 @@ def _compute_signal_layers(
     # system would reject. If regime would block AND reversal conditions are met,
     # return the reversal signal instead of BLOCKED.
     _rev = _reversal_signal(klines, rsi, adx, atr) if enable_t16 else {"ok": False}
+    _mr  = _mean_reversion_signal(klines, rsi, adx, atr)
 
     # ── Phase 4: Regime classification (before any layer scoring) ────────────
     regime_class = _classify_regime(highs, lows, closes, adx, atr_pct, _atr_slow_pct=_atr_slow_pct_pc)
     if regime_class["block"]:
-        if _rev["ok"]:
+        # Pick the highest-scoring alternative signal (T16 reversal or mean reversion)
+        _alt = max(
+            [r for r in [_rev, _mr] if r.get("ok")],
+            key=lambda r: r["score"],
+            default=None,
+        )
+        if _alt:
             return {
-                "ok": True, "signal": "REVERSAL", "side": _rev["side"],
-                "score": _rev["score"], "grade": "B",
-                "signal_type": "REVERSAL",
-                "sl_atr_override": _rev["sl_atr_override"],
-                "tp_atr_override": _rev["tp_atr_override"],
-                "reversal_log": _rev["log"],
-                "breakdown": {"reversal": _rev["log"]},
+                "ok": True, "signal": _alt["signal_type"], "side": _alt["side"],
+                "score": _alt["score"], "grade": _alt["grade"],
+                "signal_type": _alt["signal_type"],
+                "sl_atr_override": _alt["sl_atr_override"],
+                "tp_atr_override": _alt["tp_atr_override"],
+                "reversal_log": _alt["log"],
+                "breakdown": {"reversal": _alt["log"]},
                 "atr_pct": atr_pct,
                 "market_regime": regime_class["regime"],
                 "adaptive_strictness": adaptive_strictness,
