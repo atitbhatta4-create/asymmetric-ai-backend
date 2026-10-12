@@ -772,7 +772,9 @@ def _compute_signal_layers(
         p["rsi_max"]      = max(50, new_rsi_max)
         p["pullback_max"] = p["pullback_max"] / max(0.5, s)
         p["vol_factor"]   = p["vol_factor"] * s
-        p["min_score"]    = min(0.90, p["min_score"] + (s - 1) * 0.12)
+        # Cap: adaptive strictness may raise min_score by at most 0.07 above base.
+        # Without the cap, 2.50× strictness pushed NEAR to 0.65 + 0.18 = 0.83 — too aggressive.
+        p["min_score"]    = min(0.70, p["min_score"] + (s - 1) * 0.12)
 
     # Apply MARGINAL regime penalty — raises min_score so only strong signals fire
     p["min_score"] = min(0.92, p["min_score"] + regime_class["min_score_penalty"])
@@ -887,6 +889,12 @@ def _compute_signal_layers(
     else:
         # Fallback to local EMAs (less reliable) — cap at 0.5
         htf_score = 0.4
+
+    # HTF timeout floor — after 12h+ of HTF blocking, caller passes a floor score
+    # so the filter gradually relaxes rather than blocking indefinitely.
+    _htf_floor = (param_overrides.get("htf_score_floor", 0.0) or 0.0) if param_overrides else 0.0
+    if _htf_floor > 0:
+        htf_score = max(htf_score, _htf_floor)
 
     # local_score = 0.0 when not aligned (was 0.4 — gave free credit even against trend).
     local_score   = 1.0 if local_aligned else 0.0
@@ -1066,20 +1074,30 @@ def _compute_signal_layers(
         momentum_score  * _w["momentum"]
     )
     total_score = round(raw_score * sess_score, 3)
-    min_score = p.get("min_score", 0.62)
+    _base_min_score = p.get("min_score", 0.62)
+    min_score = _base_min_score
 
-    # Asia / overnight session (00:00–08:00 Dubai): raise floor to Grade A conviction.
-    # Grade B setups in thin overnight hours have near-0% historical WR — require ≥0.78.
+    # Asia / overnight session (00:00–08:00 Dubai): raise floor slightly.
+    # Capped at 0.70 (was 0.78 — too aggressive, blocked valid setups for hours).
     _dubai_hour = now_dubai().hour
     _asia_floor = 0 <= _dubai_hour < 8
     if _asia_floor:
-        min_score = max(min_score, 0.78)
+        min_score = max(min_score, 0.70)
+
+    # Threshold source — logged so ops can see exactly why the threshold is what it is.
+    _thresh_source = (
+        "asia_floor"                    if _asia_floor and min_score > _base_min_score else
+        f"adaptive_x{adaptive_strictness:.2f}" if (adaptive_strictness > 1.0 and mode == "MINI_ASYM") else
+        "coin_param"                    if _base_min_score > MODE_SIGNAL_PARAMS.get(mode, {}).get("min_score", 0) else
+        "base"
+    )
 
     breakdown["session"] = {
         "label": sess_label, "quality": round(sess_score, 2),
         "raw_score": round(raw_score, 3), "ok": True, "reason": "",
         "asia_grade_a_floor": _asia_floor,
         "effective_min_score": round(min_score, 2),
+        "threshold_source": _thresh_source,
     }
     breakdown["weights"] = {**_w, "s4_active": enable_s4, "regime_type": _regime_type, "ok": True}
 

@@ -364,16 +364,15 @@ class TestComputeSignalLayers:
             assert result["grade"] == "B"
 
     def test_asia_floor_raises_min_score(self):
-        """Hour 3 (Asia/overnight): effective_min_score must be ≥ 0.78."""
+        """Hour 3: Asia floor caps at 0.70 (lowered from 0.78 — was blocking valid setups)."""
         klines = _trending_klines(260, bull=True)
         with patch("indicators.now_dubai", return_value=_fixed_dubai(3)):
             result = _compute_signal_layers(klines, mode="MINI_ASYM")
-        # Even in blocked result, Asia floor must have been applied
         breakdown = result.get("breakdown", {})
         sess = breakdown.get("session", {})
         if sess:
             assert sess.get("asia_grade_a_floor") is True
-            assert sess.get("effective_min_score", 0) >= 0.78
+            assert 0.70 <= sess.get("effective_min_score", 0) <= 0.70
 
     def test_scalp_dead_zone_is_blocked(self):
         """SCALP at hour 3 must return ok=False with SCALP_LOW_LIQ block."""
