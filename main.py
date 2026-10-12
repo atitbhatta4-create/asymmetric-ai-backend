@@ -2611,6 +2611,15 @@ class AutoRunner:
             except Exception:
                 mtf_klines = []
 
+        # Daily bias — 30 daily candles for EMA21 slope + price position check.
+        # Adds ±0.05 to direction score: agrees with daily trend = +0.05, opposes = -0.05.
+        # Blocks weak counter-trend entries (e.g. LONG when daily is bearish).
+        daily_klines: List[Dict] = []
+        try:
+            daily_klines = _fetch_klines_sync(self.symbol, "1d", limit=35, exchange=self._exchange_id)
+        except Exception:
+            daily_klines = []
+
         # ── Change 4: Global market regime ───────────────────────────────────
         _weekly_btc = self._get_weekly_btc_candles()
         _cur_adx: Optional[float] = None
@@ -2694,6 +2703,7 @@ class AutoRunner:
             higher_klines, self.trade_style, mtf_klines,
             param_overrides=_param_overrides if _param_overrides else None,
             symbol=self.symbol,
+            daily_klines=daily_klines or None,
         )
 
         # Enforce side restriction from weekly filter or parabolic regime
