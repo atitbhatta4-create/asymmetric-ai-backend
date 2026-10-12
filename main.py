@@ -2739,7 +2739,7 @@ class AutoRunner:
         self.signal_type    = res.get("signal_type", "NORMAL")
         self.sl_atr_override = res.get("sl_atr_override")
         self.tp_atr_override = res.get("tp_atr_override")
-        if res.get("signal_type") == "REVERSAL" and res.get("reversal_log"):
+        if res.get("signal_type") in ("REVERSAL", "MEAN_REVERSION") and res.get("reversal_log"):
             self.log(res["reversal_log"])
         if res.get("market_regime"):
             self.market_regime = res["market_regime"]

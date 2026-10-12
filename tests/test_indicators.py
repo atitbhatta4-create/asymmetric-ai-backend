@@ -27,6 +27,8 @@ from indicators import (
     _compute_signal_layers,
     _market_structure,
     _daily_bias,
+    _bollinger_bands,
+    _mean_reversion_signal,
 )
 
 
@@ -533,3 +535,109 @@ class TestDailyBias:
             for _ in range(10)
         ]
         assert _daily_bias(flat) == "NEUTRAL"
+
+
+# ─── Helper: build a ranging candle list (price oscillates around 100) ────────
+def _ranging_klines(n: int = 40, base: float = 100.0, amp: float = 1.0) -> List[Dict]:
+    """Candles that oscillate around `base` with amplitude `amp` — no trend."""
+    klines = []
+    import math
+    for i in range(n):
+        price = base + amp * math.sin(i * 0.5)
+        klines.append({
+            "open": price - 0.1, "close": price + 0.1,
+            "high": price + 0.3, "low": price - 0.3,
+            "volume": 80.0,
+        })
+    return klines
+
+
+class TestBollingerBands:
+
+    def test_returns_three_values(self):
+        """_bollinger_bands returns (upper, middle, lower) for 20+ candles."""
+        closes = [100.0 + i * 0.1 for i in range(25)]
+        upper, middle, lower = _bollinger_bands(closes)
+        assert upper is not None and middle is not None and lower is not None
+        assert upper > middle > lower
+
+    def test_too_few_candles_returns_none(self):
+        """Fewer than 20 closes → all None, no crash."""
+        upper, middle, lower = _bollinger_bands([100.0] * 10)
+        assert upper is None and middle is None and lower is None
+
+    def test_flat_candles_equal_middle_and_zero_std(self):
+        """All-equal closes → bands are symmetric around middle, std = 0."""
+        closes = [100.0] * 25
+        upper, middle, lower = _bollinger_bands(closes)
+        assert middle == 100.0
+        assert upper == lower == 100.0  # std=0 → no spread
+
+
+class TestMeanReversionSignal:
+
+    def _ranging_mr_klines(self, price_at_lower_bb: bool = True) -> List[Dict]:
+        """
+        Build 40 candles where price oscillates tightly (low std dev = narrow BB),
+        then on the last candle push price clearly below (or above) the band.
+        """
+        base = 100.0
+        klines = []
+        for i in range(39):
+            # Small oscillation ±0.15 around base → std ≈ 0.12 → BB ≈ base ± 0.24
+            offset = 0.15 if i % 2 == 0 else -0.15
+            p = base + offset
+            klines.append({
+                "open": p - 0.05, "close": p + 0.05,
+                "high": p + 0.1,  "low": p - 0.1,
+                "volume": 80.0,
+            })
+        # Last candle: push 1.5 below base to be clearly beyond lower BB (≈ base − 0.24)
+        if price_at_lower_bb:
+            last_price = base - 1.5
+        else:
+            last_price = base + 1.5
+        klines.append({
+            "open": last_price + 0.05, "close": last_price,
+            "high": last_price + 0.1,  "low": last_price - 0.1,
+            "volume": 80.0,
+        })
+        return klines
+
+    def test_long_fires_at_lower_band(self):
+        """Price below lower BB + RSI < 45 + ADX < 20 → LONG mean reversion."""
+        klines = self._ranging_mr_klines(price_at_lower_bb=True)
+        result = _mean_reversion_signal(klines, rsi=38.0, adx=12.0, atr=0.5)
+        assert result["ok"] is True
+        assert result["side"] == "LONG"
+        assert result["signal_type"] == "MEAN_REVERSION"
+        assert result["grade"] == "A"
+        assert result["sl_atr_override"] == 1.0
+        assert result["tp_atr_override"] >= 1.5
+
+    def test_short_fires_at_upper_band(self):
+        """Price above upper BB + RSI > 55 + ADX < 20 → SHORT mean reversion."""
+        klines = self._ranging_mr_klines(price_at_lower_bb=False)
+        result = _mean_reversion_signal(klines, rsi=62.0, adx=14.0, atr=0.5)
+        assert result["ok"] is True
+        assert result["side"] == "SHORT"
+        assert result["signal_type"] == "MEAN_REVERSION"
+        assert result["grade"] == "A"
+
+    def test_blocked_when_adx_too_high(self):
+        """ADX ≥ 20 → trending market, mean reversion must not fire."""
+        klines = self._ranging_mr_klines(price_at_lower_bb=True)
+        result = _mean_reversion_signal(klines, rsi=38.0, adx=22.0, atr=0.5)
+        assert result["ok"] is False
+
+    def test_blocked_when_rsi_wrong_side(self):
+        """Price at lower BB but RSI ≥ 45 → signal is not a reversion setup."""
+        klines = self._ranging_mr_klines(price_at_lower_bb=True)
+        result = _mean_reversion_signal(klines, rsi=55.0, adx=12.0, atr=0.5)
+        assert result["ok"] is False
+
+    def test_too_few_klines_safe(self):
+        """Fewer than 25 candles → ok=False, no crash."""
+        klines = self._ranging_mr_klines(price_at_lower_bb=True)[:10]
+        result = _mean_reversion_signal(klines, rsi=38.0, adx=12.0, atr=0.5)
+        assert result["ok"] is False
