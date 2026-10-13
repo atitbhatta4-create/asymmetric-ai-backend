@@ -1197,6 +1197,7 @@ class AutoRunner:
         self.last_breakdown: Dict = {}
         self.last_score: float = 0.0
         self.last_atr_pct: float = 0.01   # fallback 1% ATR until first signal
+        self.last_adx: float = 0.0        # ADX at last signal — stored in trade dict
         self.market_grade: str = "-"
         self.signal_type: str = "NORMAL"  # "NORMAL" or "REVERSAL" (T16)
         self.sl_atr_override: Optional[float] = None   # T16 reversal uses 1.5
@@ -1895,6 +1896,23 @@ class AutoRunner:
             (side == "SHORT" and candle_low  <= tp_price)
         )
 
+        # ── Beyond-TP trail: activate instead of closing at TP ───────────
+        # First time price exceeds TP → switch to ATR-based trailing mode.
+        # Subsequent candles with intrabar_tp=True → still suppress close.
+        if intrabar_tp:
+            if not pt.get("tp_trail_active"):
+                pt["tp_trail_active"] = True
+                _p0 = (candle_high if side == "LONG"
+                       else candle_low if candle_high > 0 else tp_price)
+                pt["tp_trail_peak"] = _p0
+                self.log(
+                    f"BEYOND-TP TRAIL: {side} @ {entry:.4f} exceeded TP "
+                    f"({tp_price:.4f}). Trailing instead of closing. "
+                    f"ADX={pt.get('adx_at_open', 0):.1f} → "
+                    f"trail={'1.5×' if pt.get('adx_at_open', 0) >= 35 else '1.0×'}ATR"
+                )
+            intrabar_tp = False  # never close at fixed TP — trail instead
+
         # ── Progressive trailing stop ─────────────────────────────────────
         # Simulates a real trailing stop using intrabar high/low:
         #   Price reaches 40% of TP  → SL trails to break-even (entry)
@@ -1951,13 +1969,52 @@ class AutoRunner:
                 sl_price = entry * (1 - trail_locked_pct)
             sl_pct = trail_locked_pct  # effective SL distance from entry
 
+        # ── Beyond-TP trail stop check ────────────────────────────────────
+        # Runs each candle while tp_trail_active. Updates peak, checks if
+        # ATR-based trail stop was hit (1.0× ATR normal, 1.5× ADX ≥ 35).
+        _beyond_tp_triggered = False
+        if pt.get("tp_trail_active"):
+            _atr_val = float(atr) if atr else 0.0
+            if _atr_val > 0:
+                _adx_open   = float(pt.get("adx_at_open", 25.0))
+                _trail_mult = 1.5 if _adx_open >= 35.0 else 1.0
+                # Ratchet peak upward (LONG) or downward (SHORT)
+                if candle_high > 0:
+                    if side == "LONG":
+                        pt["tp_trail_peak"] = max(float(pt.get("tp_trail_peak", tp_price)), candle_high)
+                    else:
+                        pt["tp_trail_peak"] = min(float(pt.get("tp_trail_peak", tp_price)), candle_low)
+                _tp_peak = float(pt["tp_trail_peak"])
+                if side == "LONG":
+                    _beyond_sl = max(_tp_peak * (1.0 - _trail_mult * _atr_val),
+                                     entry * (1.0 + tp_pct))  # floor at original TP
+                    _hit = ((candle_high > 0 and candle_low <= _beyond_sl)
+                            or exit_price <= _beyond_sl)
+                    if _hit:
+                        final_move = max((_beyond_sl - entry) / entry, tp_pct)
+                else:
+                    _beyond_sl = min(_tp_peak * (1.0 + _trail_mult * _atr_val),
+                                     entry * (1.0 - tp_pct))
+                    _hit = ((candle_high > 0 and candle_high >= _beyond_sl)
+                            or exit_price >= _beyond_sl)
+                    if _hit:
+                        final_move = max((entry - _beyond_sl) / entry, tp_pct)
+                if _hit:
+                    outcome = "TRAIL_STOP"
+                    _beyond_tp_triggered = True
+                    self.log(
+                        f"BEYOND-TP TRAIL STOP: {side} @ {entry:.4f} | "
+                        f"peak {_tp_peak:.4f} | trail_SL {_beyond_sl:.4f} | "
+                        f"profit +{final_move*100:.2f}% (vs fixed TP +{tp_pct*100:.2f}%)"
+                    )
+
         # SL and TP both touched in same candle → TP wins if trailing activated
         # (trade moved to profit first), otherwise SL wins (worst case)
-        if intrabar_sl and intrabar_tp:
+        if not _beyond_tp_triggered and intrabar_sl and intrabar_tp:
             intrabar_tp = trailing_activated  # trailing means TP is more likely
             intrabar_sl = not trailing_activated
 
-        if intrabar_sl:
+        if not _beyond_tp_triggered and intrabar_sl:
             if trailing_activated:
                 # Trailing SL hit — price went up past the lock-in level then pulled back.
                 # Exit at the locked-in profit level, NOT at a loss.
@@ -1966,10 +2023,10 @@ class AutoRunner:
             else:
                 final_move = -sl_pct
                 outcome = "SL_HIT"
-        elif intrabar_tp:
+        elif not _beyond_tp_triggered and intrabar_tp:
             final_move = tp_pct
             outcome = "TP_HIT"
-        else:
+        elif not _beyond_tp_triggered:
             # No intrabar trigger — use actual close price
             raw_move = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
             if trailing_activated and raw_move < trail_locked_pct:
@@ -1979,7 +2036,7 @@ class AutoRunner:
             elif raw_move <= -sl_pct:
                 final_move = -sl_pct
                 outcome = "SL_HIT"
-            elif raw_move >= tp_pct:
+            elif raw_move >= tp_pct and not pt.get("tp_trail_active"):
                 final_move = tp_pct
                 outcome = "TP_HIT"
             else:
@@ -2122,7 +2179,7 @@ class AutoRunner:
         elif outcome == "TP_HIT":
             actual_exit = entry * (1 + tp_pct) if side == "LONG" else entry * (1 - tp_pct)
         elif outcome == "TRAIL_STOP":
-            actual_exit = entry * (1 + trail_locked_pct) if side == "LONG" else entry * (1 - trail_locked_pct)
+            actual_exit = entry * (1 + final_move) if side == "LONG" else entry * (1 - final_move)
         else:
             actual_exit = exit_price
 
@@ -2629,6 +2686,7 @@ class AutoRunner:
             _highs  = [k["high"]  for k in klines]
             _lows   = [k["low"]   for k in klines]
             _cur_adx = _adx_fn(_highs, _lows, _closes, 14)
+        self.last_adx = _cur_adx or 0.0
         self.global_regime, self.is_parabolic = get_market_regime(
             _weekly_btc, _cur_adx or 0.0, self.is_parabolic
         )
@@ -3718,6 +3776,7 @@ class AutoRunner:
                             "score_open":     self.last_score,
                             "regime_open":    self.market_regime,
                             "atr_pct_open":   self.last_atr_pct,
+                            "adx_at_open":    self.last_adx,
                         }
                         if grade == "B":
                             self.pending_trades = [
@@ -3864,6 +3923,7 @@ class AutoRunner:
                             "score_open":  self.last_score,
                             "regime_open": self.market_regime,
                             "atr_pct_open": self.last_atr_pct,
+                            "adx_at_open":  self.last_adx,
                         }
                         _mtf_label = "" if res.get("mtf_confirmed", True) else f" | 15m unconfirmed→size {_mtf_sm*100:.0f}%"
                         if grade == "B":
