@@ -1905,11 +1905,17 @@ class AutoRunner:
                 _p0 = (candle_high if side == "LONG"
                        else candle_low if candle_high > 0 else tp_price)
                 pt["tp_trail_peak"] = _p0
+                _trail_dist_label = "1.5×ATR" if pt.get("adx_at_open", 0) >= 35 else "1.0×ATR"
                 self.log(
                     f"BEYOND-TP TRAIL: {side} @ {entry:.4f} exceeded TP "
                     f"({tp_price:.4f}). Trailing instead of closing. "
-                    f"ADX={pt.get('adx_at_open', 0):.1f} → "
-                    f"trail={'1.5×' if pt.get('adx_at_open', 0) >= 35 else '1.0×'}ATR"
+                    f"ADX={pt.get('adx_at_open', 0):.1f} → trail={_trail_dist_label}"
+                )
+                _tg_alert(
+                    f"🚀 <b>Beyond-TP Trail activated</b>\n"
+                    f"{self.email} | {self.symbol} {side}\n"
+                    f"TP exceeded → now trailing ({_trail_dist_label})\n"
+                    f"Entry <b>{entry:.4f}</b> | TP was <b>{tp_price:.4f}</b>"
                 )
             intrabar_tp = False  # never close at fixed TP — trail instead
 
@@ -2002,10 +2008,18 @@ class AutoRunner:
                 if _hit:
                     outcome = "TRAIL_STOP"
                     _beyond_tp_triggered = True
+                    _bonus_pct = (final_move - tp_pct) * 100
                     self.log(
                         f"BEYOND-TP TRAIL STOP: {side} @ {entry:.4f} | "
                         f"peak {_tp_peak:.4f} | trail_SL {_beyond_sl:.4f} | "
                         f"profit +{final_move*100:.2f}% (vs fixed TP +{tp_pct*100:.2f}%)"
+                    )
+                    _tg_alert(
+                        f"🎯 <b>Beyond-TP Trail closed</b>\n"
+                        f"{self.email} | {self.symbol} {side}\n"
+                        f"Profit <b>+{final_move*100:.2f}%</b> price move\n"
+                        f"Fixed TP was +{tp_pct*100:.2f}% → extra <b>+{_bonus_pct:.2f}%</b> captured\n"
+                        f"Peak {_tp_peak:.4f} | Trail stop {_beyond_sl:.4f}"
                     )
 
         # SL and TP both touched in same candle → TP wins if trailing activated
