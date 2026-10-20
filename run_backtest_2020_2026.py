@@ -25,6 +25,7 @@ from config import DUBAI_TZ, TRADE_STYLE_PARAMS
 from indicators import (
     _compute_signal_layers, _adx as _adx_fn,
     get_market_regime, check_pullback_entry, check_volume_hour_confirmed,
+    _candle_pattern, get_pattern_exec_params,
 )
 from coin_params import get_coin_params
 from mode_params import get_mode_config, get_style_config
@@ -48,6 +49,7 @@ ENABLE_CANDLE_PAT     = False  # Full candle pattern system — REJECTED (Sharpe
 ENABLE_WEEKLY_GATE    = False  # Fix 1: weekly EMA9 slope gate — REJECTED (2022 got worse -$125)
 ENABLE_FIX2           = False  # Fix 2: ADX floor 16→20 — DEPLOYED to indicators.py (adx_min=20 is now baseline)
 ENABLE_MR_4H_GATE     = False  # Fix 3: MR 4h direction gate — DEPLOYED (enable_mr_4h_gate=True in main.py)
+ENABLE_PAT_EXEC       = False  # Fix 4: pattern-adjusted execution (size + trail by entry candle pattern)
 
 MODE_PRESETS = {"MINI_ASYM": {"size": 0.65, "leverage": 6}}
 FEE  = {"maker": 0.00020, "taker": 0.00055, "slip": 0.00025}
@@ -195,7 +197,8 @@ def check_exit(trade: Dict, candle: Dict) -> Optional[Dict]:
                 _tp_peak    = float(trade["tp_trail_peak"])
                 _atr        = float(trade.get("atr_pct", 0.009))
                 _adx_open   = float(trade.get("adx_at_open", 25.0))
-                _trail_mult = 1.5 if _adx_open >= 35.0 else 1.0
+                _pat_ovr    = float(trade.get("pat_trail_mult", 0.0))
+                _trail_mult = _pat_ovr if _pat_ovr > 0.0 else (1.5 if _adx_open >= 35.0 else 1.0)
                 if side == "LONG":
                     _beyond_sl = max(_tp_peak * (1.0 - _trail_mult * _atr), tp_p2)
                     _trail_hit = lo <= _beyond_sl
@@ -371,16 +374,17 @@ def simulate(main_c: List[Dict], higher_c: List[Dict], weekly_c: List[Dict] = No
             sl_pct   = min(atr_pct * _sl_atr, ST["sl_max"] / 100)
             tp_pct   = min(max(sl_pct * 1.5, atr_pct * _tp_atr), ST["tp_max"] / 100)
             eff_size = c["size"] if grade == "A" else c["size"] * 0.70
-            # Fix 4: only scale UP on strong-trend NORMAL signals — never cut MR trades
-            if ENABLE_FIX4 and signal_type == "NORMAL" and cur_adx > 0:
-                _adx_sm = (1.25 if cur_adx < 50 else 1.50) if cur_adx >= 35 else 1.0
-                eff_size *= _adx_sm
+            pat_trail = 0.0
+            if ENABLE_PAT_EXEC:
+                _psm, pat_trail, sl_pct = get_pattern_exec_params(klines, desired_side, sl_pct, atr_pct)
+                eff_size = eff_size * _psm
             open_trade = {
                 "side": desired_side, "entry": candle["close"],
                 "sl_pct": sl_pct, "tp_pct": tp_pct,
                 "leverage": c["leverage"], "effective_size": eff_size,
                 "equity_at_open": equity, "signal_type": signal_type,
                 "atr_pct": atr_pct, "adx_at_open": cur_adx,
+                "pat_trail_mult": pat_trail,
             }
             continue
 
@@ -413,10 +417,10 @@ def simulate(main_c: List[Dict], higher_c: List[Dict], weekly_c: List[Dict] = No
         sl_pct  = min(atr_pct * ST["sl_atr"], ST["sl_max"] / 100)
         tp_pct  = min(max(sl_pct * 1.5, atr_pct * ST["tp_atr"]), ST["tp_max"] / 100)
         eff_size = c["size"] if grade == "A" else c["size"] * 0.70
-        # Fix 4: only scale UP on strong-trend NORMAL signals
-        if ENABLE_FIX4 and signal_type == "NORMAL" and cur_adx > 0:
-            _adx_sm = (1.25 if cur_adx < 50 else 1.50) if cur_adx >= 35 else 1.0
-            eff_size *= _adx_sm
+        pat_trail = 0.0
+        if ENABLE_PAT_EXEC:
+            _psm, pat_trail, sl_pct = get_pattern_exec_params(klines, desired_side, sl_pct, atr_pct)
+            eff_size = eff_size * _psm
 
         open_trade = {
             "side": desired_side, "entry": candle["close"],
@@ -424,6 +428,7 @@ def simulate(main_c: List[Dict], higher_c: List[Dict], weekly_c: List[Dict] = No
             "leverage": c["leverage"], "effective_size": eff_size,
             "equity_at_open": equity, "signal_type": signal_type,
             "atr_pct": atr_pct, "adx_at_open": cur_adx,
+            "pat_trail_mult": pat_trail,
         }
 
     print(f"\r  Simulation complete — {len(trades)} trades        ")
@@ -613,7 +618,7 @@ def print_ab(label_a, label_b, stats_a, stats_b, t_a, t_b, yr_a, yr_b, result_b,
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    global ENABLE_TRAIL, ENABLE_CANDLE_PAT, ENABLE_WEEKLY_GATE, ENABLE_FIX2, ENABLE_MR_4H_GATE
+    global ENABLE_TRAIL, ENABLE_CANDLE_PAT, ENABLE_WEEKLY_GATE, ENABLE_FIX2, ENABLE_MR_4H_GATE, ENABLE_PAT_EXEC
 
     print("\n" + "=" * 68)
     print("  Asymmetric AI — A/B Backtest: BTCUSDT 1h  Jan 2020 → Oct 2026")
@@ -626,18 +631,19 @@ def main():
     years = (END_MS - START_MS) / (1000 * 60 * 60 * 24 * 365.25)
     print(f"  Data range: {total_candles:,} active candles | {years:.1f} years")
 
-    # ── Run A: current baseline (MR 4h gate OFF) ─────────────────────
-    print(f"\nStep 2a — Baseline (adx_min=20, MR 4h gate OFF)...")
-    ENABLE_MR_4H_GATE = False
+    # ── Run A: current baseline (Fix 3 deployed, pat exec OFF) ───────
+    print(f"\nStep 2a — Baseline (Fix 3 deployed, pat exec OFF)...")
+    ENABLE_MR_4H_GATE = True   # Fix 3 is deployed
+    ENABLE_PAT_EXEC   = False
     t0       = time.time()
     result_a = simulate(main_c, higher_c, weekly_c)
     t_a      = time.time() - t0
     stats_a  = compute_stats(result_a)
     yr_a     = year_summary(result_a["year_trades"])
 
-    # ── Run B: Fix 3 ON (MR 4h gate) ─────────────────────────────────
-    print(f"\nStep 2b — Fix 3 (MR 4h direction gate ON)...")
-    ENABLE_MR_4H_GATE = True
+    # ── Run B: Fix 4 ON (pattern-adjusted execution) ──────────────────
+    print(f"\nStep 2b — Fix 4 (pattern-adjusted execution ON)...")
+    ENABLE_PAT_EXEC = True
     t0       = time.time()
     result_b = simulate(main_c, higher_c, weekly_c)
     t_b      = time.time() - t0
@@ -645,8 +651,8 @@ def main():
     yr_b     = year_summary(result_b["year_trades"])
 
     print_ab(
-        "Baseline (MR gate OFF)",
-        "Fix 3 (MR 4h gate ON)",
+        "Baseline (Fix 3, pat exec OFF)",
+        "Fix 4 (pattern-adjusted execution)",
         stats_a, stats_b, t_a, t_b, yr_a, yr_b, result_b,
     )
 

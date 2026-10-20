@@ -368,6 +368,44 @@ def _candle_pattern(
     return "against_trend", 0.10
 
 
+_PAT_SIZE_MULT: Dict[str, float] = {
+    "three_white_soldiers": 1.00, "three_black_crows":    1.00,
+    "engulfing":            1.00,
+    "hammer":               1.00, "shooting_star":        1.00,
+    "momentum":             0.90,
+    "bullish":              0.80, "bearish":              0.80,
+    "inside_bar_breakout":  0.80, "inside_bar_breakdown": 0.80,
+    "micro":                0.70,
+    "doji":                 0.75, "none":                 0.75,
+}
+_PAT_TRAIL_STRONG = {"three_white_soldiers", "three_black_crows"}
+
+
+def get_pattern_exec_params(
+    klines: List[Dict], side: str, sl_pct: float, atr_pct: float
+) -> tuple:
+    """
+    Returns (size_mult, trail_mult, adj_sl_pct) from entry candle pattern.
+    trail_mult: 1.5 for strong patterns, 0.0 = use ADX-based default.
+    Shared by live engine and backtester — zero divergence.
+    """
+    pat_name, _ = _candle_pattern(klines, side)
+    size_mult  = _PAT_SIZE_MULT.get(pat_name, 0.75)
+    trail_mult = 1.5 if pat_name in _PAT_TRAIL_STRONG else 0.0
+
+    adj_sl = sl_pct
+    if pat_name in ("hammer", "shooting_star") and len(klines) >= 1:
+        entry = klines[-1]["close"]
+        if side == "LONG":
+            wick_dist = (entry - klines[-1]["low"]) / entry
+        else:
+            wick_dist = (klines[-1]["high"] - entry) / entry
+        wick_dist = min(wick_dist, atr_pct * 2.0)
+        adj_sl = max(wick_dist, sl_pct * 0.5)
+
+    return size_mult, trail_mult, adj_sl
+
+
 def _candle_structure_check(klines: List[Dict], side: str) -> tuple:
     """
     Compares the last closed candle's body against the 3–4 prior opposing candles.
