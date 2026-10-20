@@ -41,6 +41,7 @@ from indicators import (
     _classify_regime, _compute_signal_layers,
     get_market_regime, check_weekly_trend,
     check_pullback_entry, check_volume_hour_confirmed,
+    get_pattern_exec_params,
 )
 from coin_params import get_coin_params
 from mode_params import get_mode_config, get_style_config
@@ -1984,7 +1985,8 @@ class AutoRunner:
             _atr_val = float(atr) if atr else 0.0
             if _atr_val > 0:
                 _adx_open   = float(pt.get("adx_at_open", 25.0))
-                _trail_mult = 1.5 if _adx_open >= 35.0 else 1.0
+                _pat_ovr    = float(pt.get("pat_trail_mult", 0.0))
+                _trail_mult = _pat_ovr if _pat_ovr > 0.0 else (1.5 if _adx_open >= 35.0 else 1.0)
                 # Ratchet peak upward (LONG) or downward (SHORT)
                 if candle_high > 0:
                     if side == "LONG":
@@ -3590,6 +3592,7 @@ class AutoRunner:
                 self.candles_since_signal += 1
 
                 _strong_trend_entry = False
+                _pb_klines = None
                 if _style_cfg_pb.get("pullback_required", True):
                     _pb_klines = _fetch_klines_sync(self.symbol, self.tf, limit=50, exchange=self._exchange_id)
                     _cp_pb = get_coin_params(self.symbol)
@@ -3671,6 +3674,15 @@ class AutoRunner:
                     sl_pct_open = min(self.last_atr_pct * _sl_atr, st["sl_max"] / 100.0)
                     tp_pct_open = min(self.last_atr_pct * _tp_atr, st["tp_max"] / 100.0)
 
+                    _pat_size_mult, _pat_trail_mult = 1.0, 0.0
+                    if _pb_klines is not None and self.last_atr_pct:
+                        _psm, _ptm, _adj_sl = get_pattern_exec_params(
+                            _pb_klines, desired_side, sl_pct_open, self.last_atr_pct
+                        )
+                        _pat_size_mult  = _psm
+                        _pat_trail_mult = _ptm
+                        sl_pct_open     = _adj_sl
+
                     if REAL_TRADING:
                         real_bal = get_real_usdt_balance(self.email, force=True)
                         if real_bal is None:
@@ -3725,12 +3737,12 @@ class AutoRunner:
                                     _fr_abs   = abs(_fr)
                                     _fund_mult = 0.50 if _fr_abs >= 0.003 else 0.70
                                     self.log(f"Funding rate {_fr*100:.4f}%/8h against {desired_side} — size × {_fund_mult:.2f}")
-                            size_pct  = float(c["size"]) * _mtf_sm * _vol_sm * _dd_sm * _btc_mult * _fund_mult
+                            size_pct  = float(c["size"]) * _mtf_sm * _vol_sm * _dd_sm * _btc_mult * _fund_mult * _pat_size_mult
                             usdt_size = equity_now * size_pct
                             self.log(
                                 f"REAL ORDER SIZE: base={float(c['size'])*100:.0f}% "
-                                f"× mtf={_mtf_sm:.2f} × vol={_vol_sm:.2f} × dd={_dd_sm:.2f}"
-                                f"× btc={_btc_mult:.2f} × fund={_fund_mult:.2f} "
+                                f"× mtf={_mtf_sm:.2f} × vol={_vol_sm:.2f} × dd={_dd_sm:.2f} "
+                                f"× btc={_btc_mult:.2f} × fund={_fund_mult:.2f} × pat={_pat_size_mult:.2f} "
                                 f"= {size_pct*100:.1f}% → ${usdt_size:.2f}"
                             )
                             if grade == "B":
@@ -3798,6 +3810,7 @@ class AutoRunner:
                             "regime_open":    self.market_regime,
                             "atr_pct_open":   self.last_atr_pct,
                             "adx_at_open":    self.last_adx,
+                            "pat_trail_mult": _pat_trail_mult,
                         }
                         if grade == "B":
                             self.pending_trades = [
@@ -3945,19 +3958,20 @@ class AutoRunner:
                             "regime_open": self.market_regime,
                             "atr_pct_open": self.last_atr_pct,
                             "adx_at_open":  self.last_adx,
+                            "pat_trail_mult": _pat_trail_mult,
                         }
                         _mtf_label = "" if res.get("mtf_confirmed", True) else f" | 15m unconfirmed→size {_mtf_sm*100:.0f}%"
                         if grade == "B":
                             self.pending_trades = [
-                                {**base_trade, "grade": "B", "size_mult": round(0.60 * _mtf_sm, 4), "tp_mult": 1.00,
+                                {**base_trade, "grade": "B", "size_mult": round(0.60 * _mtf_sm * _pat_size_mult, 4), "tp_mult": 1.00,
                                  "is_primary": True,  "label": "T1"},
-                                {**base_trade, "grade": "B", "size_mult": round(0.40 * _mtf_sm, 4), "tp_mult": 1.00,
+                                {**base_trade, "grade": "B", "size_mult": round(0.40 * _mtf_sm * _pat_size_mult, 4), "tp_mult": 1.00,
                                  "is_primary": False, "label": "T2", "breakeven_after_t1": True},
                             ]
                             self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}{_mtf_label}")
                         else:
                             # Scaling enabled: open at 70% to allow scale-ins. Builds to 100% on winners.
-                            _grade_a_sm = round((0.70 if self._scaling_enabled else 1.00) * _mtf_sm, 4)
+                            _grade_a_sm = round((0.70 if self._scaling_enabled else 1.00) * _mtf_sm * _pat_size_mult, 4)
                             _scale_label = " | scaling: entry 70%" if self._scaling_enabled else ""
                             self.pending_trades = [
                                 {**base_trade, "grade": "A", "size_mult": _grade_a_sm, "tp_mult": 1.00,
