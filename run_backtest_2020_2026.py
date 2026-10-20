@@ -47,6 +47,7 @@ ENABLE_FIX3           = False  # entry body gate — REJECTED (killed avg win)
 ENABLE_CANDLE_PAT     = False  # Full candle pattern system — REJECTED (Sharpe -0.23 vs -0.16 baseline)
 ENABLE_WEEKLY_GATE    = False  # Fix 1: weekly EMA9 slope gate — REJECTED (2022 got worse -$125)
 ENABLE_FIX2           = False  # Fix 2: ADX floor 16→20 — DEPLOYED to indicators.py (adx_min=20 is now baseline)
+ENABLE_MR_4H_GATE     = False  # Fix 3: MR 4h direction gate — DEPLOYED (enable_mr_4h_gate=True in main.py)
 
 MODE_PRESETS = {"MINI_ASYM": {"size": 0.65, "leverage": 6}}
 FEE  = {"maker": 0.00020, "taker": 0.00055, "slip": 0.00025}
@@ -340,6 +341,7 @@ def simulate(main_c: List[Dict], higher_c: List[Dict], weekly_c: List[Dict] = No
             candle_ts_ms=candle["t"],
             weekly_klines=weekly_slice,
             enable_weekly_gate=ENABLE_WEEKLY_GATE,
+            enable_mr_4h_gate=ENABLE_MR_4H_GATE,
         )
 
         if _allowed_sides and sig.get("ok") and sig.get("side") not in _allowed_sides:
@@ -611,7 +613,7 @@ def print_ab(label_a, label_b, stats_a, stats_b, t_a, t_b, yr_a, yr_b, result_b,
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    global ENABLE_TRAIL, ENABLE_CANDLE_PAT, ENABLE_WEEKLY_GATE, ENABLE_FIX2
+    global ENABLE_TRAIL, ENABLE_CANDLE_PAT, ENABLE_WEEKLY_GATE, ENABLE_FIX2, ENABLE_MR_4H_GATE
 
     print("\n" + "=" * 68)
     print("  Asymmetric AI — A/B Backtest: BTCUSDT 1h  Jan 2020 → Oct 2026")
@@ -624,19 +626,18 @@ def main():
     years = (END_MS - START_MS) / (1000 * 60 * 60 * 24 * 365.25)
     print(f"  Data range: {total_candles:,} active candles | {years:.1f} years")
 
-    # ── Run A: current baseline (Fix 2 OFF, adx_min=16) ──────────────
-    print(f"\nStep 2a — Current (adx_min=16)...")
-    ENABLE_FIX2 = False
+    # ── Run A: current baseline (MR 4h gate OFF) ─────────────────────
+    print(f"\nStep 2a — Baseline (adx_min=20, MR 4h gate OFF)...")
+    ENABLE_MR_4H_GATE = False
     t0       = time.time()
     result_a = simulate(main_c, higher_c, weekly_c)
     t_a      = time.time() - t0
     stats_a  = compute_stats(result_a)
     yr_a     = year_summary(result_a["year_trades"])
-    buckets  = adx_bucket_stats(result_a)
 
-    # ── Run B: Fix 2 ON (adx_min=20) ─────────────────────────────────
-    print(f"\nStep 2b — Fix 2 (adx_min=20)...")
-    ENABLE_FIX2 = True
+    # ── Run B: Fix 3 ON (MR 4h gate) ─────────────────────────────────
+    print(f"\nStep 2b — Fix 3 (MR 4h direction gate ON)...")
+    ENABLE_MR_4H_GATE = True
     t0       = time.time()
     result_b = simulate(main_c, higher_c, weekly_c)
     t_b      = time.time() - t0
@@ -644,10 +645,9 @@ def main():
     yr_b     = year_summary(result_b["year_trades"])
 
     print_ab(
-        "Current (adx_min=16)",
-        "Fix 2 (adx_min=20)",
+        "Baseline (MR gate OFF)",
+        "Fix 3 (MR 4h gate ON)",
         stats_a, stats_b, t_a, t_b, yr_a, yr_b, result_b,
-        adx_buckets=buckets,
     )
 
 
