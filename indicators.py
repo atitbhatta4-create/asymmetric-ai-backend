@@ -601,8 +601,37 @@ def _bollinger_bands(closes: List[float], period: int = 20, std_dev: float = 2.0
     return middle + std_dev * std, middle, middle - std_dev * std
 
 
+def get_4h_trend_direction(candles_4h: List[Dict]) -> str:
+    """
+    Returns 'BULLISH', 'BEARISH', or 'NEUTRAL' based on 4h EMA9 vs EMA21.
+
+    BULLISH:  EMA9 above EMA21 AND EMA9 slope rising (both agree → clear uptrend)
+    BEARISH:  EMA9 below EMA21 AND EMA9 slope falling (both agree → clear downtrend)
+    NEUTRAL:  mixed (EMA9 above but falling, or below but rising) → no clear bias
+
+    Used by MR direction gate: NEUTRAL allows both LONG and SHORT MR to fire.
+    Single implementation shared by live engine and backtester — no divergence.
+    """
+    if len(candles_4h) < 21:
+        return "NEUTRAL"
+    closes    = [k["close"] for k in candles_4h]
+    ema9      = _ema(closes,      9)
+    ema21     = _ema(closes,     21)
+    ema9_prev = _ema(closes[:-1], 9)
+    if len(ema9) < 1 or len(ema21) < 1 or len(ema9_prev) < 1:
+        return "NEUTRAL"
+    ema_aligned = ema9[-1]  > ema21[-1]
+    ema_rising  = ema9[-1]  > ema9_prev[-1]
+    if ema_aligned and ema_rising:
+        return "BULLISH"
+    if not ema_aligned and not ema_rising:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
 def _mean_reversion_signal(
-    klines: List[Dict], rsi: Optional[float], adx: Optional[float], atr: Optional[float]
+    klines: List[Dict], rsi: Optional[float], adx: Optional[float], atr: Optional[float],
+    trend_4h: str = "NEUTRAL",
 ) -> Dict:
     """
     Mean Reversion — fires when price touches a Bollinger Band in a ranging market.
@@ -613,6 +642,10 @@ def _mean_reversion_signal(
       2. Price at or beyond Bollinger Band (20-period, 2 std dev)
       3. RSI < 45 for LONG, RSI > 55 for SHORT
       4. Volume ≥ 0.5× median (market is active, not dead)
+      5. [Optional] trend_4h must not oppose the MR direction — blocks catching falling knives
+         LONG MR blocked if trend_4h == "BEARISH" (selling into 4h downtrend)
+         SHORT MR blocked if trend_4h == "BULLISH" (selling into 4h uptrend)
+         NEUTRAL 4h → both directions allowed
 
     TP: middle Bollinger Band (20-period SMA), expressed as ATR multiples
     SL: 1.0× ATR beyond entry (tight — ranging markets don't run far)
@@ -637,6 +670,14 @@ def _mean_reversion_signal(
     if not (long_signal or short_signal):
         return {"ok": False}
     side = "LONG" if long_signal else "SHORT"
+
+    # 4h direction gate: block counter-trend MR when 4h has a clear opposing trend.
+    # LONG into 4h BEARISH = catching a falling knife. SHORT into 4h BULLISH = selling strength.
+    # NEUTRAL 4h = no clear bias, both directions allowed.
+    if side == "LONG"  and trend_4h == "BEARISH":
+        return {"ok": False, "blocked": "MR_LONG blocked: 4h bearish — catching falling knife"}
+    if side == "SHORT" and trend_4h == "BULLISH":
+        return {"ok": False, "blocked": "MR_SHORT blocked: 4h bullish — selling into strength"}
 
     if side == "LONG"  and rsi >= 45:
         return {"ok": False}
@@ -792,6 +833,7 @@ def _compute_signal_layers(
     candle_ts_ms: Optional[int] = None,
     weekly_klines: Optional[List[Dict]] = None,
     enable_weekly_gate: bool = False,
+    enable_mr_4h_gate: bool = False,
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -851,7 +893,8 @@ def _compute_signal_layers(
     # system would reject. If regime would block AND reversal conditions are met,
     # return the reversal signal instead of BLOCKED.
     _rev = _reversal_signal(klines, rsi, adx, atr) if enable_t16 else {"ok": False}
-    _mr  = _mean_reversion_signal(klines, rsi, adx, atr)
+    _trend_4h = get_4h_trend_direction(higher_klines or []) if enable_mr_4h_gate else "NEUTRAL"
+    _mr  = _mean_reversion_signal(klines, rsi, adx, atr, trend_4h=_trend_4h)
 
     # ── Phase 4: Regime classification (before any layer scoring) ────────────
     regime_class = _classify_regime(highs, lows, closes, adx, atr_pct, _atr_slow_pct=_atr_slow_pct_pc)

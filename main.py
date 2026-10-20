@@ -1216,6 +1216,7 @@ class AutoRunner:
         self.candles_since_signal: int = 0        # candles elapsed since signal fired
         self.pending_signal_score: float = 0.0    # original signal score (for logging)
         self.pending_signal_side: str = ""
+        self.pending_strong_trend_override: bool = False  # extends pullback timeout to 6
 
         # ── Change 7: Economic calendar cache ────────────────────────────────
         self._calendar_cache: List[Dict] = []
@@ -2776,6 +2777,7 @@ class AutoRunner:
             param_overrides=_param_overrides if _param_overrides else None,
             symbol=self.symbol,
             daily_klines=daily_klines or None,
+            enable_mr_4h_gate=True,
         )
 
         # Enforce side restriction from weekly filter or parabolic regime
@@ -3570,9 +3572,11 @@ class AutoRunner:
                     self.signal_pending = True
                     self.pending_signal_side = desired_side
                     self.pending_signal_score = res.get("score", 0.0)
+                    self.pending_strong_trend_override = res.get("strong_trend_override", False)
                     self.candles_since_signal = 0
+                    _sto_label = " | STRONG TREND override (6-candle window)" if self.pending_strong_trend_override else ""
                     self.log(
-                        f"Signal armed — {desired_side} score={self.pending_signal_score:.2f}"
+                        f"Signal armed — {desired_side} score={self.pending_signal_score:.2f} pattern={res.get('candle_pattern','?')}{_sto_label}"
                         + (" | entering immediately (pullback disabled)" if not _style_cfg_pb.get("pullback_required") else " | awaiting pullback")
                     )
                 elif self.pending_signal_side != desired_side:
@@ -3580,6 +3584,7 @@ class AutoRunner:
                     self.log(f"Direction changed {self.pending_signal_side}→{desired_side} — re-arming signal.")
                     self.pending_signal_side = desired_side
                     self.pending_signal_score = res.get("score", 0.0)
+                    self.pending_strong_trend_override = res.get("strong_trend_override", False)
                     self.candles_since_signal = 0
 
                 self.candles_since_signal += 1
@@ -3592,6 +3597,7 @@ class AutoRunner:
                         _pb_klines, self.pending_signal_side, _cp_pb,
                         self.global_regime, self.candles_since_signal,
                         trade_style=self.trade_style,
+                        strong_trend_override=self.pending_strong_trend_override,
                     )
 
                     if _pb_result == "TIMEOUT":
@@ -3603,6 +3609,7 @@ class AutoRunner:
                         self.signal_pending = False
                         self.pending_signal_side = ""
                         self.pending_signal_score = 0.0
+                        self.pending_strong_trend_override = False
                         self.candles_since_signal = 0
                         continue
 
