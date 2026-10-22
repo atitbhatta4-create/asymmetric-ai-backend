@@ -50,6 +50,11 @@ ENABLE_WEEKLY_GATE    = False  # Fix 1: weekly EMA9 slope gate — REJECTED (202
 ENABLE_FIX2           = False  # Fix 2: ADX floor 16→20 — DEPLOYED to indicators.py (adx_min=20 is now baseline)
 ENABLE_MR_4H_GATE     = False  # Fix 3: MR 4h direction gate — DEPLOYED (enable_mr_4h_gate=True in main.py)
 ENABLE_PAT_EXEC       = False  # Fix 4: pattern-adjusted execution (size + trail by entry candle pattern)
+# Test 6 — T18 MR exemption (model T18 as 70% Grade A; test MR at 100%)
+ENABLE_T18            = False  # when True: all Grade A enters at 70% (T18 model)
+T18_MR_EXEMPT         = False  # when True: MR/REVERSAL Grade A bypasses T18 → 100% size
+# Test 7 — Choppy market trail delay
+ENABLE_CHOPPY_TRAIL   = False  # when True: trail activates at 3× TP (not 2×) in RANGING/CHOPPY regime
 
 MODE_PRESETS = {"MINI_ASYM": {"size": 0.65, "leverage": 6}}
 FEE  = {"maker": 0.00020, "taker": 0.00055, "slip": 0.00025}
@@ -151,7 +156,7 @@ def trade_fee(size_usd: float, is_tp: bool) -> float:
     return size_usd * (FEE["maker"] + (FEE["maker"] if is_tp else FEE["taker"]) + FEE["slip"])
 
 
-def check_exit(trade: Dict, candle: Dict) -> Optional[Dict]:
+def check_exit(trade: Dict, candle: Dict, candle_regime: str = "TRENDING") -> Optional[Dict]:
     """
     Simulates T1/T2 as separate phases for both trail and no-trail modes.
 
@@ -161,7 +166,8 @@ def check_exit(trade: Dict, candle: Dict) -> Optional[Dict]:
 
     Phase 2 (t1_done=True): T2 running with breakeven SL.
       ENABLE_TRAIL=False → close T2 when 2× TP hit, or breakeven SL.
-      ENABLE_TRAIL=True  → trail T2 from 2× TP floor, close on trail stop.
+      ENABLE_TRAIL=True  → trail T2 from activation floor, close on trail stop.
+      ENABLE_CHOPPY_TRAIL=True → trail activates at 3× TP (not 2×) in RANGING/CHOPPY.
     """
     side, entry = trade["side"], trade["entry"]
     sl, tp  = trade["sl_pct"], trade["tp_pct"]
@@ -183,34 +189,44 @@ def check_exit(trade: Dict, candle: Dict) -> Optional[Dict]:
         tp2_hit = (hi >= tp_p2 if side == "LONG" else lo <= tp_p2)
 
         if ENABLE_TRAIL:
-            # Activate trail when 2× TP first touched
-            if tp2_hit and not trade.get("tp_trail_active"):
+            # Determine trail activation threshold (Test 7: raise to 3× TP in choppy markets)
+            if ENABLE_CHOPPY_TRAIL and candle_regime in ("RANGING", "CHOPPY"):
+                _act_mult  = 3.0
+            else:
+                _act_mult  = 2.0
+            _tp_act_price = entry * (1 + tp * _act_mult) if side == "LONG" else entry * (1 - tp * _act_mult)
+            tp_act_hit    = (hi >= _tp_act_price if side == "LONG" else lo <= _tp_act_price)
+
+            # Activate trail when activation threshold is first touched
+            if tp_act_hit and not trade.get("tp_trail_active"):
                 trade["tp_trail_active"] = True
                 trade["tp_trail_peak"]   = hi if side == "LONG" else lo
+                trade["tp_trail_floor"]  = _tp_act_price  # floor = activation level
 
             if trade.get("tp_trail_active"):
                 # Ratchet peak
                 if side == "LONG":
-                    trade["tp_trail_peak"] = max(float(trade.get("tp_trail_peak", tp_p2)), hi)
+                    trade["tp_trail_peak"] = max(float(trade.get("tp_trail_peak", _tp_act_price)), hi)
                 else:
-                    trade["tp_trail_peak"] = min(float(trade.get("tp_trail_peak", tp_p2)), lo)
+                    trade["tp_trail_peak"] = min(float(trade.get("tp_trail_peak", _tp_act_price)), lo)
                 _tp_peak    = float(trade["tp_trail_peak"])
+                _tp_floor   = float(trade.get("tp_trail_floor", tp_p2))
                 _atr        = float(trade.get("atr_pct", 0.009))
                 _adx_open   = float(trade.get("adx_at_open", 25.0))
                 _pat_ovr    = float(trade.get("pat_trail_mult", 0.0))
                 _trail_mult = _pat_ovr if _pat_ovr > 0.0 else (1.5 if _adx_open >= 35.0 else 1.0)
                 if side == "LONG":
-                    _beyond_sl = max(_tp_peak * (1.0 - _trail_mult * _atr), tp_p2)
+                    _beyond_sl = max(_tp_peak * (1.0 - _trail_mult * _atr), _tp_floor)
                     _trail_hit = lo <= _beyond_sl
                     if _trail_hit:
-                        _move = max((_beyond_sl - entry) / entry, tp * 2.0)
+                        _move = max((_beyond_sl - entry) / entry, tp * _act_mult)
                         pnl2 = t2_size * _move * lev - trade_fee(t2_size, True)
                         return {"outcome": "TRAIL_STOP", "pnl": t1_pnl + pnl2}
                 else:
-                    _beyond_sl = min(_tp_peak * (1.0 + _trail_mult * _atr), tp_p2)
+                    _beyond_sl = min(_tp_peak * (1.0 + _trail_mult * _atr), _tp_floor)
                     _trail_hit = hi >= _beyond_sl
                     if _trail_hit:
-                        _move = max((entry - _beyond_sl) / entry, tp * 2.0)
+                        _move = max((entry - _beyond_sl) / entry, tp * _act_mult)
                         pnl2 = t2_size * _move * lev - trade_fee(t2_size, True)
                         return {"outcome": "TRAIL_STOP", "pnl": t1_pnl + pnl2}
         else:
@@ -262,6 +278,7 @@ def simulate(main_c: List[Dict], higher_c: List[Dict], weekly_c: List[Dict] = No
     sig_pending   = False
     pending_side  = ""
     candles_since = 0
+    _last_regime  = "TRENDING"  # prior-candle regime passed to check_exit for trail decisions
 
     # Year → stats tracking
     year_trades: Dict[int, List] = {}
@@ -275,7 +292,7 @@ def simulate(main_c: List[Dict], higher_c: List[Dict], weekly_c: List[Dict] = No
 
         # ── Exit check ────────────────────────────────────────────────
         if open_trade:
-            result = check_exit(open_trade, candle)
+            result = check_exit(open_trade, candle, candle_regime=_last_regime)
             if result:
                 pnl = result["pnl"]
                 equity += pnl
@@ -317,6 +334,7 @@ def simulate(main_c: List[Dict], higher_c: List[Dict], weekly_c: List[Dict] = No
 
         _rng_thresh = style_cfg.get("ranging_adx_threshold", 15)
         regime, is_parabolic = get_market_regime([], cur_adx, is_parabolic, ranging_threshold=_rng_thresh)
+        _last_regime = regime  # used by check_exit() on the next candle
 
         # RANGING: don't skip — let _compute_signal_layers handle it.
         # In RANGING, mean reversion can fire (ADX < 20 + BB touch).
@@ -373,7 +391,12 @@ def simulate(main_c: List[Dict], higher_c: List[Dict], weekly_c: List[Dict] = No
             _tp_atr  = sig.get("tp_atr_override") or ST["tp_atr"]
             sl_pct   = min(atr_pct * _sl_atr, ST["sl_max"] / 100)
             tp_pct   = min(max(sl_pct * 1.5, atr_pct * _tp_atr), ST["tp_max"] / 100)
-            eff_size = c["size"] if grade == "A" else c["size"] * 0.70
+            # T18 model: Grade A at 70%; MR exempt when T18_MR_EXEMPT=True
+            if grade == "A":
+                _mr_exempt = T18_MR_EXEMPT and signal_type in ("MEAN_REVERSION", "REVERSAL")
+                eff_size = c["size"] if (not ENABLE_T18 or _mr_exempt) else c["size"] * 0.70
+            else:
+                eff_size = c["size"] * 0.70
             pat_trail = 0.0
             if ENABLE_PAT_EXEC:
                 _psm, pat_trail, sl_pct = get_pattern_exec_params(klines, desired_side, sl_pct, atr_pct)
@@ -416,7 +439,11 @@ def simulate(main_c: List[Dict], higher_c: List[Dict], weekly_c: List[Dict] = No
         atr_pct = sig.get("atr_pct", 0.009)
         sl_pct  = min(atr_pct * ST["sl_atr"], ST["sl_max"] / 100)
         tp_pct  = min(max(sl_pct * 1.5, atr_pct * ST["tp_atr"]), ST["tp_max"] / 100)
-        eff_size = c["size"] if grade == "A" else c["size"] * 0.70
+        # T18 model: NORMAL Grade A at 70% (T18 applies); Grade B unchanged
+        if grade == "A":
+            eff_size = c["size"] if not ENABLE_T18 else c["size"] * 0.70
+        else:
+            eff_size = c["size"] * 0.70
         pat_trail = 0.0
         if ENABLE_PAT_EXEC:
             _psm, pat_trail, sl_pct = get_pattern_exec_params(klines, desired_side, sl_pct, atr_pct)
@@ -618,7 +645,8 @@ def print_ab(label_a, label_b, stats_a, stats_b, t_a, t_b, yr_a, yr_b, result_b,
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    global ENABLE_TRAIL, ENABLE_CANDLE_PAT, ENABLE_WEEKLY_GATE, ENABLE_FIX2, ENABLE_MR_4H_GATE, ENABLE_PAT_EXEC
+    global ENABLE_TRAIL, ENABLE_CANDLE_PAT, ENABLE_WEEKLY_GATE, ENABLE_FIX2
+    global ENABLE_MR_4H_GATE, ENABLE_PAT_EXEC, ENABLE_T18, T18_MR_EXEMPT, ENABLE_CHOPPY_TRAIL
 
     print("\n" + "=" * 68)
     print("  Asymmetric AI — A/B Backtest: BTCUSDT 1h  Jan 2020 → Oct 2026")
@@ -631,19 +659,34 @@ def main():
     years = (END_MS - START_MS) / (1000 * 60 * 60 * 24 * 365.25)
     print(f"  Data range: {total_candles:,} active candles | {years:.1f} years")
 
-    # ── Run A: current baseline (Fix 3 deployed, pat exec OFF) ───────
-    print(f"\nStep 2a — Baseline (Fix 3 deployed, pat exec OFF)...")
-    ENABLE_MR_4H_GATE = True   # Fix 3 is deployed
-    ENABLE_PAT_EXEC   = False
+    # All deployed fixes active for both tests
+    ENABLE_MR_4H_GATE = True
+    ENABLE_PAT_EXEC   = True
+    ENABLE_TRAIL      = True
+
+    # ════════════════════════════════════════════════════════════════════
+    # TEST 6 — T18 MR Exemption
+    # A: T18 applies to ALL Grade A (all at 70%)
+    # B: T18 exempt for MR/REVERSAL Grade A (MR=100%, NORMAL=70%)
+    # ════════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 68)
+    print("  TEST 6 — T18 MR Exemption")
+    print("  A: T18 for all Grade A (MR + NORMAL at 70%)")
+    print("  B: MR/Reversal Grade A at 100% (NORMAL stays 70%)")
+    print("=" * 68)
+
+    ENABLE_T18     = True
+    T18_MR_EXEMPT  = False
+    ENABLE_CHOPPY_TRAIL = False
+    print(f"\nTest 6a — baseline: T18 for all Grade A (70%)...")
     t0       = time.time()
     result_a = simulate(main_c, higher_c, weekly_c)
     t_a      = time.time() - t0
     stats_a  = compute_stats(result_a)
     yr_a     = year_summary(result_a["year_trades"])
 
-    # ── Run B: Fix 4 ON (pattern-adjusted execution) ──────────────────
-    print(f"\nStep 2b — Fix 4 (pattern-adjusted execution ON)...")
-    ENABLE_PAT_EXEC = True
+    T18_MR_EXEMPT = True
+    print(f"\nTest 6b — MR/Reversal Grade A exempt from T18 (100%)...")
     t0       = time.time()
     result_b = simulate(main_c, higher_c, weekly_c)
     t_b      = time.time() - t0
@@ -651,8 +694,43 @@ def main():
     yr_b     = year_summary(result_b["year_trades"])
 
     print_ab(
-        "Baseline (Fix 3, pat exec OFF)",
-        "Fix 4 (pattern-adjusted execution)",
+        "T18 all Grade A (MR at 70%)",
+        "Test 6: MR Grade A at 100% (T18 exempt)",
+        stats_a, stats_b, t_a, t_b, yr_a, yr_b, result_b,
+    )
+
+    # ════════════════════════════════════════════════════════════════════
+    # TEST 7 — Choppy Market Trail Delay
+    # A: current trail (activates at 2× TP)
+    # B: trail activates at 3× TP in RANGING/CHOPPY regime
+    # ════════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 68)
+    print("  TEST 7 — Choppy Market Trail Delay")
+    print("  A: current trail (2× TP activation always)")
+    print("  B: RANGING/CHOPPY regime → trail activates at 3× TP")
+    print("=" * 68)
+
+    ENABLE_T18          = False
+    T18_MR_EXEMPT       = False
+    ENABLE_CHOPPY_TRAIL = False
+    print(f"\nTest 7a — baseline: trail at 2× TP (no choppy delay)...")
+    t0       = time.time()
+    result_a = simulate(main_c, higher_c, weekly_c)
+    t_a      = time.time() - t0
+    stats_a  = compute_stats(result_a)
+    yr_a     = year_summary(result_a["year_trades"])
+
+    ENABLE_CHOPPY_TRAIL = True
+    print(f"\nTest 7b — choppy trail delay: 3× TP in RANGING/CHOPPY...")
+    t0       = time.time()
+    result_b = simulate(main_c, higher_c, weekly_c)
+    t_b      = time.time() - t0
+    stats_b  = compute_stats(result_b)
+    yr_b     = year_summary(result_b["year_trades"])
+
+    print_ab(
+        "Trail at 2× TP (no delay)",
+        "Test 7: Trail at 3× TP in RANGING/CHOPPY",
         stats_a, stats_b, t_a, t_b, yr_a, yr_b, result_b,
     )
 

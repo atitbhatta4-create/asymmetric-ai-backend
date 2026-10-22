@@ -1898,28 +1898,41 @@ class AutoRunner:
             (side == "SHORT" and candle_low  <= tp_price)
         )
 
-        # ── Beyond-TP trail: activate instead of closing at TP ───────────
-        # First time price exceeds TP → switch to ATR-based trailing mode.
-        # Subsequent candles with intrabar_tp=True → still suppress close.
+        # ── Beyond-TP trail: regime-aware activation ─────────────────────
+        # TRENDING/PARABOLIC: trail fires at 1× TP (2× ATR) — normal behavior.
+        # RANGING/CHOPPY: trail fires at 1.5× TP (3× ATR) — delay in chop.
+        _cur_regime      = getattr(self, 'market_regime', 'TRENDING')
+        _choppy_delay    = _cur_regime in ("RANGING", "CHOPPY")
+        _trail_act_pct   = tp_pct * 1.5 if _choppy_delay else tp_pct
+        _trail_act_price = (entry * (1.0 + _trail_act_pct) if side == "LONG"
+                            else entry * (1.0 - _trail_act_pct))
+        _trail_act_hit   = candle_high > 0 and (
+            (side == "LONG"  and candle_high >= _trail_act_price) or
+            (side == "SHORT" and candle_low  <= _trail_act_price)
+        )
         if intrabar_tp:
-            if not pt.get("tp_trail_active"):
-                pt["tp_trail_active"] = True
-                _p0 = (candle_high if side == "LONG"
-                       else candle_low if candle_high > 0 else tp_price)
-                pt["tp_trail_peak"] = _p0
-                _trail_dist_label = "1.5×ATR" if pt.get("adx_at_open", 0) >= 35 else "1.0×ATR"
-                self.log(
-                    f"BEYOND-TP TRAIL: {side} @ {entry:.4f} exceeded TP "
-                    f"({tp_price:.4f}). Trailing instead of closing. "
-                    f"ADX={pt.get('adx_at_open', 0):.1f} → trail={_trail_dist_label}"
-                )
-                _tg_alert(
-                    f"🚀 <b>Beyond-TP Trail activated</b>\n"
-                    f"{self.email} | {self.symbol} {side}\n"
-                    f"TP exceeded → now trailing ({_trail_dist_label})\n"
-                    f"Entry <b>{entry:.4f}</b> | TP was <b>{tp_price:.4f}</b>"
-                )
-            intrabar_tp = False  # never close at fixed TP — trail instead
+            if _trail_act_hit or pt.get("tp_trail_active"):
+                if not pt.get("tp_trail_active"):
+                    pt["tp_trail_active"] = True
+                    pt["tp_trail_floor"]  = _trail_act_price
+                    _p0 = (candle_high if side == "LONG"
+                           else candle_low if candle_high > 0 else _trail_act_price)
+                    pt["tp_trail_peak"] = _p0
+                    _trail_dist_label = "1.5×ATR" if pt.get("adx_at_open", 0) >= 35 else "1.0×ATR"
+                    _chp_label = " (1.5×TP — choppy delay)" if _choppy_delay else ""
+                    self.log(
+                        f"BEYOND-TP TRAIL: {side} @ {entry:.4f} exceeded TP "
+                        f"({_trail_act_price:.4f}){_chp_label}. Trailing instead of closing. "
+                        f"ADX={pt.get('adx_at_open', 0):.1f} → trail={_trail_dist_label}"
+                    )
+                    _tg_alert(
+                        f"🚀 <b>Beyond-TP Trail activated</b>\n"
+                        f"{self.email} | {self.symbol} {side}\n"
+                        f"TP exceeded → now trailing ({_trail_dist_label}){_chp_label}\n"
+                        f"Entry <b>{entry:.4f}</b> | TP was <b>{_trail_act_price:.4f}</b>"
+                    )
+                intrabar_tp = False  # suppress TP close — trail instead
+            # else: choppy regime + below 1.5× TP threshold → normal TP close at 1× TP
 
         # ── Progressive trailing stop ─────────────────────────────────────
         # Simulates a real trailing stop using intrabar high/low:
@@ -1994,16 +2007,18 @@ class AutoRunner:
                     else:
                         pt["tp_trail_peak"] = min(float(pt.get("tp_trail_peak", tp_price)), candle_low)
                 _tp_peak = float(pt["tp_trail_peak"])
+                _tp_floor = float(pt.get("tp_trail_floor",
+                    entry * (1.0 + tp_pct) if side == "LONG" else entry * (1.0 - tp_pct)))
                 if side == "LONG":
                     _beyond_sl = max(_tp_peak * (1.0 - _trail_mult * _atr_val),
-                                     entry * (1.0 + tp_pct))  # floor at original TP
+                                     _tp_floor)
                     _hit = ((candle_high > 0 and candle_low <= _beyond_sl)
                             or exit_price <= _beyond_sl)
                     if _hit:
                         final_move = max((_beyond_sl - entry) / entry, tp_pct)
                 else:
                     _beyond_sl = min(_tp_peak * (1.0 + _trail_mult * _atr_val),
-                                     entry * (1.0 - tp_pct))
+                                     _tp_floor)
                     _hit = ((candle_high > 0 and candle_high >= _beyond_sl)
                             or exit_price >= _beyond_sl)
                     if _hit:
@@ -3761,8 +3776,8 @@ class AutoRunner:
                                     f"T1@{real_b_result['t1_tp_price']:.4f} T2@{real_b_result['t2_tp_price']:.4f}"
                                 )
                             else:
-                                # T18: open at 70% so we can scale into winners
-                                _t18_active = self._scaling_enabled
+                                # T18: open at 70% so we can scale into winners (MR/REVERSAL enter at 100%)
+                                _t18_active = self._scaling_enabled and self.signal_type not in ("MEAN_REVERSION", "REVERSAL")
                                 _open_usdt  = usdt_size * (0.70 if _t18_active else 1.00)
                                 _real_result = place_real_order(
                                     email=self.email, symbol=self.symbol, side=desired_side,
@@ -3826,7 +3841,7 @@ class AutoRunner:
                             ]
                             self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP T2 40%+100%TP+BE | score={self.last_score:.2f}")
                         else:
-                            _real_t18   = self._scaling_enabled
+                            _real_t18   = self._scaling_enabled and self.signal_type not in ("MEAN_REVERSION", "REVERSAL")
                             _real_init_sm = round(0.70 * _mtf_sm if _real_t18 else 1.00 * _mtf_sm, 4)
                             _scale_lbl  = " | T18: entry 70%" if _real_t18 else ""
                             self.pending_trades = [
@@ -3971,13 +3986,15 @@ class AutoRunner:
                             self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}{_mtf_label}")
                         else:
                             # Scaling enabled: open at 70% to allow scale-ins. Builds to 100% on winners.
-                            _grade_a_sm = round((0.70 if self._scaling_enabled else 1.00) * _mtf_sm * _pat_size_mult, 4)
-                            _scale_label = " | scaling: entry 70%" if self._scaling_enabled else ""
+                            # MR/REVERSAL skip T18 — they enter at 100% (no scale-in needed).
+                            _t18_demo = self._scaling_enabled and self.signal_type not in ("MEAN_REVERSION", "REVERSAL")
+                            _grade_a_sm = round((0.70 if _t18_demo else 1.00) * _mtf_sm * _pat_size_mult, 4)
+                            _scale_label = " | scaling: entry 70%" if _t18_demo else ""
                             self.pending_trades = [
                                 {**base_trade, "grade": "A", "size_mult": _grade_a_sm, "tp_mult": 1.00,
                                  "is_primary": True,
                                  "scale1_done": False, "scale2_done": False,
-                                 "scaling_enabled": self._scaling_enabled},
+                                 "scaling_enabled": _t18_demo},
                             ]
                             self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}{_mtf_label}{_scale_label}")
                         _sl_px = entry_price * (1 + sl_pct_open) if desired_side == "SHORT" else entry_price * (1 - sl_pct_open)
