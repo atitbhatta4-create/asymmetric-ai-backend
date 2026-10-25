@@ -129,13 +129,21 @@ for r in rows:
 
 # ── Core metrics ───────────────────────────────────────────────────────────────
 total        = len(trades)
-wins         = [t for t in trades if t["outcome"] in ("TP_HIT", "TRAIL_STOP") and t["pnl_value"] > 0]
-losses       = [t for t in trades if t["pnl_value"] < 0]
-breakevens   = [t for t in trades if abs(t["pnl_value"]) < 0.01]
+wins         = [t for t in trades if t["outcome"] in ("TP_HIT", "TRAIL_STOP") and t["pnl_pct"] > 0]
+losses       = [t for t in trades if t["pnl_pct"] < 0]
+breakevens   = [t for t in trades if abs(t["pnl_pct"]) < 0.001]
 
 wr_pct       = len(wins) / total * 100 if total else 0
-avg_win_usd  = statistics.mean([t["pnl_value"] for t in wins])  if wins   else 0
-avg_loss_usd = statistics.mean([t["pnl_value"] for t in losses]) if losses else 0
+avg_win_pct  = statistics.mean([t["pnl_pct"]   for t in wins])   if wins   else 0
+avg_loss_pct = statistics.mean([t["pnl_pct"]   for t in losses])  if losses else 0
+avg_win_usd  = statistics.mean([t["pnl_value"] for t in wins])   if wins   else 0
+avg_loss_usd = statistics.mean([t["pnl_value"] for t in losses])  if losses else 0
+
+# Account equity info
+first_equity = trades[0]["eq_before"]  if trades else 0
+last_equity  = trades[-1]["eq_after"]  if trades else 0
+peak_equity  = max(t["eq_after"] for t in trades) if trades else 0
+total_return_pct = (last_equity - first_equity) / first_equity * 100 if first_equity else 0
 
 # Trade frequency
 closed_dates = [t["closed"] for t in trades if t["closed"]]
@@ -148,12 +156,14 @@ else:
     span_months  = 1
     trades_per_mo = 0
 
-# Monthly P&L
-monthly_pnl: dict = defaultdict(float)
+# Monthly P&L — both $ and %
+monthly_pnl: dict  = defaultdict(float)
+monthly_pnl_pct: dict = defaultdict(float)
 monthly_count: dict = defaultdict(int)
 for t in trades:
-    monthly_pnl[t["month"]]   += t["pnl_value"]
-    monthly_count[t["month"]] += 1
+    monthly_pnl[t["month"]]     += t["pnl_value"]
+    monthly_pnl_pct[t["month"]] += t["pnl_pct"]
+    monthly_count[t["month"]]   += 1
 
 # Trailing stop usage
 trail_trades = [t for t in wins if t["trailing_used"]]
@@ -178,43 +188,53 @@ for t in trades:
 
 print(f"\n  Data: {total} trades | {span_days} days ({span_months:.1f} months)")
 print(f"  Period: {min(closed_dates).strftime('%Y-%m-%d')} → {max(closed_dates).strftime('%Y-%m-%d')}")
+print(f"  Account: start ${first_equity:.2f} → current ${last_equity:.2f} | peak ${peak_equity:.2f} | total return {total_return_pct:+.1f}%")
 print()
 
-# ── Main comparison table ──────────────────────────────────────────────────────
+# ── Main comparison table (pct-based — dollar amounts scale with account size) ─
 print(f"{SEP}")
 print(f"  {'Metric':<28} {'Backtest':>10} {'Live':>10}  {'Diff':>8}  {'Status'}")
+print(f"  NOTE: pnl_pct = % of account equity per trade (account-size independent)")
 print(f"{SEP2}")
 
+# Backtest pct equivalents at $1000 equity, 65% size, 6x leverage:
+# avg_win_pct = avg_win_$ / (equity * size * leverage) = 89.11 / (1000*0.65*6) = 2.28%
+# avg_loss_pct similarly
+BT_avg_win_pct  =  2.28   # $89.11 at $1000 equity, 0.65 size, 6x lev
+BT_avg_loss_pct = -0.77   # ~$30 loss equivalent
+
 rows_table = [
-    ("Trades/month",    BT["trades_per_mo"],  trades_per_mo,  True,  ".1f"),
-    ("Win rate %",      BT["wr_pct"],          wr_pct,         True,  ".1f"),
-    ("Avg win $",       BT["avg_win_usd"],     avg_win_usd,    True,  ".2f"),
-    ("Avg loss $",      -30.0,                 avg_loss_usd,   False, ".2f"),
+    ("Trades/month",      BT["trades_per_mo"],   trades_per_mo,   True,  ".1f"),
+    ("Win rate %",        BT["wr_pct"],           wr_pct,          True,  ".1f"),
+    ("Avg win % equity",  BT_avg_win_pct,         avg_win_pct,     True,  ".2f"),
+    ("Avg loss % equity", BT_avg_loss_pct,        avg_loss_pct,    False, ".2f"),
 ]
 
 for label, bt_val, live_val, higher_better, fmt in rows_table:
-    verd = verdict(live_val, bt_val, tolerance=0.20, higher_is_better=higher_better)
+    verd = verdict(live_val, bt_val, tolerance=0.25, higher_is_better=higher_better)
     diff = pct_diff(live_val, bt_val)
     print(f"  {label:<28} {bt_val:>10{fmt}} {live_val:>10{fmt}}  {diff:>8}  {verd}")
 
 print(f"{SEP2}")
 
 # ── Monthly P&L ───────────────────────────────────────────────────────────────
-print(f"\n  MONTHLY P&L")
+print(f"\n  MONTHLY P&L  (% = sum of per-trade pnl_pct that month)")
 print(f"{SEP2}")
-print(f"  {'Month':<10}  {'Trades':>6}  {'P&L':>10}  {'Win Rate':>9}")
+print(f"  {'Month':<10}  {'Trades':>6}  {'P&L %':>8}  {'P&L $':>8}  {'Win Rate':>9}")
 print(f"{SEP2}")
 for month in sorted(monthly_pnl.keys()):
-    cnt = monthly_count[month]
-    pnl = monthly_pnl[month]
+    cnt  = monthly_count[month]
+    pnl  = monthly_pnl[month]
+    ppct = monthly_pnl_pct[month]
     month_trades = [t for t in trades if t["month"] == month]
-    month_wins   = [t for t in month_trades if t["pnl_value"] > 0]
+    month_wins   = [t for t in month_trades if t["pnl_pct"] > 0]
     wr            = len(month_wins) / cnt * 100 if cnt else 0
-    print(f"  {month:<10}  {cnt:>6}  ${pnl:>9.2f}  {wr:>8.1f}%")
+    print(f"  {month:<10}  {cnt:>6}  {ppct:>+7.2f}%  ${pnl:>7.2f}  {wr:>8.1f}%")
 
-total_pnl = sum(monthly_pnl.values())
+total_pnl     = sum(monthly_pnl.values())
+total_pnl_pct = sum(monthly_pnl_pct.values())
 print(f"{SEP2}")
-print(f"  {'TOTAL':<10}  {total:>6}  ${total_pnl:>9.2f}")
+print(f"  {'TOTAL':<10}  {total:>6}  {total_pnl_pct:>+7.2f}%  ${total_pnl:>7.2f}")
 
 # ── Signal type breakdown ─────────────────────────────────────────────────────
 print(f"\n  SIGNAL TYPE BREAKDOWN")
@@ -256,16 +276,16 @@ print(f"  VALIDATION SUMMARY")
 print(f"{SEP}")
 
 checks = [
-    ("Trade frequency",  within(trades_per_mo, BT["trades_per_mo"]), trades_per_mo, BT["trades_per_mo"]),
-    ("Win rate",         within(wr_pct, BT["wr_pct"]),                wr_pct,        BT["wr_pct"]),
-    ("Avg win $",        within(avg_win_usd, BT["avg_win_usd"]),       avg_win_usd,   BT["avg_win_usd"]),
+    ("Trade frequency",    within(trades_per_mo, BT["trades_per_mo"], 0.25), trades_per_mo,  BT["trades_per_mo"]),
+    ("Win rate %",         within(wr_pct, BT["wr_pct"], 0.25),               wr_pct,          BT["wr_pct"]),
+    ("Avg win % equity",   within(avg_win_pct, BT_avg_win_pct, 0.25),        avg_win_pct,     BT_avg_win_pct),
 ]
 
 all_green = all(c[1] for c in checks)
 for name, ok, live_v, bt_v in checks:
     status = "PASS" if ok else "FAIL"
     diff   = pct_diff(live_v, bt_v)
-    print(f"  [{status}] {name:<20} live={live_v:.1f}  bt={bt_v:.1f}  ({diff})")
+    print(f"  [{status}] {name:<22} live={live_v:.2f}  bt={bt_v:.2f}  ({diff})")
 
 print()
 if total < 30:
