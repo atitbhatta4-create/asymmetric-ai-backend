@@ -734,6 +734,43 @@ def main():
         stats_a, stats_b, t_a, t_b, yr_a, yr_b, result_b,
     )
 
+    # ════════════════════════════════════════════════════════════════════
+    # COMBINED — All fixes: T18 MR-exempt + Choppy trail delay
+    # Baseline: Sharpe +0.13 (all prior fixes, no T18, no choppy trail)
+    # Combined: T18 for NORMAL signals + MR/REVERSAL at 100% + choppy trail
+    # ════════════════════════════════════════════════════════════════════
+    print("\n" + "=" * 68)
+    print("  COMBINED — T18 MR-Exempt + Choppy Trail (all fixes active)")
+    print("  A: baseline (no T18, trail at 2× TP)")
+    print("  B: T18 NORMAL-only + MR at 100% + choppy trail at 3× TP")
+    print("=" * 68)
+
+    ENABLE_T18          = False
+    T18_MR_EXEMPT       = False
+    ENABLE_CHOPPY_TRAIL = False
+    print(f"\nCombined A — baseline (deployed state)...")
+    t0       = time.time()
+    result_a = simulate(main_c, higher_c, weekly_c)
+    t_a      = time.time() - t0
+    stats_a  = compute_stats(result_a)
+    yr_a     = year_summary(result_a["year_trades"])
+
+    ENABLE_T18          = True
+    T18_MR_EXEMPT       = True
+    ENABLE_CHOPPY_TRAIL = True
+    print(f"\nCombined B — T18 NORMAL-only + MR at 100% + choppy trail...")
+    t0       = time.time()
+    result_b = simulate(main_c, higher_c, weekly_c)
+    t_b      = time.time() - t0
+    stats_b  = compute_stats(result_b)
+    yr_b     = year_summary(result_b["year_trades"])
+
+    print_ab(
+        "Baseline (no T18, trail 2×TP)",
+        "Combined: T18 MR-exempt + choppy trail",
+        stats_a, stats_b, t_a, t_b, yr_a, yr_b, result_b,
+    )
+
 
 if __name__ == "__main__":
     main()
