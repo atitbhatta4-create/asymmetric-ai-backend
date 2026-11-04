@@ -94,6 +94,16 @@ from routes_report import report_router
 from routes_portfolio import portfolio_router
 from routes_engine import engine_router
 
+# ── Engine feature flags ───────────────────────────────────────────────────────
+# MR_4H_GATE: backtest Sharpe delta = -0.29 on corrected baseline — OFF
+# PAT_EXEC:   backtest Sharpe delta = -0.76 on corrected baseline — OFF
+# T18:        backtest Sharpe delta = -0.22 on corrected baseline — OFF
+# TRAIL + CHOPPY_TRAIL are always active (built into the exit loop, +0.25 combined)
+ENABLE_MR_4H_GATE = False
+ENABLE_PAT_EXEC   = False
+ENABLE_T18        = False
+# ──────────────────────────────────────────────────────────────────────────────
+
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
@@ -1242,7 +1252,7 @@ class AutoRunner:
             self._exchange_id = "bybit"
         # Momentum scaling (pyramiding) — tracks scale-in state per active trade
         # Allowed modes: MINI_ASYM, NORMAL, AGGRESSIVE only
-        self._scaling_enabled: bool = mode in ("MINI_ASYM", "NORMAL", "AGGRESSIVE")
+        self._scaling_enabled: bool = ENABLE_T18 and mode in ("MINI_ASYM", "NORMAL", "AGGRESSIVE")
         self.session_start_equity: float = get_equity(email)
         # Peak must be the highest equity ever seen — read from user_state which survives
         # AI stop/restart (ai_runner_state is deleted on stop, user_state is permanent).
@@ -2794,7 +2804,7 @@ class AutoRunner:
             param_overrides=_param_overrides if _param_overrides else None,
             symbol=self.symbol,
             daily_klines=daily_klines or None,
-            enable_mr_4h_gate=True,
+            enable_mr_4h_gate=ENABLE_MR_4H_GATE,
         )
 
         # Enforce side restriction from weekly filter or parabolic regime
@@ -3690,7 +3700,7 @@ class AutoRunner:
                     tp_pct_open = min(self.last_atr_pct * _tp_atr, st["tp_max"] / 100.0)
 
                     _pat_size_mult, _pat_trail_mult = 1.0, 0.0
-                    if _pb_klines is not None and self.last_atr_pct:
+                    if ENABLE_PAT_EXEC and _pb_klines is not None and self.last_atr_pct:
                         _psm, _ptm, _adj_sl = get_pattern_exec_params(
                             _pb_klines, desired_side, sl_pct_open, self.last_atr_pct
                         )
