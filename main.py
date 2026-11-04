@@ -3330,7 +3330,8 @@ class AutoRunner:
                         f"{self.email} | {self.symbol}\n"
                         f"<code>{str(_mrf_err)[:200]}</code>"
                     )
-                self.last_run_ts = time.time()
+                _tick_start = time.time()
+                self.last_run_ts = _tick_start
 
                 # Periodic 15-min log when deferring stop for an open trade
                 if self.waiting_for_trade_close and time.time() - self._last_waiting_log_ts >= 900:
@@ -4063,6 +4064,22 @@ class AutoRunner:
                 # keeps them in its internal free-list and Render's 512MB limit is hit
                 # within a few hours of multiple runners being active.
                 gc.collect()
+                # Log tick time + RSS memory every 10 cycles (every ~10 intervals)
+                _tick_ms = int((time.time() - _tick_start) * 1000)
+                self._tick_count = getattr(self, "_tick_count", 0) + 1
+                if self._tick_count % 10 == 1:
+                    try:
+                        import psutil as _psutil
+                        _rss_mb = _psutil.Process().memory_info().rss / 1024 / 1024
+                        _n_runners = len(AUTO_RUNNERS)
+                        self.log(
+                            f"[PERF] tick={_tick_ms}ms | mem={_rss_mb:.0f}MB RSS | "
+                            f"runners={_n_runners} | symbol={self.symbol}"
+                        )
+                    except ImportError:
+                        self.log(f"[PERF] tick={_tick_ms}ms | mem=N/A (psutil missing) | symbol={self.symbol}")
+                    except Exception:
+                        pass
                 # Sleep in 30-second chunks so the loop wakes up quickly when
                 # the mid-candle monitor opens a trade and sets pending_trades.
                 _rem = self.interval_sec
