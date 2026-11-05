@@ -66,6 +66,26 @@ EXCHANGE_FEES: Dict[str, Dict] = {
 
 OKX_HIST_CANDLES_LIMIT = 100  # OKX history-candles max per request
 
+# Mirror of main.py TRAIL_LEVELS — must stay in sync with live engine.
+# (tp_fraction, lock_fraction, level_name)
+TRAIL_LEVELS = [
+    (0.35, 0.00, "L1-BE"),
+    (0.40, 0.05, "L2"),
+    (0.50, 0.25, "L3"),
+    (0.60, 0.35, "L4"),
+    (0.70, 0.50, "L5"),
+    (0.80, 0.65, "L6"),
+    (0.90, 0.80, "L7"),
+]
+
+
+def _sim_floor(peak: float, start: float) -> float:
+    """R1 Hybrid floor — mirrors live _compute_floor() in user_state.py."""
+    if peak >= 2.0 * start:
+        return max(start * 0.85, peak * 0.90)
+    return peak * 0.85
+
+
 # Active runs tracked in memory: run_id → {status, progress, error}
 _active: Dict[str, Dict] = {}
 _active_lock = threading.Lock()
@@ -328,11 +348,17 @@ def _get_aligned_slice(
     return candles[start : idx + 1]
 
 
-def _sim_check_exit(trade: Dict, candle: Dict, exchange: str) -> Optional[Dict]:
+def _sim_check_exit(
+    trade: Dict, candle: Dict, exchange: str, regime: str = "TRENDING"
+) -> Optional[Dict]:
     """
     Check whether the open trade exits on this candle.
-    Mutates trade dict for Grade B T1/T2 state.
+    Mutates trade dict for Grade B T1/T2 state and trail ratchet state.
     Returns dict with {closed, outcome, pnl} or None if trade stays open.
+
+    regime — current market regime (TRENDING/MARGINAL/RANGING/CHOPPY/PARABOLIC).
+             Used for the choppy-delay rule: beyond-TP trail activates at 1.5×TP
+             in RANGING/CHOPPY, 1.0×TP in all other regimes (mirrors live engine).
     """
     side     = trade["side"]
     entry    = trade["entry"]
@@ -355,7 +381,7 @@ def _sim_check_exit(trade: Dict, candle: Dict, exchange: str) -> Optional[Dict]:
     tp_price = entry * (1 + tp_pct) if side == "LONG" else entry * (1 - tp_pct)
 
     if grade == "B":
-        t1_tp_pct   = tp_pct  # T1 exits at full ATR TP (tp_mult=1.00, same as live engine)
+        t1_tp_pct   = tp_pct * trade.get("t1_tp_mult", 1.0)
         t1_tp_price = entry * (1 + t1_tp_pct) if side == "LONG" else entry * (1 - t1_tp_pct)
 
         t1_just_closed = False
@@ -382,46 +408,130 @@ def _sim_check_exit(trade: Dict, candle: Dict, exchange: str) -> Optional[Dict]:
                 trade["t2_sl_is_breakeven"] = True
                 t1_just_closed = True
 
-        # Check T2 — only if T1 was already done before this candle
+        # ── T2 phase — only evaluated from the candle AFTER T1 closed ──────
         if trade.get("t1_done") and not t1_just_closed:
             t2_dollar = equity * trade["t2_size"]
+            _be = trade.get("t2_sl_is_breakeven", False)
+            _atr_pct = trade.get("atr_pct", ATR_BASELINE.get("1h", 0.009))
 
-            if trade.get("t2_sl_is_breakeven"):
-                t2_sl_price = entry  # breakeven = entry
+            # Base SL — updated below if trail is active
+            t2_sl_price = entry if _be else sl_price
+
+            if _be:
+                # ── Trail ratchet on T2 (mirrors live _close_one_trade
+                #    after breakeven is set) ────────────────────────────
+                candle_best = high if side == "LONG" else low
+                _t2_bm = max(
+                    float(trade.get("t2_trail_best_move", 0.0)),
+                    (candle_best - entry) / entry if side == "LONG"
+                    else (entry - candle_best) / entry,
+                )
+                trade["t2_trail_best_move"] = _t2_bm
+
+                _t2_locked = 0.0
+                for _tf, _lf, _ in reversed(TRAIL_LEVELS):
+                    if _t2_bm >= tp_pct * _tf:
+                        if _lf == 0.0 and _t2_bm < _atr_pct * 0.50:
+                            continue
+                        _t2_locked = _t2_bm * _lf
+                        break
+
+                _prev_t2 = float(trade.get("t2_trail_locked_pct", 0.0))
+                _t2_locked = max(_t2_locked, _prev_t2)
+                trade["t2_trail_locked_pct"] = _t2_locked
+
+                if _t2_locked > 0.0:
+                    t2_sl_price = (entry * (1.0 + _t2_locked) if side == "LONG"
+                                   else entry * (1.0 - _t2_locked))
+
+                # ── Beyond-TP activation and trailing for T2 ─────────────
+                _choppy = regime in ("RANGING", "CHOPPY")
+                _t2_act_pct   = tp_pct * 1.5 if _choppy else tp_pct
+                _t2_act_price = (entry * (1.0 + _t2_act_pct) if side == "LONG"
+                                 else entry * (1.0 - _t2_act_pct))
+                _t2_act_hit   = (high >= _t2_act_price if side == "LONG"
+                                 else low <= _t2_act_price)
+
+                _t2_tp_hit = tp_hit(tp_price)
+
+                if _t2_tp_hit and not trade.get("tp_trail_active_t2"):
+                    if _t2_act_hit:
+                        trade["tp_trail_active_t2"] = True
+                        trade["tp_trail_floor_t2"]  = _t2_act_price
+                        trade["tp_trail_peak_t2"]   = high if side == "LONG" else low
+                        _t2_tp_hit = False  # trail takes over; suppress normal close
+                elif _t2_tp_hit and trade.get("tp_trail_active_t2"):
+                    _t2_tp_hit = False
+
+                if trade.get("tp_trail_active_t2"):
+                    _adx_open   = float(trade.get("adx_at_open", 25.0))
+                    _trail_mult = 1.5 if _adx_open >= 35.0 else 1.0
+                    if side == "LONG":
+                        trade["tp_trail_peak_t2"] = max(
+                            float(trade.get("tp_trail_peak_t2", tp_price)), high)
+                    else:
+                        trade["tp_trail_peak_t2"] = min(
+                            float(trade.get("tp_trail_peak_t2", tp_price)), low)
+                    _pk = float(trade["tp_trail_peak_t2"])
+                    _fl = float(trade.get("tp_trail_floor_t2",
+                        entry * (1.0 + tp_pct) if side == "LONG"
+                        else entry * (1.0 - tp_pct)))
+                    if side == "LONG":
+                        _bsl = max(_pk * (1.0 - _trail_mult * _atr_pct), _fl)
+                        _bhit = low <= _bsl
+                        final_move = max((_bsl - entry) / entry, tp_pct) if _bhit else 0.0
+                    else:
+                        _bsl = min(_pk * (1.0 + _trail_mult * _atr_pct), _fl)
+                        _bhit = high >= _bsl
+                        final_move = max((entry - _bsl) / entry, tp_pct) if _bhit else 0.0
+                    if _bhit:
+                        t2_pnl = t2_dollar * (final_move * leverage) - _fee_cost(t2_dollar, "TP_HIT", exchange)
+                        return {"closed": True, "outcome": "T1_TP_T2_TRAIL",
+                                "pnl": trade["accumulated_pnl"] + t2_pnl, "exit_ts": candle["t"]}
+
+                # ── Normal T2 TP / SL ─────────────────────────────────────
+                _t2_sl_hit = sl_hit(t2_sl_price)
+
+                if _t2_sl_hit and _t2_tp_hit:
+                    _t2_tp_hit = _t2_locked > 0.0
+                    _t2_sl_hit = not _t2_tp_hit
+
+                if _t2_tp_hit:
+                    t2_pnl = t2_dollar * (tp_pct * leverage) - _fee_cost(t2_dollar, "TP_HIT", exchange)
+                    return {"closed": True, "outcome": "T1_TP_T2_TP",
+                            "pnl": trade["accumulated_pnl"] + t2_pnl, "exit_ts": candle["t"]}
+
+                if _t2_sl_hit:
+                    if _t2_locked > 0.0:
+                        t2_pnl = (t2_dollar * (_t2_locked * leverage)
+                                  - _fee_cost(t2_dollar, "TP_HIT", exchange))
+                        return {"closed": True, "outcome": "T1_TP_T2_TRAIL_SL",
+                                "pnl": trade["accumulated_pnl"] + t2_pnl, "exit_ts": candle["t"]}
+                    else:
+                        # Breakeven hit — exit T2 at 0 P&L (only fees)
+                        t2_pnl = -_fee_cost(t2_dollar, "SL_HIT", exchange)
+                        return {"closed": True, "outcome": "T1_TP_T2_BE",
+                                "pnl": trade["accumulated_pnl"] + t2_pnl, "exit_ts": candle["t"]}
+
             else:
-                t2_sl_price = sl_price
-
-            if tp_hit(tp_price):
-                t2_pnl = t2_dollar * (tp_pct * leverage) - _fee_cost(t2_dollar, "TP_HIT", exchange)
-                return {
-                    "closed": True,
-                    "outcome": "T1_TP_T2_TP",
-                    "pnl": trade["accumulated_pnl"] + t2_pnl,
-                    "exit_ts": candle["t"],
-                }
-
-            if sl_hit(t2_sl_price):
-                if trade.get("t2_sl_is_breakeven"):
-                    # Price retraced to entry — close T2 at 0% P&L (only fees)
-                    t2_pnl = -_fee_cost(t2_dollar, "SL_HIT", exchange)
-                    outcome = "T1_TP_T2_BE"
-                else:
+                # T2 still on original SL (pre-breakeven) — no trail yet
+                if tp_hit(tp_price):
+                    t2_pnl = t2_dollar * (tp_pct * leverage) - _fee_cost(t2_dollar, "TP_HIT", exchange)
+                    return {"closed": True, "outcome": "T1_TP_T2_TP",
+                            "pnl": trade["accumulated_pnl"] + t2_pnl, "exit_ts": candle["t"]}
+                if sl_hit(t2_sl_price):
                     t2_pnl = t2_dollar * (-sl_pct * leverage) - _fee_cost(t2_dollar, "SL_HIT", exchange)
-                    outcome = "T1_TP_T2_SL"
-                return {
-                    "closed": True,
-                    "outcome": outcome,
-                    "pnl": trade["accumulated_pnl"] + t2_pnl,
-                    "exit_ts": candle["t"],
-                }
+                    return {"closed": True, "outcome": "T1_TP_T2_SL",
+                            "pnl": trade["accumulated_pnl"] + t2_pnl, "exit_ts": candle["t"]}
 
         return None  # trade still open
 
     else:
-        # Grade A — standard single exit (+ T18 breakeven / profit-lock exits)
+        # Grade A — single exit with trail ratchet + beyond-TP trailing
+        # (mirrors _close_one_trade in main.py exactly)
         size_dollar = equity * trade["effective_size"]
 
-        # T18 Scale-in 2: profit lock at +1.5× ATR — acts as trailing stop
+        # T18 scale-in exits (only active when enable_t18=True in _run_worker)
         profit_lock = trade.get("profit_lock", 0.0)
         if profit_lock > 0:
             lock_price = (entry * (1 + profit_lock) if side == "LONG"
@@ -430,28 +540,111 @@ def _sim_check_exit(trade: Dict, candle: Dict, exchange: str) -> Optional[Dict]:
                 pnl = size_dollar * (profit_lock * leverage) - _fee_cost(size_dollar, "TP_HIT", exchange)
                 return {"closed": True, "outcome": "SCALE_TRAIL", "pnl": pnl, "exit_ts": candle["t"]}
 
-        # T18 Scale-in 1: breakeven SL — SL is at entry price
         if trade.get("be_active"):
             if (side == "LONG" and low <= entry) or (side == "SHORT" and high >= entry):
                 pnl = -_fee_cost(size_dollar, "SL_HIT", exchange)
                 return {"closed": True, "outcome": "SCALE_BE", "pnl": pnl, "exit_ts": candle["t"]}
-            # Also check TP
             if tp_hit(tp_price):
                 pnl = size_dollar * (tp_pct * leverage) - _fee_cost(size_dollar, "TP_HIT", exchange)
                 return {"closed": True, "outcome": "TP_HIT", "pnl": pnl, "exit_ts": candle["t"]}
             return None
 
-        if tp_hit(tp_price) and sl_hit(sl_price):
-            # Both hit same candle → SL wins (worst-case, conservative)
-            pnl = size_dollar * (-sl_pct * leverage) - _fee_cost(size_dollar, "SL_HIT", exchange)
-            return {"closed": True, "outcome": "SL_HIT", "pnl": pnl, "exit_ts": candle["t"]}
+        # ── 7-level trail ratchet ─────────────────────────────────────────
+        # Runs every candle while trade is open (mirrors TRAIL_LEVELS logic).
+        # Only active when beyond-TP trail is not yet triggered.
+        if not trade.get("tp_trail_active"):
+            candle_best = high if side == "LONG" else low
+            candle_best_move = ((candle_best - entry) / entry if side == "LONG"
+                                else (entry - candle_best) / entry)
+            lifetime_best_move = max(float(trade.get("trail_best_move", 0.0)), candle_best_move)
+            trade["trail_best_move"] = lifetime_best_move
 
-        if tp_hit(tp_price):
+            trail_locked_pct = 0.0
+            _atr_pct = trade.get("atr_pct", ATR_BASELINE.get("1h", 0.009))
+            for _tl_tp_frac, _tl_lock_frac, _ in reversed(TRAIL_LEVELS):
+                if lifetime_best_move >= tp_pct * _tl_tp_frac:
+                    # Breakeven level: require ≥0.5× ATR move to avoid micro-noise trigger
+                    if _tl_lock_frac == 0.0 and lifetime_best_move < _atr_pct * 0.50:
+                        continue
+                    trail_locked_pct = lifetime_best_move * _tl_lock_frac
+                    break
+
+            # Ratchet: locked profit can only increase
+            prev_locked = float(trade.get("trail_locked_pct", 0.0))
+            trail_locked_pct = max(trail_locked_pct, prev_locked)
+            trade["trail_locked_pct"] = trail_locked_pct
+
+            if trail_locked_pct > 0.0:
+                if side == "LONG":
+                    sl_price = entry * (1.0 + trail_locked_pct)
+                else:
+                    sl_price = entry * (1.0 - trail_locked_pct)
+                sl_pct = trail_locked_pct
+
+        # ── Beyond-TP activation (regime-aware) ──────────────────────────
+        # RANGING/CHOPPY: trail fires at 1.5×TP. All others: 1.0×TP.
+        _choppy = regime in ("RANGING", "CHOPPY")
+        _trail_act_pct   = tp_pct * 1.5 if _choppy else tp_pct
+        _trail_act_price = (entry * (1.0 + _trail_act_pct) if side == "LONG"
+                            else entry * (1.0 - _trail_act_pct))
+        _trail_act_hit   = (high >= _trail_act_price if side == "LONG"
+                            else low <= _trail_act_price)
+
+        intrabar_tp = tp_hit(tp_price)
+
+        if intrabar_tp and not trade.get("tp_trail_active"):
+            if _trail_act_hit:
+                trade["tp_trail_active"] = True
+                trade["tp_trail_floor"]  = _trail_act_price
+                trade["tp_trail_peak"]   = high if side == "LONG" else low
+                intrabar_tp = False  # suppress normal TP close; trail takes over
+            # else: choppy + below 1.5×TP → normal TP close at 1×TP
+        elif intrabar_tp and trade.get("tp_trail_active"):
+            intrabar_tp = False  # already in trail mode
+
+        # ── Beyond-TP trail stop ──────────────────────────────────────────
+        _beyond_hit = False
+        if trade.get("tp_trail_active"):
+            _atr_val  = trade.get("atr_pct", ATR_BASELINE.get("1h", 0.009))
+            _adx_open = float(trade.get("adx_at_open", 25.0))
+            _trail_mult = 1.5 if _adx_open >= 35.0 else 1.0
+            # Ratchet peak
+            if side == "LONG":
+                trade["tp_trail_peak"] = max(float(trade.get("tp_trail_peak", tp_price)), high)
+            else:
+                trade["tp_trail_peak"] = min(float(trade.get("tp_trail_peak", tp_price)), low)
+            _tp_peak  = float(trade["tp_trail_peak"])
+            _tp_floor = float(trade.get("tp_trail_floor",
+                entry * (1.0 + tp_pct) if side == "LONG" else entry * (1.0 - tp_pct)))
+            if side == "LONG":
+                _beyond_sl = max(_tp_peak * (1.0 - _trail_mult * _atr_val), _tp_floor)
+                _beyond_hit = low <= _beyond_sl
+                if _beyond_hit:
+                    final_move = max((_beyond_sl - entry) / entry, tp_pct)
+            else:
+                _beyond_sl = min(_tp_peak * (1.0 + _trail_mult * _atr_val), _tp_floor)
+                _beyond_hit = high >= _beyond_sl
+                if _beyond_hit:
+                    final_move = max((entry - _beyond_sl) / entry, tp_pct)
+            if _beyond_hit:
+                pnl = size_dollar * (final_move * leverage) - _fee_cost(size_dollar, "TP_HIT", exchange)
+                return {"closed": True, "outcome": "TRAIL_STOP", "pnl": pnl, "exit_ts": candle["t"]}
+
+        # ── Standard SL/TP ───────────────────────────────────────────────
+        intrabar_sl = sl_hit(sl_price)
+
+        if intrabar_sl and intrabar_tp:
+            # Both hit: TP wins if trail is active (trade moved to profit first)
+            intrabar_tp = trade.get("trail_locked_pct", 0.0) > 0
+            intrabar_sl = not intrabar_tp
+
+        if intrabar_tp:
             pnl = size_dollar * (tp_pct * leverage) - _fee_cost(size_dollar, "TP_HIT", exchange)
             return {"closed": True, "outcome": "TP_HIT", "pnl": pnl, "exit_ts": candle["t"]}
 
-        if sl_hit(sl_price):
-            pnl = size_dollar * (-sl_pct * leverage) - _fee_cost(size_dollar, "SL_HIT", exchange)
+        if intrabar_sl:
+            exit_pct = sl_pct  # may be trail-adjusted (locked profit)
+            pnl = size_dollar * (-exit_pct * leverage) - _fee_cost(size_dollar, "SL_HIT", exchange)
             return {"closed": True, "outcome": "SL_HIT", "pnl": pnl, "exit_ts": candle["t"]}
 
         return None
@@ -564,6 +757,24 @@ def _calc_metrics(
         "scaled_trades":    len(scaled_trades),
         "avg_scaled_win_pct": avg_scaled_win,
         "avg_normal_win_pct": avg_normal_win,
+        # Raw trade log — used by run_parity_test.py for trade-by-trade comparison
+        "trade_log": [
+            {
+                "open_ts":  t["open_ts"],
+                "exit_ts":  t["exit_ts"],
+                "side":     t["side"],
+                "grade":    t["grade"],
+                "entry":    t["entry"],
+                "pnl":      round(t["pnl"], 4),
+                "outcome":  t["outcome"],
+                "sl_pct":   round(t.get("sl_pct", 0.0), 6),
+                "tp_pct":   round(t.get("tp_pct", 0.0), 6),
+                "regime":   t.get("regime", ""),
+                "signal":   t.get("signal", ""),
+                "score":    t.get("score", 0.0),
+            }
+            for t in trades
+        ],
     }
 
 
@@ -582,6 +793,8 @@ def _run_worker(
     enable_t16: bool = True,
     enable_t18: bool = True,
     enable_s4: bool = False,
+    enable_mr_4h_gate: bool = False,
+    t1_tp_mult: float = 1.0,
 ) -> None:
     _last_db_write = [0.0]  # throttle DB progress writes
 
@@ -648,7 +861,19 @@ def _run_worker(
         except Exception:
             btc_weekly_candles = []  # degrade to TRENDING if fetch fails
 
-        _set("running", 75)
+        # ── Fetch daily candles for daily bias (live engine uses 30-day window) ──
+        # Extend range back 30 days so the warmup period has daily history.
+        daily_start_ms = start_ms - 30 * 86_400_000
+        daily_candles: List[Dict] = []
+        try:
+            daily_candles = _ensure_candles(
+                symbol, "1d", daily_start_ms, end_ms,
+                on_progress=_fetch_cb(75, 77, "1d"),
+            )
+        except Exception:
+            daily_candles = []  # degrade to NEUTRAL daily bias if fetch fails
+
+        _set("running", 77)
 
         _mode_cfg  = get_mode_config(mode)
         _style_cfg = get_style_config(style)
@@ -710,7 +935,8 @@ def _run_worker(
                         open_trade["scale2_done"]   = True
                         open_trade["profit_lock"]   = 1.5 * _atr   # SL at +1.5× ATR from entry
 
-                result = _sim_check_exit(open_trade, candle, exchange)
+                result = _sim_check_exit(open_trade, candle, exchange,
+                                        regime=open_trade.get("regime", "TRENDING"))
                 if result and result.get("closed"):
                     equity += result["pnl"]
                     peak_equity = max(peak_equity, equity)
@@ -725,14 +951,15 @@ def _run_worker(
                         "open_ts":  open_trade["open_ts"],
                         "exit_ts":  result["exit_ts"],
                         "entry":    open_trade["entry"],
+                        "sl_pct":   open_trade["sl_pct"],
+                        "tp_pct":   open_trade["tp_pct"],
                         "scaled":   open_trade.get("scaled", False),
                     })
                     equity_curve.append({"ts": result["exit_ts"], "equity": round(equity, 4)})
                     open_trade = None
 
-            # ── Drawdown stop (same as live engine) ───────────────────
-            drawdown = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0.0
-            if drawdown >= 0.15:
+            # ── Hard floor stop (R1 Hybrid — mirrors live _compute_floor) ─
+            if equity <= _sim_floor(peak_equity, start_equity):
                 break
 
             # ── Try to open new trade ─────────────────────────────────
@@ -792,10 +1019,14 @@ def _run_worker(
                     _param_overrides = {"min_score": max(0.35, _cp_par["score_threshold"] - 0.05)}
                     _allowed_sides = ["LONG"]
 
+                daily_slice = _get_aligned_slice(daily_candles, candle["t"], 30) if daily_candles else []
                 sig = _compute_signal_layers(
                     klines, mode, 1.0, higher_slice, style, mtf_slice,
                     enable_t16=enable_t16, enable_s4=enable_s4, symbol=symbol,
                     param_overrides=_param_overrides if _param_overrides else None,
+                    daily_klines=daily_slice or None,
+                    candle_ts_ms=candle["t"],
+                    enable_mr_4h_gate=enable_mr_4h_gate,
                 )
 
                 # Enforce side restriction
@@ -885,6 +1116,10 @@ def _run_worker(
 
                 effective_size = c["size"] * mtf_size_mult * vol_mult * dd_mult * mode_size_mult
 
+                # Degrade Grade B → A if T1 leg would be below $5 (mirrors live min-order check)
+                if grade == "B" and equity * effective_size * 0.60 < 5.0:
+                    grade = "A"
+
                 side = desired_side
 
                 open_trade = {
@@ -893,10 +1128,12 @@ def _run_worker(
                     "grade":          grade,
                     "sl_pct":         sl_pct,
                     "tp_pct":         tp_pct,
+                    "t1_tp_mult":     t1_tp_mult,
                     "effective_size": effective_size,
                     "leverage":       min(c["leverage"], 3) if style == "SWING" and mode == "AGGRESSIVE" else c["leverage"],
                     "equity_at_open": equity,
                     "atr_pct":        atr_pct,
+                    "adx_at_open":    cur_adx,
                     # Grade B legs
                     "t1_size":           effective_size * 0.60,
                     "t2_size":           effective_size * 0.40,
@@ -917,9 +1154,9 @@ def _run_worker(
         result_json["candles_fetched"]   = len(main_candles)
         result_json["sim_candles_used"]  = len(main_candles) - WARMUP_CANDLES
         result_json["session_note"] = (
-            "Session quality computed at backtest run time (not historical candle time). "
-            "SCALP dead-zone blocks are applied correctly; DAY_TRADE/SWING scores may "
-            "vary slightly by ≤5% depending on when this backtest was run."
+            "Session quality computed using historical candle timestamp (candle_ts_ms). "
+            "Daily bias passed from 30-day daily slice aligned to each candle. "
+            "enable_mr_4h_gate=False matches live engine flags."
         )
 
         with db_conn() as conn:
@@ -959,6 +1196,8 @@ def start_backtest(
     enable_t16: bool = True,
     enable_t18: bool = True,
     enable_s4: bool = False,
+    enable_mr_4h_gate: bool = False,
+    t1_tp_mult: float = 1.0,
 ) -> str:
     """Validate inputs, create DB record, start background thread, return run_id."""
     from datetime import datetime
@@ -1011,7 +1250,8 @@ def start_backtest(
     t = threading.Thread(
         target=_run_worker,
         args=(run_id, email, symbol.upper(), tf, mode, style, exchange,
-              start_ms, end_ms, start_equity, enable_t16, enable_t18, enable_s4),
+              start_ms, end_ms, start_equity, enable_t16, enable_t18, enable_s4,
+              enable_mr_4h_gate, t1_tp_mult),
         daemon=True,
     )
     t.start()
