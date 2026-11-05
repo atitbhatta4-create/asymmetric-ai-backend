@@ -385,7 +385,7 @@ def get_pattern_exec_params(
     klines: List[Dict], side: str, sl_pct: float, atr_pct: float
 ) -> tuple:
     """
-    Returns (size_mult, trail_mult, adj_sl_pct) from entry candle pattern.
+    Returns (size_mult, trail_mult, adj_sl_pct, pat_name) from entry candle pattern.
     trail_mult: 1.5 for strong patterns, 0.0 = use ADX-based default.
     Shared by live engine and backtester — zero divergence.
     """
@@ -403,7 +403,7 @@ def get_pattern_exec_params(
         wick_dist = min(wick_dist, atr_pct * 2.0)
         adj_sl = max(wick_dist, sl_pct * 0.5)
 
-    return size_mult, trail_mult, adj_sl
+    return size_mult, trail_mult, adj_sl, pat_name
 
 
 def _candle_structure_check(klines: List[Dict], side: str) -> tuple:
@@ -650,9 +650,9 @@ def get_4h_trend_direction(candles_4h: List[Dict]) -> str:
     Used by MR direction gate: NEUTRAL allows both LONG and SHORT MR to fire.
     Single implementation shared by live engine and backtester — no divergence.
     """
-    if len(candles_4h) < 21:
+    if len(candles_4h) < 22:
         return "NEUTRAL"
-    closes    = [k["close"] for k in candles_4h]
+    closes    = [k["close"] for k in candles_4h[:-1]]
     ema9      = _ema(closes,      9)
     ema21     = _ema(closes,     21)
     ema9_prev = _ema(closes[:-1], 9)
@@ -1054,8 +1054,8 @@ def _compute_signal_layers(
     _htf_bear_debug = None
     _htf_bear_triggered = False
     _htf_bear_slope_pct = None
-    if higher_klines and len(higher_klines) >= 55:
-        htf_closes = [k["close"] for k in higher_klines]
+    if higher_klines and len(higher_klines) >= 56:
+        htf_closes = [k["close"] for k in higher_klines[:-1]]
         htf_ema21  = _ema(htf_closes, 21)
         htf_ema50  = _ema(htf_closes, 50)
         htf_bull_cross = htf_ema21[-1] > htf_ema50[-1]
@@ -1083,15 +1083,15 @@ def _compute_signal_layers(
     # hard-blocking. This preserves exceptional LONG setups in bear markets while
     # filtering weaker ones. Hard block was rejected: hurt 2021 entries (-$297 vs +$251 saved).
     _wk_bear = False
-    if enable_weekly_gate and desired_side == "LONG" and weekly_klines and len(weekly_klines) >= 11:
-        _wk_closes = [k["close"] for k in weekly_klines[-15:]]
+    if enable_weekly_gate and desired_side == "LONG" and weekly_klines and len(weekly_klines) >= 12:
+        _wk_closes = [k["close"] for k in weekly_klines[:-1][-15:]]
         _wk_ema9   = _ema(_wk_closes, 9)
         _wk_bear   = len(_wk_ema9) >= 2 and (_wk_ema9[-1] < _wk_ema9[-2])
 
     # ── Market structure (4h swing HH/HL) + daily bias ───────────────────
     # Both are soft score adjustments: agree = +0.05, disagree = -0.05, neutral = 0.
     # daily_klines=None (default) → _db_adj=0.0 — zero regression on all existing callers.
-    _ms_label, _ms_adj = _market_structure(higher_klines or [], desired_side)
+    _ms_label, _ms_adj = _market_structure(higher_klines[:-1] if higher_klines else [], desired_side)
     _db_label = _daily_bias(daily_klines or [])
     _db_adj = (
          0.05 if (_db_label == "BULL"  and desired_side == "LONG")  else

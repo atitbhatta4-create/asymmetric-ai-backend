@@ -3700,9 +3700,9 @@ class AutoRunner:
                     sl_pct_open = min(self.last_atr_pct * _sl_atr, st["sl_max"] / 100.0)
                     tp_pct_open = min(self.last_atr_pct * _tp_atr, st["tp_max"] / 100.0)
 
-                    _pat_size_mult, _pat_trail_mult = 1.0, 0.0
+                    _pat_size_mult, _pat_trail_mult, _pat_nm = 1.0, 0.0, "none"
                     if ENABLE_PAT_EXEC and _pb_klines is not None and self.last_atr_pct:
-                        _psm, _ptm, _adj_sl = get_pattern_exec_params(
+                        _psm, _ptm, _adj_sl, _pat_nm = get_pattern_exec_params(
                             _pb_klines, desired_side, sl_pct_open, self.last_atr_pct
                         )
                         _pat_size_mult  = _psm
@@ -3763,12 +3763,12 @@ class AutoRunner:
                                     _fr_abs   = abs(_fr)
                                     _fund_mult = 0.50 if _fr_abs >= 0.003 else 0.70
                                     self.log(f"Funding rate {_fr*100:.4f}%/8h against {desired_side} — size × {_fund_mult:.2f}")
-                            size_pct  = float(c["size"]) * _mtf_sm * _vol_sm * _dd_sm * _btc_mult * _fund_mult * _pat_size_mult
+                            size_pct  = float(c["size"]) * _mtf_sm * _vol_sm * _dd_sm * _btc_mult * _fund_mult
                             usdt_size = equity_now * size_pct
                             self.log(
                                 f"REAL ORDER SIZE: base={float(c['size'])*100:.0f}% "
                                 f"× mtf={_mtf_sm:.2f} × vol={_vol_sm:.2f} × dd={_dd_sm:.2f} "
-                                f"× btc={_btc_mult:.2f} × fund={_fund_mult:.2f} × pat={_pat_size_mult:.2f} "
+                                f"× btc={_btc_mult:.2f} × fund={_fund_mult:.2f} "
                                 f"= {size_pct*100:.1f}% → ${usdt_size:.2f}"
                             )
                             if grade == "B":
@@ -3777,7 +3777,7 @@ class AutoRunner:
                                     email=self.email, symbol=self.symbol, side=desired_side,
                                     usdt_size=usdt_size, leverage=int(c["leverage"]),
                                     sl_pct=sl_pct_open,
-                                    t1_tp_pct=tp_pct_open * 0.80,
+                                    t1_tp_pct=tp_pct_open * 1.00,
                                     t2_tp_pct=tp_pct_open * 1.00,
                                 )
                                 self.log(
@@ -3861,7 +3861,8 @@ class AutoRunner:
                                  "scale1_done": False, "scale2_done": False,
                                  "scaling_enabled": _real_t18},
                             ]
-                            self.log(f"TRADE OPENED Grade A REAL ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f}{_scale_lbl}")
+                            _pat_lbl_r = f" | pat={_pat_nm}(×{_pat_size_mult:.2f})" if _pat_nm != "none" else ""
+                            self.log(f"TRADE OPENED Grade A REAL ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f}{_scale_lbl}{_pat_lbl_r}")
                         _sl_px = entry_price * (1 + sl_pct_open) if desired_side == "SHORT" else entry_price * (1 - sl_pct_open)
                         _tp_px = entry_price * (1 - tp_pct_open) if desired_side == "SHORT" else entry_price * (1 + tp_pct_open)
                         try:
@@ -3989,9 +3990,9 @@ class AutoRunner:
                         _mtf_label = "" if res.get("mtf_confirmed", True) else f" | 15m unconfirmed→size {_mtf_sm*100:.0f}%"
                         if grade == "B":
                             self.pending_trades = [
-                                {**base_trade, "grade": "B", "size_mult": round(0.60 * _mtf_sm * _pat_size_mult, 4), "tp_mult": 1.00,
+                                {**base_trade, "grade": "B", "size_mult": round(0.60 * _mtf_sm, 4), "tp_mult": 1.00,
                                  "is_primary": True,  "label": "T1"},
-                                {**base_trade, "grade": "B", "size_mult": round(0.40 * _mtf_sm * _pat_size_mult, 4), "tp_mult": 1.00,
+                                {**base_trade, "grade": "B", "size_mult": round(0.40 * _mtf_sm, 4), "tp_mult": 1.00,
                                  "is_primary": False, "label": "T2", "breakeven_after_t1": True},
                             ]
                             self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}{_mtf_label}")
@@ -3999,7 +4000,7 @@ class AutoRunner:
                             # Scaling enabled: open at 70% to allow scale-ins. Builds to 100% on winners.
                             # MR/REVERSAL skip T18 — they enter at 100% (no scale-in needed).
                             _t18_demo = self._scaling_enabled and self.signal_type not in ("MEAN_REVERSION", "REVERSAL")
-                            _grade_a_sm = round((0.70 if _t18_demo else 1.00) * _mtf_sm * _pat_size_mult, 4)
+                            _grade_a_sm = round((0.70 if _t18_demo else 1.00) * _mtf_sm, 4)
                             _scale_label = " | scaling: entry 70%" if _t18_demo else ""
                             self.pending_trades = [
                                 {**base_trade, "grade": "A", "size_mult": _grade_a_sm, "tp_mult": 1.00,
@@ -4007,7 +4008,8 @@ class AutoRunner:
                                  "scale1_done": False, "scale2_done": False,
                                  "scaling_enabled": _t18_demo},
                             ]
-                            self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}{_mtf_label}{_scale_label}")
+                            _pat_label = f" | pat={_pat_nm}(×{_pat_size_mult:.2f})" if _pat_nm != "none" else ""
+                            self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}{_mtf_label}{_scale_label}{_pat_label}")
                         _sl_px = entry_price * (1 + sl_pct_open) if desired_side == "SHORT" else entry_price * (1 - sl_pct_open)
                         _tp_px = entry_price * (1 - tp_pct_open) if desired_side == "SHORT" else entry_price * (1 + tp_pct_open)
                         try:
