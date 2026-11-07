@@ -1235,8 +1235,6 @@ class AutoRunner:
 
         self._last_trade_bad: bool = False
         self._last_holding_log_ts: float = 0.0   # throttle repeated holding logs
-        self._last_drawdown_log_ts: float = 0.0  # throttle repeated drawdown tier logs
-        self._last_dd_tier: int = 0              # 0=none 1=65% 2=40% 3=25% 4=stop
         self._last_mc_log_ts: float = 0.0        # throttle mid-candle noise logs
         self._last_margin_email_ts: float = 0.0  # 24h cooldown for SKIP_LOW_MARGIN emails
         # Session-end-with-open-trade: defer engine stop until trade closes naturally
@@ -1275,6 +1273,11 @@ class AutoRunner:
         self.start_capital: float = _saved_sc  # first-ever balance — used for R1 hybrid floor
         self.consecutive_wins: int = 0    # reset strictness after 3 wins in a row
         self._htf_block_start: Optional[float] = None   # timestamp when HTF blocking began
+        self._htf_timeout_12h_logged: bool = False   # log once at 12h, not every hour
+        self._htf_timeout_24h_logged: bool = False   # log once at 24h, not every hour
+        self._last_dd_tier: int = 0                  # last logged drawdown tier (0=none)
+        self._last_drawdown_log_ts: float = 0.0      # throttle drawdown reminder logs
+        self._last_perf_log_ts: float = 0.0          # throttle PERF logs to once/hour
         # R1 Hybrid floor: flat 85% until 2× start capital, then tightens to 90% from peak.
         self.floor_equity: float = _compute_floor(self.peak_equity, self.start_capital)
         # Persist the correct peak immediately so /balance endpoint shows the right floor
@@ -1839,7 +1842,7 @@ class AutoRunner:
         # Determine which drawdown tier we are in (0 = no drawdown).
         # Used for throttled logging — only log when tier changes or every 30 min.
         _dd_now = time.time()
-        _dd_log_interval = 1800  # 30 minutes between repeated drawdown reminders
+        _dd_log_interval = 7200  # 2 hours between repeated drawdown reminders
 
         if drawdown_pct >= 0.15:
             # -15%+ from peak: stop trading, protect what's left — always log this
@@ -2111,6 +2114,20 @@ class AutoRunner:
                         f"SL={sl_price:.4f}  TP={tp_price:.4f}{_trail_log}"
                     )
 
+                # ── E1: Stall exit — force-close if stuck near entry for 20+ candles ──
+                # Prevents dead capital sitting in a trade going nowhere.
+                # 20 candles = 20h (DAY_TRADE), 5h (SCALP), 80h (SWING).
+                _e1_pnl = ((exit_price - entry) / entry if side == "LONG"
+                           else (entry - exit_price) / entry)
+                if candles_held_so_far >= 20 and abs(_e1_pnl) < 0.005:
+                    self.log(
+                        f"E1 STALL EXIT: {side} @ {entry:.4f} | "
+                        f"{candles_held_so_far} candles held, {_e1_pnl*100:+.3f}% progress — "
+                        f"force-closing at market."
+                    )
+                    outcome = "E1_STALL"
+                    final_move = _e1_pnl
+
                 # ── Momentum Scaling (Pyramiding) — Grade A only, both paper and real ──
                 # Scale into winning positions in two stages.
                 # Guards: in profit, drawdown < 7%, strictness ≤ 1.10.
@@ -2212,7 +2229,9 @@ class AutoRunner:
                                     else:
                                         self.log(f"TRAIL ERROR: Retry also failed — {_tr_err}. Manual check needed for {self.symbol}.")
 
-                return None
+                if outcome != "E1_STALL":
+                    return None
+                # E1_STALL falls through to close at current price
 
         # Use the actual SL/TP price for display and DB when those levels were hit,
         # not the raw candle close — otherwise exit price and PnL are inconsistent.
@@ -3569,23 +3588,29 @@ class AutoRunner:
                     )
 
                     # ── HTF timeout: track consecutive hours blocked by weak HTF ──
+                    # Log ONCE at 12h and ONCE at 24h — not every hour.
                     _is_htf_block = "HTF trend weak" in _raw or "direction" in _raw.lower()
                     if _is_htf_block:
                         if self._htf_block_start is None:
                             self._htf_block_start = time.time()
                         _htf_blocked_hours = (time.time() - self._htf_block_start) / 3600
-                        if _htf_blocked_hours >= 24:
+                        if _htf_blocked_hours >= 24 and not self._htf_timeout_24h_logged:
+                            self._htf_timeout_24h_logged = True
                             self.log(
                                 f"HTF timeout: {_htf_blocked_hours:.1f}h blocked — "
                                 f"HTF filter suspended. Other layers decide."
                             )
-                        elif _htf_blocked_hours >= 12:
+                        elif _htf_blocked_hours >= 12 and not self._htf_timeout_12h_logged:
+                            self._htf_timeout_12h_logged = True
                             self.log(
                                 f"HTF timeout: {_htf_blocked_hours:.1f}h blocked — "
                                 f"EMA separation requirement reduced 30%."
                             )
                     else:
-                        self._htf_block_start = None   # reset when no longer HTF-blocked
+                        # Reset all HTF timeout state when block clears
+                        self._htf_block_start = None
+                        self._htf_timeout_12h_logged = False
+                        self._htf_timeout_24h_logged = False
 
                     continue
 
@@ -4066,10 +4091,11 @@ class AutoRunner:
                 # keeps them in its internal free-list and Render's 512MB limit is hit
                 # within a few hours of multiple runners being active.
                 gc.collect()
-                # Log tick time + RSS memory every 10 cycles (every ~10 intervals)
+                # Log tick time + RSS memory once per hour (not every 10 cycles)
                 _tick_ms = int((time.time() - _tick_start) * 1000)
-                self._tick_count = getattr(self, "_tick_count", 0) + 1
-                if self._tick_count % 10 == 1:
+                _now_perf = time.time()
+                if _now_perf - self._last_perf_log_ts >= 3600:
+                    self._last_perf_log_ts = _now_perf
                     try:
                         import psutil as _psutil
                         _rss_mb = _psutil.Process().memory_info().rss / 1024 / 1024
@@ -4078,10 +4104,8 @@ class AutoRunner:
                             f"[PERF] tick={_tick_ms}ms | mem={_rss_mb:.0f}MB RSS | "
                             f"runners={_n_runners} | symbol={self.symbol}"
                         )
-                    except ImportError:
-                        self.log(f"[PERF] tick={_tick_ms}ms | mem=N/A (psutil missing) | symbol={self.symbol}")
-                    except Exception:
-                        pass
+                    except (ImportError, Exception):
+                        pass  # skip PERF log if psutil unavailable
                 # Sleep in 30-second chunks so the loop wakes up quickly when
                 # the mid-candle monitor opens a trade and sets pending_trades.
                 _rem = self.interval_sec
