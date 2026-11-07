@@ -9,6 +9,8 @@ from __future__ import annotations
 import io
 import csv as _csv
 import statistics as _st
+import threading as _cthreading
+import time as _ctime
 from typing import Any, List, Optional
 from datetime import timezone as _tz, timedelta as _td, datetime as _dt
 
@@ -25,6 +27,30 @@ from risk_engine import mini_asym_risk_engine
 from user_state import get_equity, set_equity, get_session_id, _compute_floor
 
 portfolio_router = APIRouter()
+
+# ── Response cache — prevents every dashboard poll from hitting DB/exchange ───
+# TTL is short (10s) so data stays fresh. Each user has their own cache slot.
+_BALANCE_CACHE: dict = {}   # email -> (payload, cached_at)
+_TRADES_CACHE: dict = {}    # cache_key -> (payload, cached_at)
+_CACHE_LOCK = _cthreading.Lock()
+_BALANCE_TTL = 10
+_TRADES_TTL  = 10
+
+def _cache_get(store: dict, key: str, ttl: float):
+    with _CACHE_LOCK:
+        entry = store.get(key)
+        if entry and (_ctime.time() - entry[1]) < ttl:
+            return entry[0]
+    return None
+
+def _cache_set(store: dict, key: str, value):
+    with _CACHE_LOCK:
+        store[key] = (value, _ctime.time())
+
+def invalidate_balance_cache(email: str):
+    """Call this after any equity change so the next /balance is live."""
+    with _CACHE_LOCK:
+        _BALANCE_CACHE.pop(email, None)
 
 
 class RiskPreviewIn(BaseModel):
@@ -83,6 +109,10 @@ def balance(user=Depends(require_user)):
     from main import AUTO_RUNNERS, AUTO_LOCK
 
     email = user["email"]
+
+    cached = _cache_get(_BALANCE_CACHE, email, _BALANCE_TTL)
+    if cached:
+        return cached
 
     real_bal = get_real_usdt_balance(email)
     if real_bal is not None:
@@ -145,7 +175,7 @@ def balance(user=Depends(require_user)):
     ath = float(state_row["all_time_high"] or 0) if state_row else 0.0
     if ath < equity:
         ath = equity
-    return {
+    result = {
         "total": equity,
         "equity_after_last_trade": equity,
         "last_trade": last_row["time"] if last_row else None,
@@ -157,6 +187,8 @@ def balance(user=Depends(require_user)):
         "distance_pct": distance_pct,
         "all_time_high": round(ath, 2),
     }
+    _cache_set(_BALANCE_CACHE, email, result)
+    return result
 
 
 @portfolio_router.get("/trades")
@@ -167,6 +199,11 @@ def trades(
     limit: int = Query(default=500, ge=1, le=2000),
 ):
     email = user["email"]
+    _tkey = f"{email}:{symbol}:{current_session}:{limit}"
+    cached = _cache_get(_TRADES_CACHE, _tkey, _TRADES_TTL)
+    if cached:
+        return cached
+
     where = ["email = %s"]
     params: List[Any] = [email]
 
@@ -187,7 +224,9 @@ def trades(
         cur.execute(q, tuple(params))
         rows = cur.fetchall()
 
-    return {"trades": [dict(r) for r in rows]}
+    result = {"trades": [dict(r) for r in rows]}
+    _cache_set(_TRADES_CACHE, _tkey, result)
+    return result
 
 
 @portfolio_router.get("/portfolio/stats")

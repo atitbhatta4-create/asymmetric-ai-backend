@@ -27,6 +27,8 @@ from config import (
     TRADE_STYLE_PARAMS, now_dubai,
 )
 from database import db_conn, USING_PG
+import os as _os
+
 from exchange_utils import get_real_usdt_balance
 from market_data import _validate_symbol
 from notifications import tg_alert as _tg_alert, email_ai_started
@@ -37,6 +39,11 @@ from user_state import (
 )
 
 engine_router = APIRouter()
+
+# ── Concurrent AutoRunner cap ─────────────────────────────────────────────────
+# Prevents OOM on constrained Render plans. Raise MAX_RUNNERS env var when
+# upgrading: Starter=20, Standard=45, Pro=100.
+_MAX_RUNNERS = int(_os.getenv("MAX_RUNNERS", "20"))
 
 
 # ── Request models ────────────────────────────────────────────────────────────
@@ -512,6 +519,19 @@ def auto_start(payload: AutoStartIn, user=Depends(require_user)):
             )
         _main._engine_start_times.append(_now)
         _main._last_engine_start_ts = _now
+
+    # ── Concurrent runner cap — prevent OOM on constrained plans ─────────────
+    with AUTO_LOCK:
+        _active = sum(1 for r in AUTO_RUNNERS.values() if r.is_running())
+        _already_mine = email in AUTO_RUNNERS
+    if _active >= _MAX_RUNNERS and not _already_mine:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Server at capacity ({_active}/{_MAX_RUNNERS} AI engines running). "
+                f"Please try again in a few minutes."
+            ),
+        )
 
     # ── Start the runner ──────────────────────────────────────────────────────
     try:

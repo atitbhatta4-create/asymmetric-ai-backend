@@ -184,6 +184,13 @@ app.add_middleware(
     allow_headers=["Content-Type", "Accept", "Cookie", "X-Requested-With"],
 )
 
+@app.on_event("startup")
+async def _startup():
+    import anyio
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    limiter.total_tokens = 100  # up from default 40 — handles more concurrent sync endpoints
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)

@@ -1,100 +1,108 @@
 """
-Database layer — supports both PostgreSQL (prod) and SQLite (local dev).
+Database layer — supports both PostgreSQL (prod) and SQLite (local dev/fallback).
 
-When DATABASE_URL env var is set → uses psycopg3 + ConnectionPool (PostgreSQL).
-When not set → falls back to SQLite with a thin compatibility wrapper
-that makes it behave identically (dict rows, %s placeholders).
+When DATABASE_URL env var is set → tries psycopg3 + ConnectionPool (PostgreSQL).
+If that fails (e.g. Render IP block from local dev) → falls back to SQLite automatically.
+When DATABASE_URL is not set → SQLite directly.
 """
 import os
 from contextlib import contextmanager
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
+_pg_connected = False   # True only if PostgreSQL pool opened successfully
+
 if DATABASE_URL:
-    import psycopg
-    from psycopg.rows import dict_row
-    from psycopg_pool import ConnectionPool
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+        from psycopg_pool import ConnectionPool
+        import time as _time
 
-    _url = DATABASE_URL
-    if _url.startswith("postgres://"):
-        _url = _url.replace("postgres://", "postgresql://", 1)
+        _url = DATABASE_URL
+        if _url.startswith("postgres://"):
+            _url = _url.replace("postgres://", "postgresql://", 1)
 
-    # TCP keepalives — aggressive settings so Render's 60-90s idle timeout
-    # never kills a pooled connection before the pre-ping catches it.
-    # keepalives_idle=30: probe after 30s idle (before Render drops it)
-    # keepalives_interval=5: retry probe every 5s (was 10)
-    # keepalives_count=3: declare dead after 3 missed probes (~45s total, was ~80s)
-    _ka = "keepalives=1&keepalives_idle=30&keepalives_interval=5&keepalives_count=3&connect_timeout=10"
-    _url = _url + ("&" if "?" in _url else "?") + _ka
+        # TCP keepalives — aggressive so Render's 60-90s idle timeout
+        # never kills a pooled connection before the pre-ping catches it.
+        _ka = "keepalives=1&keepalives_idle=30&keepalives_interval=5&keepalives_count=3&connect_timeout=10"
+        _url = _url + ("&" if "?" in _url else "?") + _ka
 
-    USING_PG = True
-
-    def _pre_ping(conn: "psycopg.Connection") -> None:
-        """Pool pre-ping: verify connection is alive before handing to caller.
-        If this raises, psycopg_pool discards the connection and opens a fresh one."""
-        try:
-            conn.execute("SELECT 1")
-        except Exception as exc:
-            print(f"[DB] SSL drop detected in pre-ping ({type(exc).__name__}) — pool will reconnect")
-            raise
-
-    # Connection pool — sized for ~100 concurrent active engines.
-    # Render free PostgreSQL allows max 25 connections; Standard allows 97.
-    # Set max_size to leave headroom for migrations / admin tools.
-    _PG_POOL_MAX = int(os.getenv("PG_POOL_MAX", "30"))
-    _pool = ConnectionPool(
-        conninfo=_url,
-        min_size=2,
-        max_size=_PG_POOL_MAX,
-        kwargs={"row_factory": dict_row},
-        open=False,
-        check=_pre_ping,         # pool_pre_ping: ping before every hand-out
-        max_lifetime=1800,       # pool_recycle: recycle connections every 30 min
-        reconnect_timeout=10,
-    )
-    _pool.open(wait=True, timeout=30)
-
-    @contextmanager
-    def db_conn():
-        """Context manager — borrows a pre-pinged connection from the pool.
-
-        On SSL drop the pool's pre-ping catches the dead connection and reconnects
-        transparently. If a drop slips through (race between ping and use), we log
-        and re-raise so FastAPI returns a clean 500 rather than a cryptic SSL error.
-        """
-        try:
-            with _pool.connection() as conn:
-                yield conn
-        except psycopg.OperationalError as exc:
-            print(f"[DB] OperationalError after pool hand-out — {exc}")
+        def _pre_ping(conn: "psycopg.Connection") -> None:
             try:
-                _pool.check()  # evict any remaining stale connections
-            except Exception:
-                pass
-            print("[DB] DB reconnected after SSL drop")
-            raise
+                conn.execute("SELECT 1")
+            except Exception as exc:
+                print(f"[DB] SSL drop detected in pre-ping ({type(exc).__name__}) — pool will reconnect")
+                raise
 
-    def db():
-        """Legacy: returns a raw pool connection. Caller must call .close() to return it."""
-        return _pool.getconn()
+        _PG_POOL_MAX = int(os.getenv("PG_POOL_MAX", "50"))
 
-    def serial_pk() -> str:
-        return "SERIAL PRIMARY KEY"
+        # Try to open pool 3 times; if all fail, fall through to SQLite.
+        _pool_error = None
+        for _attempt in range(3):
+            try:
+                _pool = ConnectionPool(
+                    conninfo=_url,
+                    min_size=2,
+                    max_size=_PG_POOL_MAX,
+                    kwargs={"row_factory": dict_row},
+                    open=False,
+                    check=_pre_ping,
+                    max_lifetime=1800,
+                    reconnect_timeout=10,
+                )
+                _pool.open(wait=True, timeout=30)
+                _pool_error = None
+                break
+            except Exception as _e:
+                _pool_error = _e
+                if _attempt < 2:
+                    _time.sleep(5)
 
-    def column_exists(conn, table: str, col: str) -> bool:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name = %s AND column_name = %s",
-            (table, col),
-        )
-        exists = cur.fetchone() is not None
-        cur.close()
-        return exists
+        if _pool_error is not None:
+            raise _pool_error   # falls into the outer except → SQLite fallback
 
-else:
+        USING_PG = True
+        _pg_connected = True
+
+        @contextmanager
+        def db_conn():
+            """Borrow a pre-pinged connection from the pool."""
+            try:
+                with _pool.connection() as conn:
+                    yield conn
+            except psycopg.OperationalError as exc:
+                print(f"[DB] OperationalError after pool hand-out — {exc}")
+                try:
+                    _pool.check()
+                except Exception:
+                    pass
+                print("[DB] DB reconnected after SSL drop")
+                raise
+
+        def db():
+            return _pool.getconn()
+
+        def serial_pk() -> str:
+            return "SERIAL PRIMARY KEY"
+
+        def column_exists(conn, table: str, col: str) -> bool:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = %s AND column_name = %s",
+                (table, col),
+            )
+            exists = cur.fetchone() is not None
+            cur.close()
+            return exists
+
+    except Exception as _pg_err:
+        print(f"[DB] PostgreSQL unavailable ({_pg_err.__class__.__name__}) — falling back to SQLite")
+        DATABASE_URL = ""   # triggers SQLite block below
+
+if not DATABASE_URL:
     import sqlite3
-    from contextlib import contextmanager as _cm
 
     USING_PG = False
     _DB_PATH = os.getenv("ASYM_DB_PATH", "asymmetric_demo.db")
@@ -125,7 +133,7 @@ else:
             self._cur.close()
 
     class _Conn:
-        """Wraps sqlite3.Connection — exposes raw connection for PRAGMA access."""
+        """Wraps sqlite3.Connection."""
 
         def __init__(self, raw_conn):
             self._raw = raw_conn
@@ -143,8 +151,10 @@ else:
             self._raw.close()
 
     def _make_conn():
-        raw = sqlite3.connect(_DB_PATH, check_same_thread=False)
+        raw = sqlite3.connect(_DB_PATH, check_same_thread=False, timeout=60)
         raw.row_factory = _dict_factory
+        raw.execute("PRAGMA journal_mode=WAL")   # allow concurrent readers + 1 writer
+        raw.execute("PRAGMA busy_timeout=60000")  # 60s retry on locked writes
         return _Conn(raw)
 
     @contextmanager
