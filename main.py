@@ -606,7 +606,7 @@ def config():
     }
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     return {"health": "green"}
 
