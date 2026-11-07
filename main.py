@@ -2114,6 +2114,20 @@ class AutoRunner:
                         f"SL={sl_price:.4f}  TP={tp_price:.4f}{_trail_log}"
                     )
 
+                # ── E1: Stall exit — force-close if stuck near entry for 20+ candles ──
+                # Prevents dead capital sitting in a trade going nowhere.
+                # 20 candles = 20h (DAY_TRADE), 5h (SCALP), 80h (SWING).
+                _e1_pnl = ((exit_price - entry) / entry if side == "LONG"
+                           else (entry - exit_price) / entry)
+                if candles_held_so_far >= 20 and abs(_e1_pnl) < 0.005:
+                    self.log(
+                        f"E1 STALL EXIT: {side} @ {entry:.4f} | "
+                        f"{candles_held_so_far} candles held, {_e1_pnl*100:+.3f}% progress — "
+                        f"force-closing at market."
+                    )
+                    outcome = "E1_STALL"
+                    final_move = _e1_pnl
+
                 # ── Momentum Scaling (Pyramiding) — Grade A only, both paper and real ──
                 # Scale into winning positions in two stages.
                 # Guards: in profit, drawdown < 7%, strictness ≤ 1.10.
@@ -2215,7 +2229,9 @@ class AutoRunner:
                                     else:
                                         self.log(f"TRAIL ERROR: Retry also failed — {_tr_err}. Manual check needed for {self.symbol}.")
 
-                return None
+                if outcome != "E1_STALL":
+                    return None
+                # E1_STALL falls through to close at current price
 
         # Use the actual SL/TP price for display and DB when those levels were hit,
         # not the raw candle close — otherwise exit price and PnL are inconsistent.
