@@ -4187,6 +4187,13 @@ def _resume_runners_on_startup() -> None:
                     resumed += 1
                     print(f"[startup-resume] {email} — resumed {row['symbol']} {row['mode']} {row['trade_style']}")
 
+            # Pre-warm the balance cache so the first /balance request after
+            # a cold start returns instantly instead of blocking on Bybit API.
+            if REAL_TRADING:
+                from exchange_utils import _do_balance_refresh
+                import threading as _thr2
+                _thr2.Thread(target=_do_balance_refresh, args=(email,), daemon=True).start()
+
         except Exception as e:
             # Log but do NOT clear state — preserve it so the next redeploy can retry
             print(f"[startup-resume] {email} — error (state preserved): {e}")
