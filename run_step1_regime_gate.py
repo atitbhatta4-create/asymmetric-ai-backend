@@ -114,14 +114,19 @@ def extract(res):
     wr       = res.get("win_rate")
     trades   = res.get("total_trades", 0)
     mdd      = res.get("max_drawdown_pct") or res.get("max_drawdown")
-    monthly  = res.get("monthly_returns") or {}
+    monthly  = res.get("monthly_returns") or []
     return sharpe, wr, trades, mdd, monthly
 
 
 def yearly_sharpe(monthly):
-    """Compute per-year Sharpe from monthly returns dict {YYYY-MM: pnl_pct}."""
+    """Compute per-year Sharpe from monthly returns list [{"month": "YYYY-MM", "return_pct": float}]."""
     by_year = {}
-    for ym, pnl in (monthly or {}).items():
+    for entry in (monthly or []):
+        if isinstance(entry, dict):
+            ym  = entry.get("month", "")
+            pnl = entry.get("return_pct", 0.0)
+        else:
+            continue
         yr = ym[:4]
         by_year.setdefault(yr, []).append(float(pnl))
     result = {}
@@ -202,8 +207,8 @@ def main():
                 f"{bs:.3f}" if bs is not None else "—",
                 f"{ss:.3f}" if ss is not None else "—",
                 f"{delta:+.3f}" if delta is not None else "—",
-                f"{bwr:.1%}" if bwr is not None else "—",
-                f"{swr:.1%}" if swr is not None else "—",
+                f"{bwr:.1f}%" if bwr is not None else "—",
+                f"{swr:.1f}%" if swr is not None else "—",
                 str(btr) if btr else "—",
                 str(str_) if str_ else "—",
             )
@@ -236,8 +241,8 @@ def main():
                 f"{bs:.3f}" if bs is not None else "—",
                 f"{ss:.3f}" if ss is not None else "—",
                 f"{delta:+.3f}" if delta is not None else "—",
-                f"{bwr:.1%}" if bwr is not None else "—",
-                f"{swr:.1%}" if swr is not None else "—",
+                f"{bwr:.1f}%" if bwr is not None else "—",
+                f"{swr:.1f}%" if swr is not None else "—",
                 vs_rand,
             )
         )
