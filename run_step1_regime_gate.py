@@ -147,18 +147,18 @@ def main():
 
     # ── Coverage check ───────────────────────────────────────────────────────
     out.writeln("\nChecking candle coverage...")
-    all_ok = True
-    for coin in COINS:
-        for (d_from, d_to, label) in [
-            (IS_FROM, IS_TO, "IS"), (OOS_FROM, OOS_TO, "OOS")
-        ]:
-            ok, pct, msg = check_candle_coverage(coin, "1h", d_from, d_to, threshold=0.97)
-            if not ok:
-                out.writeln(f"  ✗ {coin} {label}: {pct:.1%} — {msg}")
-                all_ok = False
-    if all_ok:
-        out.writeln("  All 10 coins × IS+OOS: 100% coverage ✓")
+    def _to_ms(d):
+        return int(datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+    is_start_ms  = _to_ms(IS_FROM);  is_end_ms  = _to_ms(IS_TO)
+    oos_start_ms = _to_ms(OOS_FROM); oos_end_ms = _to_ms(OOS_TO)
+    all_ok_is,  rows_is  = check_candle_coverage(COINS, ["1h"], is_start_ms,  is_end_ms)
+    all_ok_oos, rows_oos = check_candle_coverage(COINS, ["1h"], oos_start_ms, oos_end_ms)
+    if all_ok_is and all_ok_oos:
+        out.writeln("  All 10 coins × IS+OOS: coverage OK ✓")
     else:
+        for r in rows_is + rows_oos:
+            if r.get("pct", 1.0) < 0.97:
+                out.writeln(f"  ✗ {r['symbol']} {r['tf']}: {r['pct']:.1%}")
         out.writeln("\n⚠  Coverage issues found. Run fix_candle_cache.py first.")
 
     # ── IS runs (tune window) ────────────────────────────────────────────────
