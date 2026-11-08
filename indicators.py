@@ -639,6 +639,93 @@ def _bollinger_bands(closes: List[float], period: int = 20, std_dev: float = 2.0
     return middle + std_dev * std, middle, middle - std_dev * std
 
 
+def donchian_channel(highs: List[float], lows: List[float], period: int = 20) -> Dict:
+    """
+    Donchian channel — where price sits within its own N-period range.
+
+    Returns:
+        upper    : highest high over last N candles
+        lower    : lowest low over last N candles
+        middle   : midpoint of channel
+        position : 0.0 (at lower) to 1.0 (at upper), based on last close
+        trend    : "UP" | "DOWN" | "RANGING"
+
+    Trend logic (used as regime gate):
+        position > 0.65 → price in upper 35% of channel → UP trend confirmed
+        position < 0.35 → price in lower 35% of channel → DOWN trend confirmed
+        0.35–0.65       → price in middle 30% → RANGING → block entry
+    """
+    if len(highs) < period or len(lows) < period:
+        return {"upper": None, "lower": None, "middle": None, "position": 0.5, "trend": "RANGING"}
+    upper  = max(highs[-period:])
+    lower  = min(lows[-period:])
+    middle = (upper + lower) / 2.0
+    span   = upper - lower
+    last_close = highs[-1]  # use last high as proxy if close not passed
+    position   = (last_close - lower) / span if span > 0 else 0.5
+    if position > 0.65:
+        trend = "UP"
+    elif position < 0.35:
+        trend = "DOWN"
+    else:
+        trend = "RANGING"
+    return {
+        "upper":    round(upper, 6),
+        "lower":    round(lower, 6),
+        "middle":   round(middle, 6),
+        "position": round(position, 3),
+        "trend":    trend,
+    }
+
+
+def donchian_regime_gate(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    side: str,
+    period: int = 20,
+) -> tuple:
+    """
+    Gate for a proposed entry direction using Donchian channel.
+
+    Returns (allowed: bool, reason: str).
+    - LONG  allowed only when Donchian trend = UP (price in upper 35%)
+    - SHORT allowed only when Donchian trend = DOWN (price in lower 35%)
+    - RANGING blocks both directions
+    """
+    if len(highs) < period:
+        return True, ""  # not enough data — don't block
+
+    upper  = max(highs[-period:])
+    lower  = min(lows[-period:])
+    span   = upper - lower
+    pos    = (closes[-1] - lower) / span if span > 0 else 0.5
+
+    if pos > 0.65:
+        dc_trend = "UP"
+    elif pos < 0.35:
+        dc_trend = "DOWN"
+    else:
+        dc_trend = "RANGING"
+
+    if dc_trend == "RANGING":
+        return False, (
+            f"Donchian: price at {pos:.0%} of {period}-bar channel — "
+            f"ranging zone (35–65%). No directional edge."
+        )
+    if side == "LONG" and dc_trend == "DOWN":
+        return False, (
+            f"Donchian: price at {pos:.0%} of {period}-bar channel — "
+            f"downtrend. LONG blocked by regime gate."
+        )
+    if side == "SHORT" and dc_trend == "UP":
+        return False, (
+            f"Donchian: price at {pos:.0%} of {period}-bar channel — "
+            f"uptrend. SHORT blocked by regime gate."
+        )
+    return True, ""
+
+
 def get_4h_trend_direction(candles_4h: List[Dict]) -> str:
     """
     Returns 'BULLISH', 'BEARISH', or 'NEUTRAL' based on 4h EMA9 vs EMA21.
@@ -872,6 +959,7 @@ def _compute_signal_layers(
     weekly_klines: Optional[List[Dict]] = None,
     enable_weekly_gate: bool = False,
     enable_mr_4h_gate: bool = False,
+    enable_regime_gate: bool = False,
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -936,14 +1024,29 @@ def _compute_signal_layers(
 
     # ── Phase 4: Regime classification (before any layer scoring) ────────────
     regime_class = _classify_regime(highs, lows, closes, adx, atr_pct, _atr_slow_pct=_atr_slow_pct_pc)
-    if regime_class["block"]:
+
+    # ── Regime gate (Step 1) — only trade in TRENDING regime ─────────────────
+    # When enable_regime_gate=True:
+    #   • MARGINAL is promoted to a hard block (normally just raises score bar)
+    #   • Donchian channel confirms direction before any entry is allowed
+    # Default OFF — existing behaviour preserved until backtest validates this.
+    _regime_gate_blocked = False
+    _regime_gate_reason  = ""
+    if enable_regime_gate and regime_class["regime"] == "MARGINAL":
+        _regime_gate_blocked = True
+        _regime_gate_reason  = (
+            f"REGIME_GATE: ADX {regime_class['adx']} — MARGINAL trend blocked. "
+            f"Waiting for ADX > 22 before entry."
+        )
+
+    if regime_class["block"] or _regime_gate_blocked:
         # Pick the highest-scoring alternative signal (T16 reversal or mean reversion)
         _alt = max(
             [r for r in [_rev, _mr] if r.get("ok")],
             key=lambda r: r["score"],
             default=None,
         )
-        if _alt:
+        if _alt and not _regime_gate_blocked:
             return {
                 "ok": True, "signal": _alt["signal_type"], "side": _alt["side"],
                 "score": _alt["score"], "grade": _alt["grade"],
@@ -956,9 +1059,10 @@ def _compute_signal_layers(
                 "market_regime": regime_class["regime"],
                 "adaptive_strictness": adaptive_strictness,
             }
+        _block_reason = _regime_gate_reason if _regime_gate_blocked else f"REGIME_{regime_class['regime']}: {regime_class['reason']}"
         return {
             "ok": False,
-            "blocked": f"REGIME_{regime_class['regime']}: {regime_class['reason']}",
+            "blocked": _block_reason,
             "signal": "BLOCKED", "score": 0.0, "breakdown": {},
             "side": None, "adaptive_strictness": adaptive_strictness,
             "market_regime": regime_class["regime"],
@@ -1449,6 +1553,16 @@ def _compute_signal_layers(
         "size_mult": mtf_size_mult,
         "reason": "" if mtf_confirmed else "15m not confirmed — size reduced 15% for lower conviction",
     }
+
+    # ── Donchian direction gate (Step 1) ─────────────────────────────────────
+    # Only runs when enable_regime_gate=True. Checks that price is in the
+    # upper 35% (LONG) or lower 35% (SHORT) of its 20-bar channel.
+    # Prevents entries when price is stuck in the middle of a range.
+    if enable_regime_gate:
+        _dc_ok, _dc_reason = donchian_regime_gate(highs, lows, closes, desired_side, period=20)
+        breakdown["donchian"] = {"ok": _dc_ok, "reason": _dc_reason}
+    else:
+        breakdown["donchian"] = {"ok": True, "reason": ""}
 
     failed = [k for k, v in breakdown.items() if not v.get("ok") and k != "mtf_15m"]
     _score_below = round(total_score, 4) < round(min_score, 4)

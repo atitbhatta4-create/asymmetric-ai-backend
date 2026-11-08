@@ -95,13 +95,15 @@ from routes_portfolio import portfolio_router
 from routes_engine import engine_router
 
 # ── Engine feature flags ───────────────────────────────────────────────────────
-# MR_4H_GATE: backtest Sharpe delta = -0.29 on corrected baseline — OFF
-# PAT_EXEC:   backtest Sharpe delta = -0.76 on corrected baseline — OFF
-# T18:        backtest Sharpe delta = -0.22 on corrected baseline — OFF
+# MR_4H_GATE:    backtest Sharpe delta = -0.29 on corrected baseline — OFF
+# PAT_EXEC:      backtest Sharpe delta = -0.76 on corrected baseline — OFF
+# T18:           backtest Sharpe delta = -0.22 on corrected baseline — OFF
+# REGIME_GATE:   Step 1 — Donchian + MARGINAL block — OFF until backtest validates
 # TRAIL + CHOPPY_TRAIL are always active (built into the exit loop, +0.25 combined)
-ENABLE_MR_4H_GATE = False
-ENABLE_PAT_EXEC   = False
-ENABLE_T18        = False
+ENABLE_MR_4H_GATE   = False
+ENABLE_PAT_EXEC     = False
+ENABLE_T18          = False
+ENABLE_REGIME_GATE  = False  # Step 1: set True only after backtest passes
 # ──────────────────────────────────────────────────────────────────────────────
 
 import sentry_sdk
@@ -2831,6 +2833,7 @@ class AutoRunner:
             symbol=self.symbol,
             daily_klines=daily_klines or None,
             enable_mr_4h_gate=ENABLE_MR_4H_GATE,
+            enable_regime_gate=ENABLE_REGIME_GATE,
         )
 
         # Enforce side restriction from weekly filter or parabolic regime

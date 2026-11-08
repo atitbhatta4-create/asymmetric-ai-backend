@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random as _random_module
 import statistics
 import threading
 import time
@@ -26,7 +27,8 @@ import httpx
 from config import DUBAI_TZ, HIGHER_TF_MAP, OKX_BASE, OKX_TF_MAP, TRADE_STYLE_PARAMS
 from database import db_conn, serial_pk, USING_PG
 from indicators import (
-    _atr, _adx, _adx_series, _compute_signal_layers,
+    _atr, _adx, _adx_series, _atr_series, _rsi_series, _ema,
+    _compute_signal_layers,
     get_market_regime, check_weekly_trend,
     check_pullback_entry, check_volume_hour_confirmed,
 )
@@ -206,35 +208,44 @@ def init_backtest_tables() -> None:
 def _fetch_okx_history_page(
     inst: str, bar: str, after_ms: Optional[int] = None
 ) -> List[Dict]:
-    """Fetch one page (≤100) of OKX history-candles. Returns chronological list."""
+    """Fetch one page (≤100) of OKX history-candles with exponential-backoff retry."""
     params: Dict = {"instId": inst, "bar": bar, "limit": OKX_HIST_CANDLES_LIMIT}
     if after_ms is not None:
         params["after"] = str(after_ms)
-    try:
-        r = httpx.get(
-            f"{OKX_BASE}/api/v5/market/history-candles",
-            params=params,
-            timeout=20,
-            headers={"accept": "application/json"},
-        )
-        if r.status_code != 200:
+    for attempt in range(4):  # 1 initial + 3 retries
+        try:
+            r = httpx.get(
+                f"{OKX_BASE}/api/v5/market/history-candles",
+                params=params,
+                timeout=20,
+                headers={"accept": "application/json"},
+            )
+            if r.status_code == 200:
+                rows = (r.json() or {}).get("data") or []
+                out: List[Dict] = []
+                for k in rows:
+                    out.append({
+                        "t":      int(k[0]),
+                        "open":   float(k[1]),
+                        "high":   float(k[2]),
+                        "low":    float(k[3]),
+                        "close":  float(k[4]),
+                        "volume": float(k[5]),
+                    })
+                out.reverse()  # chronological (oldest first)
+                return out
+            # 429 = rate-limited, 5xx = server error — worth retrying
+            if r.status_code in (429,) or r.status_code >= 500:
+                time.sleep(2.0 * (2 ** attempt))  # 2 s, 4 s, 8 s
+                continue
+            # 4xx non-429 (bad request, not found): no point retrying
             return []
-        rows = (r.json() or {}).get("data") or []
-        out: List[Dict] = []
-        for k in rows:
-            # OKX returns: [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
-            out.append({
-                "t":      int(k[0]),
-                "open":   float(k[1]),
-                "high":   float(k[2]),
-                "low":    float(k[3]),
-                "close":  float(k[4]),
-                "volume": float(k[5]),
-            })
-        out.reverse()  # chronological (oldest first)
-        return out
-    except Exception:
-        return []
+        except Exception:
+            if attempt < 3:
+                time.sleep(2.0 * (2 ** attempt))
+                continue
+            return []
+    return []
 
 
 def _ensure_candles(
@@ -243,16 +254,27 @@ def _ensure_candles(
     start_ms: int,
     end_ms: int,
     on_progress: Optional[callable] = None,
+    force_refetch: bool = False,
 ) -> List[Dict]:
     """
     Return candles for symbol/tf in [start_ms, end_ms] from DB.
     Fetches from OKX and stores in DB any missing range.
+    force_refetch=True deletes cached rows first, forcing a clean re-fetch.
     Candles are returned in chronological order (oldest first).
     """
     inst = _to_okx_inst(symbol)
     bar  = OKX_TF_MAP.get(tf)
     if not bar:
         return []
+
+    if force_refetch:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM backtest_candles WHERE symbol=%s AND tf=%s AND ts>=%s AND ts<=%s",
+                (symbol.upper(), tf, start_ms, end_ms),
+            )
+            conn.commit()
 
     # Check what's already in DB
     with db_conn() as conn:
@@ -322,6 +344,84 @@ def _ensure_candles(
          "low": r["low"], "close": r["close"], "volume": r["volume"]}
         for r in rows
     ]
+
+
+def check_candle_coverage(
+    symbols: List[str],
+    tfs: List[str],
+    start_ms: int,
+    end_ms: int,
+    threshold: float = 0.97,
+) -> Tuple[bool, List[Dict]]:
+    """
+    Check candle coverage for all symbols × tfs.
+    Returns (all_ok, rows) where all_ok is False if any entry is under threshold.
+    Call this before running baseline to catch incomplete caches early.
+    """
+    _tf_ms = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000, "1W": 604_800_000}
+    rows: List[Dict] = []
+    all_ok = True
+
+    with db_conn() as conn:
+        cur = conn.cursor()
+        for sym in symbols:
+            for tf in tfs:
+                interval_ms = _tf_ms.get(tf, 3_600_000)
+                expected    = max(1, (end_ms - start_ms) // interval_ms)
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt, MIN(ts) AS first_ts, MAX(ts) AS last_ts"
+                    " FROM backtest_candles WHERE symbol=%s AND tf=%s AND ts>=%s AND ts<=%s",
+                    (sym.upper(), tf, start_ms, end_ms),
+                )
+                row     = cur.fetchone()
+                cnt     = row["cnt"]     if row else 0
+                first_v = row["first_ts"] if row else None
+                last_v  = row["last_ts"]  if row else None
+                pct     = cnt / expected
+                ok      = pct >= threshold
+                if not ok:
+                    all_ok = False
+                rows.append({
+                    "symbol":   sym.upper(),
+                    "tf":       tf,
+                    "count":    cnt,
+                    "expected": expected,
+                    "pct":      round(pct * 100, 1),
+                    "first":    datetime.utcfromtimestamp(first_v / 1000).strftime("%Y-%m-%d") if first_v else "—",
+                    "last":     datetime.utcfromtimestamp(last_v  / 1000).strftime("%Y-%m-%d") if last_v  else "—",
+                    "ok":       ok,
+                })
+    return all_ok, rows
+
+
+def prefetch_all_candles(
+    symbols: List[str],
+    date_from: str,
+    date_to: str,
+    style: str = "DAY_TRADE",
+    force_refetch: bool = False,
+) -> None:
+    """
+    Pre-fetch and cache candles for all symbols before running simulations.
+    Runs sequentially to avoid OKX rate limits. Checks 97% threshold per coin.
+    Call this once at the start of a baseline run.
+    """
+    from datetime import datetime as _dt
+    tf       = TF_FROM_STYLE.get(style, "1h")
+    higher_tf = HIGHER_TF_MAP.get(tf, tf)
+    start_ms = int(_dt.strptime(date_from, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+    end_ms   = int(_dt.strptime(date_to,   "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+    daily_start_ms    = start_ms - 30 * 86_400_000
+    weekly_start_ms   = start_ms - 210 * 7 * 24 * 3600 * 1000
+
+    for sym in symbols:
+        print(f"  prefetch {sym} … ", end="", flush=True)
+        _ensure_candles(sym, tf,        start_ms,        end_ms,   force_refetch=force_refetch)
+        _ensure_candles(sym, higher_tf, start_ms,        end_ms,   force_refetch=force_refetch)
+        _ensure_candles(sym, "1d",      daily_start_ms,  end_ms,   force_refetch=force_refetch)
+        _ensure_candles("BTCUSDT", "1W", weekly_start_ms, end_ms,  force_refetch=force_refetch)
+        print("done")
 
 
 # ── Simulation helpers ─────────────────────────────────────────────────────────
@@ -794,7 +894,10 @@ def _run_worker(
     enable_t18: bool = True,
     enable_s4: bool = False,
     enable_mr_4h_gate: bool = False,
+    enable_regime_gate: bool = False,
     t1_tp_mult: float = 1.0,
+    enable_floor: bool = True,
+    random_seed: Optional[int] = None,
 ) -> None:
     _last_db_write = [0.0]  # throttle DB progress writes
 
@@ -882,8 +985,11 @@ def _run_worker(
         st = TRADE_STYLE_PARAMS[style]
         c  = MODE_PRESETS[mode]
 
+        orig_start_equity = start_equity
         equity      = start_equity
         peak_equity = start_equity
+        _floor_resets: List[Dict] = []
+        _floor_cooldown_until: int = 0
         trades:       List[Dict] = []
         equity_curve: List[Dict] = [{"ts": main_candles[WARMUP_CANDLES]["t"], "equity": equity}]
 
@@ -897,13 +1003,30 @@ def _run_worker(
         _pending_score:      float = 0.0
         _candles_since_sig:  int  = 0
 
-        # Precompute ADX series once — avoids recomputing 300-candle ADX every candle
-        _adx_vals = _adx_series(
-            [c["high"]  for c in main_candles],
-            [c["low"]   for c in main_candles],
-            [c["close"] for c in main_candles],
-            14,
-        )
+        # Post-reset size cap: 50% until +10% recovery; 2+ resets in 90d → cap stays
+        _post_reset_active: bool  = False
+        _post_reset_base:   float = 0.0
+        _post_reset_cap:    float = 1.0
+
+        # Precompute indicator series — eliminates ~9× O(n) computation per candle
+        _all_closes = [c["close"] for c in main_candles]
+        _all_highs  = [c["high"]  for c in main_candles]
+        _all_lows   = [c["low"]   for c in main_candles]
+        _adx_vals   = _adx_series(_all_highs, _all_lows, _all_closes, 14)
+        _rsi_raw    = _rsi_series(_all_closes, 14)
+        _rsi_full   = [None] * (len(_all_closes) - len(_rsi_raw)) + _rsi_raw
+        _precomp = {
+            "ema9":  _ema(_all_closes, 9),
+            "ema21": _ema(_all_closes, 21),
+            "ema50": _ema(_all_closes, 50),
+            "rsi":   _rsi_full,
+            "atr14": _atr_series(_all_highs, _all_lows, _all_closes, 14),
+            "adx":   _adx_vals,
+            "atr50": _atr_series(_all_highs, _all_lows, _all_closes, 50),
+        }
+
+        # Random-entry benchmark: deterministic RNG, bypasses signal computation
+        _rng = _random_module.Random(random_seed) if random_seed is not None else None
 
         for i in range(WARMUP_CANDLES, len(main_candles)):
             candle = main_candles[i]
@@ -959,8 +1082,69 @@ def _run_worker(
                     open_trade = None
 
             # ── Hard floor stop (R1 Hybrid — mirrors live _compute_floor) ─
+            if candle["t"] < _floor_cooldown_until:
+                continue  # inside cooldown window — skip candle
+
             if equity <= _sim_floor(peak_equity, start_equity):
-                break
+                if not enable_floor:
+                    pass  # floor OFF: ignore hit, keep trading
+                else:
+                    # Force-close any open trade at this candle's close price
+                    if open_trade:
+                        _close_price  = candle["close"]
+                        _entry        = open_trade["entry"]
+                        _side         = open_trade["side"]
+                        _eff_size     = open_trade["effective_size"]
+                        _lev          = open_trade["leverage"]
+                        _raw_move     = (_close_price - _entry) / _entry if _side == "LONG" else (_entry - _close_price) / _entry
+                        fees          = EXCHANGE_FEES[exchange]["taker"] * 2 + EXCHANGE_FEES[exchange]["slippage"]
+                        _force_pnl    = equity * _eff_size * _lev * (_raw_move - fees)
+                        equity       += _force_pnl
+                        trades.append({
+                            "pnl":     _force_pnl,
+                            "outcome": "floor_close",
+                            "side":    open_trade["side"],
+                            "grade":   open_trade["grade"],
+                            "signal":  open_trade["signal"],
+                            "score":   open_trade["score"],
+                            "regime":  open_trade["regime"],
+                            "open_ts": open_trade["open_ts"],
+                            "exit_ts": candle["t"],
+                            "entry":   open_trade["entry"],
+                            "sl_pct":  open_trade["sl_pct"],
+                            "tp_pct":  open_trade["tp_pct"],
+                            "scaled":  open_trade.get("scaled", False),
+                        })
+                        equity_curve.append({"ts": candle["t"], "equity": round(equity, 4)})
+                        open_trade = None
+
+                    # Determine cooldown: 30 days if second hit within 90 days
+                    _last_hit_ts  = _floor_resets[-1]["ts"] if _floor_resets else 0
+                    _days_since   = (candle["t"] - _last_hit_ts) / 86_400_000
+                    _double_hit   = bool(_floor_resets) and _days_since <= 90
+                    _cooldown_days = 30 if _double_hit else 7
+
+                    _floor_resets.append({
+                        "ts":           candle["t"],
+                        "equity":       round(equity, 2),
+                        "cooldown_days": _cooldown_days,
+                        "double_hit":   _double_hit,
+                    })
+                    _floor_cooldown_until = candle["t"] + int(_cooldown_days * 86_400_000)
+                    start_equity  = equity   # new floor anchors to current equity
+                    peak_equity   = equity
+
+                    # Clear any stale pending signal — it was based on pre-reset context
+                    _signal_pending    = False
+                    _pending_side      = ""
+                    _pending_score     = 0.0
+                    _candles_since_sig = 0
+
+                    # Post-reset size cap: restart at 50%, full only after +10% recovery
+                    _post_reset_active = True
+                    _post_reset_base   = equity
+                    _post_reset_cap    = 0.5
+                    continue
 
             # ── Try to open new trade ─────────────────────────────────
             if open_trade is None:
@@ -1020,6 +1204,28 @@ def _run_worker(
                     _allowed_sides = ["LONG"]
 
                 daily_slice = _get_aligned_slice(daily_candles, candle["t"], 30) if daily_candles else []
+
+                # Random-entry benchmark: bypass signal/pullback, enter randomly
+                if _rng is not None:
+                    if _rng.random() < (1.0 / 80.0):
+                        _r_atr   = ATR_BASELINE[tf]
+                        _r_sl    = min(_r_atr * st["sl_atr"], st["sl_max"] / 100)
+                        _r_tp    = min(_r_atr * st["tp_atr"], st["tp_max"] / 100)
+                        _r_esize = c["size"] * _mode_cfg.get("position_size_mult", 1.0) * _post_reset_cap
+                        open_trade = {
+                            "entry": candle["close"], "side": _rng.choice(["LONG", "SHORT"]),
+                            "grade": "B", "sl_pct": _r_sl, "tp_pct": _r_tp,
+                            "t1_tp_mult": t1_tp_mult, "effective_size": _r_esize,
+                            "leverage": c["leverage"], "equity_at_open": equity,
+                            "atr_pct": _r_atr, "adx_at_open": 0.0,
+                            "t1_size": _r_esize * 0.60, "t2_size": _r_esize * 0.40,
+                            "t1_done": False, "t2_sl_is_breakeven": False,
+                            "accumulated_pnl": 0.0,
+                            "open_ts": candle["t"], "signal": "RANDOM", "score": 0.5,
+                            "regime": "TRENDING",
+                        }
+                    continue  # skip full signal chain regardless
+
                 sig = _compute_signal_layers(
                     klines, mode, 1.0, higher_slice, style, mtf_slice,
                     enable_t16=enable_t16, enable_s4=enable_s4, symbol=symbol,
@@ -1027,6 +1233,8 @@ def _run_worker(
                     daily_klines=daily_slice or None,
                     candle_ts_ms=candle["t"],
                     enable_mr_4h_gate=enable_mr_4h_gate,
+                    enable_regime_gate=enable_regime_gate,
+                    _precomp={**_precomp, "idx": i},
                 )
 
                 # Enforce side restriction
@@ -1114,7 +1322,20 @@ def _run_worker(
                 # ── Change 5: Mode position_size_mult ─────────────────
                 mode_size_mult = _mode_cfg.get("position_size_mult", 1.0)
 
-                effective_size = c["size"] * mtf_size_mult * vol_mult * dd_mult * mode_size_mult
+                # Post-reset cap: check recovery (+10% from reset base) before sizing
+                if _post_reset_active and equity >= _post_reset_base * 1.10:
+                    _post_reset_active = False
+                    _recent_90d = sum(
+                        1 for r in _floor_resets
+                        if (candle["t"] - r["ts"]) <= 90 * 86_400_000
+                    )
+                    if _recent_90d < 2:
+                        _post_reset_cap = 1.0  # recovered, lift cap
+
+                effective_size = (
+                    c["size"] * mtf_size_mult * vol_mult * dd_mult
+                    * mode_size_mult * _post_reset_cap
+                )
 
                 # Degrade Grade B → A if T1 leg would be below $5 (mirrors live min-order check)
                 if grade == "B" and equity * effective_size * 0.60 < 5.0:
@@ -1150,9 +1371,11 @@ def _run_worker(
         # ── 3. Calculate metrics ───────────────────────────────────────────
         buy_hold_entry = main_candles[WARMUP_CANDLES]["close"]
         buy_hold_exit  = main_candles[-1]["close"]
-        result_json    = _calc_metrics(trades, equity_curve, start_equity, buy_hold_entry, buy_hold_exit)
+        result_json    = _calc_metrics(trades, equity_curve, orig_start_equity, buy_hold_entry, buy_hold_exit)
         result_json["candles_fetched"]   = len(main_candles)
         result_json["sim_candles_used"]  = len(main_candles) - WARMUP_CANDLES
+        result_json["floor_resets"]      = _floor_resets
+        result_json["floor_reset_count"] = len(_floor_resets)
         result_json["session_note"] = (
             "Session quality computed using historical candle timestamp (candle_ts_ms). "
             "Daily bias passed from 30-day daily slice aligned to each candle. "
@@ -1197,7 +1420,10 @@ def start_backtest(
     enable_t18: bool = True,
     enable_s4: bool = False,
     enable_mr_4h_gate: bool = False,
+    enable_regime_gate: bool = False,
     t1_tp_mult: float = 1.0,
+    enable_floor: bool = True,
+    random_seed: Optional[int] = None,
 ) -> str:
     """Validate inputs, create DB record, start background thread, return run_id."""
     from datetime import datetime
@@ -1251,7 +1477,7 @@ def start_backtest(
         target=_run_worker,
         args=(run_id, email, symbol.upper(), tf, mode, style, exchange,
               start_ms, end_ms, start_equity, enable_t16, enable_t18, enable_s4,
-              enable_mr_4h_gate, t1_tp_mult),
+              enable_mr_4h_gate, enable_regime_gate, t1_tp_mult, enable_floor, random_seed),
         daemon=True,
     )
     t.start()
