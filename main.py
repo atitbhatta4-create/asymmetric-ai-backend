@@ -105,6 +105,7 @@ ENABLE_PAT_EXEC     = False
 ENABLE_T18          = False
 ENABLE_REGIME_GATE  = False  # Step 1: set True only after backtest passes
 ENABLE_E2           = False  # Step 8: set True only after backtest passes
+ENABLE_STEP2_SCORE  = False  # Step 2: set True only after backtest passes
 # ──────────────────────────────────────────────────────────────────────────────
 
 import sentry_sdk
@@ -2850,6 +2851,7 @@ class AutoRunner:
             daily_klines=daily_klines or None,
             enable_mr_4h_gate=ENABLE_MR_4H_GATE,
             enable_regime_gate=ENABLE_REGIME_GATE,
+            enable_step2_score=ENABLE_STEP2_SCORE,
         )
 
         # Enforce side restriction from weekly filter or parabolic regime

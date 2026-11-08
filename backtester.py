@@ -896,6 +896,7 @@ def _run_worker(
     enable_mr_4h_gate: bool = False,
     enable_regime_gate: bool = False,
     enable_e2: bool = False,
+    enable_step2_score: bool = False,
     t1_tp_mult: float = 1.0,
     enable_floor: bool = True,
     random_seed: Optional[int] = None,
@@ -1276,6 +1277,7 @@ def _run_worker(
                     candle_ts_ms=candle["t"],
                     enable_mr_4h_gate=enable_mr_4h_gate,
                     enable_regime_gate=enable_regime_gate,
+                    enable_step2_score=enable_step2_score,
                     _precomp={**_precomp, "idx": i},
                 )
 
@@ -1464,6 +1466,7 @@ def start_backtest(
     enable_mr_4h_gate: bool = False,
     enable_regime_gate: bool = False,
     enable_e2: bool = False,
+    enable_step2_score: bool = False,
     t1_tp_mult: float = 1.0,
     enable_floor: bool = True,
     random_seed: Optional[int] = None,
@@ -1520,7 +1523,7 @@ def start_backtest(
         target=_run_worker,
         args=(run_id, email, symbol.upper(), tf, mode, style, exchange,
               start_ms, end_ms, start_equity, enable_t16, enable_t18, enable_s4,
-              enable_mr_4h_gate, enable_regime_gate, enable_e2, t1_tp_mult, enable_floor, random_seed),
+              enable_mr_4h_gate, enable_regime_gate, enable_e2, enable_step2_score, t1_tp_mult, enable_floor, random_seed),
         daemon=True,
     )
     t.start()

@@ -960,6 +960,7 @@ def _compute_signal_layers(
     enable_weekly_gate: bool = False,
     enable_mr_4h_gate: bool = False,
     enable_regime_gate: bool = False,
+    enable_step2_score: bool = False,
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -1146,6 +1147,10 @@ def _compute_signal_layers(
         # Cap: adaptive strictness may raise min_score by at most 0.07 above base.
         # Without the cap, 2.50× strictness pushed NEAR to 0.65 + 0.18 = 0.83 — too aggressive.
         p["min_score"]    = min(0.70, p["min_score"] + (s - 1) * 0.12)
+
+    # ── Step 2: Score floor 0.70 — only entries with strong conviction pass ──
+    if enable_step2_score:
+        p["min_score"] = max(p["min_score"], 0.70)
 
     # Apply MARGINAL regime penalty — raises min_score so only strong signals fire
     p["min_score"] = min(0.92, p["min_score"] + regime_class["min_score_penalty"])
