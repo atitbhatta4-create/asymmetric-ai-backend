@@ -104,6 +104,7 @@ ENABLE_MR_4H_GATE   = False
 ENABLE_PAT_EXEC     = False
 ENABLE_T18          = False
 ENABLE_REGIME_GATE  = False  # Step 1: set True only after backtest passes
+ENABLE_E2           = False  # Step 8: set True only after backtest passes
 # ──────────────────────────────────────────────────────────────────────────────
 
 import sentry_sdk
@@ -2137,6 +2138,21 @@ class AutoRunner:
                     outcome = "E1_STALL"
                     final_move = _e1_pnl
 
+                # ── E2: Score-scaled time exit — max hold time by signal strength ──
+                # Weak signals get a shorter leash; strong signals get more time.
+                # Only fires if E1 hasn't already triggered.
+                if outcome != "E1_STALL" and ENABLE_E2:
+                    _e2_score = float(pt.get("score_open", 0.65))
+                    _e2_max = 30 if _e2_score >= 0.80 else (22 if _e2_score >= 0.70 else 15)
+                    if candles_held_so_far >= _e2_max:
+                        self.log(
+                            f"E2 TIME EXIT: {side} @ {entry:.4f} | "
+                            f"score={_e2_score:.2f} max={_e2_max}c held={candles_held_so_far}c "
+                            f"pnl={_e1_pnl*100:+.3f}% — time budget exhausted."
+                        )
+                        outcome = "E2_TIME"
+                        final_move = _e1_pnl
+
                 # ── Momentum Scaling (Pyramiding) — Grade A only, both paper and real ──
                 # Scale into winning positions in two stages.
                 # Guards: in profit, drawdown < 7%, strictness ≤ 1.10.
@@ -2238,9 +2254,9 @@ class AutoRunner:
                                     else:
                                         self.log(f"TRAIL ERROR: Retry also failed — {_tr_err}. Manual check needed for {self.symbol}.")
 
-                if outcome != "E1_STALL":
+                if outcome not in ("E1_STALL", "E2_TIME"):
                     return None
-                # E1_STALL falls through to close at current price
+                # E1_STALL / E2_TIME falls through to close at current price
 
         # Use the actual SL/TP price for display and DB when those levels were hit,
         # not the raw candle close — otherwise exit price and PnL are inconsistent.

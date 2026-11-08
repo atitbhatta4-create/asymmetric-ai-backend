@@ -895,6 +895,7 @@ def _run_worker(
     enable_s4: bool = False,
     enable_mr_4h_gate: bool = False,
     enable_regime_gate: bool = False,
+    enable_e2: bool = False,
     t1_tp_mult: float = 1.0,
     enable_floor: bool = True,
     random_seed: Optional[int] = None,
@@ -1058,28 +1059,69 @@ def _run_worker(
                         open_trade["scale2_done"]   = True
                         open_trade["profit_lock"]   = 1.5 * _atr   # SL at +1.5× ATR from entry
 
-                result = _sim_check_exit(open_trade, candle, exchange,
-                                        regime=open_trade.get("regime", "TRENDING"))
-                if result and result.get("closed"):
-                    equity += result["pnl"]
-                    peak_equity = max(peak_equity, equity)
-                    trades.append({
-                        "pnl":      result["pnl"],
-                        "outcome":  result["outcome"],
-                        "side":     open_trade["side"],
-                        "grade":    open_trade["grade"],
-                        "signal":   open_trade["signal"],
-                        "score":    open_trade["score"],
-                        "regime":   open_trade["regime"],
-                        "open_ts":  open_trade["open_ts"],
-                        "exit_ts":  result["exit_ts"],
-                        "entry":    open_trade["entry"],
-                        "sl_pct":   open_trade["sl_pct"],
-                        "tp_pct":   open_trade["tp_pct"],
-                        "scaled":   open_trade.get("scaled", False),
-                    })
-                    equity_curve.append({"ts": result["exit_ts"], "equity": round(equity, 4)})
-                    open_trade = None
+                # ── E2: Score-scaled time exit ────────────────────────────────
+                if enable_e2 and open_trade:
+                    _e2_tf_ms  = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}.get(tf, 3_600_000)
+                    _e2_held   = (candle["t"] - open_trade["open_ts"]) // _e2_tf_ms
+                    _e2_score  = float(open_trade.get("score", 0.65))
+                    _e2_max    = 30 if _e2_score >= 0.80 else (22 if _e2_score >= 0.70 else 15)
+                    if _e2_held >= _e2_max:
+                        _e2_entry = open_trade["entry"]
+                        _e2_side  = open_trade["side"]
+                        _e2_close = candle["close"]
+                        _e2_lev   = open_trade["leverage"]
+                        _e2_raw   = ((_e2_close - _e2_entry) / _e2_entry if _e2_side == "LONG"
+                                     else (_e2_entry - _e2_close) / _e2_entry)
+                        if open_trade["grade"] == "B" and open_trade.get("t1_done"):
+                            _e2_size = open_trade["equity_at_open"] * open_trade["t2_size"]
+                        else:
+                            _e2_size = open_trade["equity_at_open"] * open_trade["effective_size"]
+                        _e2_pnl = (open_trade.get("accumulated_pnl", 0.0)
+                                   + _e2_size * _e2_lev * _e2_raw
+                                   - _fee_cost(_e2_size, "SL_HIT", exchange))
+                        equity += _e2_pnl
+                        peak_equity = max(peak_equity, equity)
+                        trades.append({
+                            "pnl":     _e2_pnl,
+                            "outcome": "E2_TIME",
+                            "side":    open_trade["side"],
+                            "grade":   open_trade["grade"],
+                            "signal":  open_trade["signal"],
+                            "score":   open_trade["score"],
+                            "regime":  open_trade["regime"],
+                            "open_ts": open_trade["open_ts"],
+                            "exit_ts": candle["t"],
+                            "entry":   open_trade["entry"],
+                            "sl_pct":  open_trade["sl_pct"],
+                            "tp_pct":  open_trade["tp_pct"],
+                            "scaled":  open_trade.get("scaled", False),
+                        })
+                        equity_curve.append({"ts": candle["t"], "equity": round(equity, 4)})
+                        open_trade = None
+
+                if open_trade:
+                    result = _sim_check_exit(open_trade, candle, exchange,
+                                            regime=open_trade.get("regime", "TRENDING"))
+                    if result and result.get("closed"):
+                        equity += result["pnl"]
+                        peak_equity = max(peak_equity, equity)
+                        trades.append({
+                            "pnl":      result["pnl"],
+                            "outcome":  result["outcome"],
+                            "side":     open_trade["side"],
+                            "grade":    open_trade["grade"],
+                            "signal":   open_trade["signal"],
+                            "score":    open_trade["score"],
+                            "regime":   open_trade["regime"],
+                            "open_ts":  open_trade["open_ts"],
+                            "exit_ts":  result["exit_ts"],
+                            "entry":    open_trade["entry"],
+                            "sl_pct":   open_trade["sl_pct"],
+                            "tp_pct":   open_trade["tp_pct"],
+                            "scaled":   open_trade.get("scaled", False),
+                        })
+                        equity_curve.append({"ts": result["exit_ts"], "equity": round(equity, 4)})
+                        open_trade = None
 
             # ── Hard floor stop (R1 Hybrid — mirrors live _compute_floor) ─
             if candle["t"] < _floor_cooldown_until:
@@ -1421,6 +1463,7 @@ def start_backtest(
     enable_s4: bool = False,
     enable_mr_4h_gate: bool = False,
     enable_regime_gate: bool = False,
+    enable_e2: bool = False,
     t1_tp_mult: float = 1.0,
     enable_floor: bool = True,
     random_seed: Optional[int] = None,
@@ -1477,7 +1520,7 @@ def start_backtest(
         target=_run_worker,
         args=(run_id, email, symbol.upper(), tf, mode, style, exchange,
               start_ms, end_ms, start_equity, enable_t16, enable_t18, enable_s4,
-              enable_mr_4h_gate, enable_regime_gate, t1_tp_mult, enable_floor, random_seed),
+              enable_mr_4h_gate, enable_regime_gate, enable_e2, t1_tp_mult, enable_floor, random_seed),
         daemon=True,
     )
     t.start()
