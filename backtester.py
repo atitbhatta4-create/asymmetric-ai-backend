@@ -929,6 +929,7 @@ def _run_worker(
     t1_tp_mult: float = 1.0,
     enable_floor: bool = True,
     random_seed: Optional[int] = None,
+    score_floor: float = 0.0,
 ) -> None:
     _last_db_write = [0.0]  # throttle DB progress writes
 
@@ -1308,6 +1309,7 @@ def _run_worker(
                     enable_mr_4h_gate=enable_mr_4h_gate,
                     enable_regime_gate=enable_regime_gate,
                     enable_step2_score=enable_step2_score,
+                    score_floor=score_floor,
                     _precomp={**_precomp, "idx": i},
                 )
 
@@ -1507,6 +1509,7 @@ def start_backtest(
     t1_tp_mult: float = 1.0,
     enable_floor: bool = True,
     random_seed: Optional[int] = None,
+    score_floor: float = 0.0,
 ) -> str:
     """Validate inputs, create DB record, start background thread, return run_id."""
     from datetime import datetime
@@ -1562,7 +1565,7 @@ def start_backtest(
               start_ms, end_ms, start_equity, enable_t16, enable_t18, enable_s4,
               enable_mr_4h_gate, enable_regime_gate, enable_e2, enable_step2_score,
               enable_grade_b_all, enable_score_cap, score_cap,
-              t1_tp_mult, enable_floor, random_seed),
+              t1_tp_mult, enable_floor, random_seed, score_floor),
         daemon=True,
     )
     t.start()

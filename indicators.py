@@ -962,6 +962,7 @@ def _compute_signal_layers(
     enable_regime_gate: bool = False,
     enable_step2_score: bool = False,
     enable_dc_filter: bool = False,
+    score_floor: float = 0.0,
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -1149,9 +1150,10 @@ def _compute_signal_layers(
         # Without the cap, 2.50× strictness pushed NEAR to 0.65 + 0.18 = 0.83 — too aggressive.
         p["min_score"]    = min(0.70, p["min_score"] + (s - 1) * 0.12)
 
-    # ── Step 2: Score floor 0.70 — only entries with strong conviction pass ──
-    if enable_step2_score:
-        p["min_score"] = max(p["min_score"], 0.70)
+    # ── Step 2: Score floor — only entries with strong conviction pass ──
+    _sf = max(0.70 if enable_step2_score else 0.0, score_floor)
+    if _sf > 0:
+        p["min_score"] = max(p["min_score"], _sf)
 
     # Apply MARGINAL regime penalty — raises min_score so only strong signals fire
     p["min_score"] = min(0.92, p["min_score"] + regime_class["min_score_penalty"])

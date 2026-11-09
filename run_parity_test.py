@@ -143,7 +143,7 @@ def run_backtest(symbol, date_from, date_to, flags, timeout_min=30):
         status = rec.get("status", "")
         if status == "done":
             print(f"  ✓ {label}")
-            rj = rec.get("result_json") or {}
+            rj = rec.get("results") or {}
             return rj.get("trade_log") or []
         if status == "error":
             raise RuntimeError(f"{label} failed: {rec.get('error', 'unknown')}")
@@ -317,9 +317,11 @@ def main():
         sym_trades = sorted(by_symbol[symbol], key=lambda t: t["time"])
         t_min_ms = ts_ms(sym_trades[0]["time"])
         t_max_ms = ts_ms(sym_trades[-1]["time"])
-        pad_ms   = 2 * 86_400_000
+        pad_ms   = 14 * 86_400_000   # 14-day pad ensures ≥250 candles
+        # Minimum 30-day window so backtester always has enough candles
+        span_ms  = max(t_max_ms - t_min_ms, 30 * 86_400_000)
         date_from = datetime.utcfromtimestamp((t_min_ms - pad_ms) / 1000).strftime("%Y-%m-%d")
-        date_to   = datetime.utcfromtimestamp((t_max_ms + pad_ms) / 1000).strftime("%Y-%m-%d")
+        date_to   = datetime.utcfromtimestamp((t_min_ms + span_ms + pad_ms) / 1000).strftime("%Y-%m-%d")
 
         pr(f"{'─'*76}")
         pr(f"SYMBOL: {symbol}   live trades: {len(sym_trades)}   period: {date_from} → {date_to}")
