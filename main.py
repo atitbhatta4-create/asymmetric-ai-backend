@@ -2066,6 +2066,8 @@ class AutoRunner:
             intrabar_tp = trailing_activated  # trailing means TP is more likely
             intrabar_sl = not trailing_activated
 
+        outcome = None  # set by whichever exit branch fires; None = still holding
+
         if not _beyond_tp_triggered and intrabar_sl:
             if trailing_activated:
                 # Trailing SL hit — price went up past the lock-in level then pulled back.
@@ -2606,8 +2608,13 @@ class AutoRunner:
                 exit_price  = self._fetch_price_sync(self.symbol)
                 candle_high = exit_price
                 candle_low  = exit_price
+        except Exception as e:
+            self.log(f"Error fetching price for trade evaluation: {e}")
+            return
 
-            still_open: List[Dict] = []
+        still_open: List[Dict] = list(self.pending_trades)
+        try:
+            still_open = []
             t1_won = False
             t1_entry_price: Optional[float] = None
 
@@ -2619,9 +2626,14 @@ class AutoRunner:
                     pt["breakeven"] = True
                     del pt["breakeven_next"]
 
-                eq = get_equity(self.email)
-                result = self._close_one_trade(pt, exit_price, eq,
-                                               candle_high=candle_high, candle_low=candle_low)
+                try:
+                    eq = get_equity(self.email)
+                    result = self._close_one_trade(pt, exit_price, eq,
+                                                   candle_high=candle_high, candle_low=candle_low)
+                except Exception as _pt_err:
+                    self.log(f"Error evaluating trade ({pt.get('label','?')}): {_pt_err}")
+                    still_open.append(pt)
+                    continue
 
                 if result is None:
                     # NATURAL_CLOSE — price between SL and TP, hold another candle
@@ -2638,8 +2650,6 @@ class AutoRunner:
                         elif result > eq:
                             t1_won = True
                             t1_entry_price = float(pt.get("entry_price", 0))
-
-            self.pending_trades = still_open
 
             # After the loop, still_open contains T2 — safe to activate its breakeven now
             if t1_won:
@@ -2667,9 +2677,9 @@ class AutoRunner:
             # Persist live state so a redeploy picks up the updated positions/strictness
             _save_runner_state(self)
 
-        except Exception as e:
-            self.log(f"Error evaluating trade(s): {e}")
-            # On error, leave pending_trades intact — retry next interval
+        finally:
+            # Always update pending_trades — prevents closed trades re-closing on next tick
+            self.pending_trades = still_open
 
     def _get_weekly_btc_candles(self) -> List[Dict]:
         """Return cached weekly BTC candles, refreshing every 6 hours."""

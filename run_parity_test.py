@@ -300,7 +300,19 @@ def main():
     pr(f"Found {len(live_trades)} trade(s) across both accounts.")
     pr()
 
-    # 2. Group by symbol
+    # 2. Deduplicate by (symbol, time, side) — real + demo log the same signal twice
+    seen = set()
+    deduped = []
+    for t in live_trades:
+        key = (t["symbol"].upper(), str(t["time"])[:16], t.get("side", ""))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(t)
+    live_trades = deduped
+    pr(f"After dedup (real+demo): {len(live_trades)} unique trade(s).")
+    pr()
+
+    # 3. Group by symbol
     by_symbol = defaultdict(list)
     for t in live_trades:
         by_symbol[t["symbol"].upper()].append(t)
@@ -315,11 +327,14 @@ def main():
 
     for symbol in sorted(by_symbol):
         sym_trades = sorted(by_symbol[symbol], key=lambda t: t["time"])
-        t_min_ms = ts_ms(sym_trades[0]["time"])
-        t_max_ms = ts_ms(sym_trades[-1]["time"])
-        pad_ms   = 2 * 86_400_000
-        date_from = datetime.utcfromtimestamp((t_min_ms - pad_ms) / 1000).strftime("%Y-%m-%d")
-        date_to   = datetime.utcfromtimestamp((t_max_ms + pad_ms) / 1000).strftime("%Y-%m-%d")
+        t_min_ms   = ts_ms(sym_trades[0]["time"])
+        t_max_ms   = ts_ms(sym_trades[-1]["time"])
+        # Pad enough so total window is always ≥ 7 days (backtester minimum)
+        span_days  = max(0, (t_max_ms - t_min_ms) // 86_400_000)
+        pad_days   = max(4, 8 - span_days)
+        pad_ms     = pad_days * 86_400_000
+        date_from  = datetime.utcfromtimestamp((t_min_ms - pad_ms) / 1000).strftime("%Y-%m-%d")
+        date_to    = datetime.utcfromtimestamp((t_max_ms + pad_ms) / 1000).strftime("%Y-%m-%d")
 
         pr(f"{'─'*76}")
         pr(f"SYMBOL: {symbol}   live trades: {len(sym_trades)}   period: {date_from} → {date_to}")
