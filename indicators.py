@@ -961,6 +961,7 @@ def _compute_signal_layers(
     enable_mr_4h_gate: bool = False,
     enable_regime_gate: bool = False,
     enable_step2_score: bool = False,
+    enable_dc_filter: bool = False,
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -1569,6 +1570,13 @@ def _compute_signal_layers(
     else:
         breakdown["donchian"] = {"ok": True, "reason": ""}
 
+    # Donchian HTF filter: block entries that trade against the 4h trend direction
+    if enable_dc_filter and higher_klines:
+        _htf_ok, _htf_reason = donchian_htf_filter(higher_klines, desired_side, period=20)
+        breakdown["dc_htf"] = {"ok": _htf_ok, "reason": _htf_reason}
+    else:
+        breakdown["dc_htf"] = {"ok": True, "reason": ""}
+
     failed = [k for k, v in breakdown.items() if not v.get("ok") and k != "mtf_15m"]
     _score_below = round(total_score, 4) < round(min_score, 4)
     if failed or _score_below:
@@ -1858,4 +1866,125 @@ def _candle_hour_utc(candle: dict) -> int:
         return datetime.fromisoformat(str(ts)).replace(tzinfo=timezone.utc).hour
     except Exception:
         return -1
+
+
+# ── Grid module (Step 4) ─────────────────────────────────────────────────────
+
+def compute_grid_signal(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    atr: float,
+    adx: float,
+    dc_period: int = 20,
+    position_threshold_low: float = 0.15,
+    position_threshold_high: float = 0.85,
+    adx_breakout_threshold: float = 20.0,
+) -> Dict:
+    """
+    Grid entry signal for RANGING regime.
+
+    Entry:
+      - LONG  when price is in the bottom 15% of the Donchian channel
+      - SHORT when price is in the top 15% of the channel
+
+    TP  : channel midpoint
+    SL  : 1.5× ATR beyond the channel extreme (below lower for LONG, above upper for SHORT)
+
+    Breakout stop (invalidation before entry):
+      - ADX > adx_breakout_threshold → market is trending, skip grid entry
+
+    Returns dict with keys:
+      ok     : bool — whether a grid signal is valid right now
+      side   : "LONG" | "SHORT" | None
+      tp     : take-profit price
+      sl     : stop-loss price
+      reason : human-readable string
+      dc     : full Donchian channel dict (upper/lower/middle/position/trend)
+    """
+    if len(closes) < dc_period or atr is None or atr <= 0:
+        return {"ok": False, "side": None, "tp": None, "sl": None,
+                "reason": "NO_DATA", "dc": {}}
+
+    upper  = max(highs[-dc_period:])
+    lower  = min(lows[-dc_period:])
+    span   = upper - lower
+    middle = (upper + lower) / 2.0
+    price  = closes[-1]
+
+    if span <= 0:
+        return {"ok": False, "side": None, "tp": None, "sl": None,
+                "reason": "FLAT_CHANNEL", "dc": {}}
+
+    position = (price - lower) / span
+
+    dc = {
+        "upper":    round(upper, 6),
+        "lower":    round(lower, 6),
+        "middle":   round(middle, 6),
+        "position": round(position, 3),
+    }
+
+    # Breakout invalidation — ADX spiking means the range is breaking
+    if adx is not None and adx > adx_breakout_threshold:
+        return {"ok": False, "side": None, "tp": None, "sl": None,
+                "reason": f"ADX_BREAKOUT adx={adx:.1f}", "dc": dc}
+
+    if position <= position_threshold_low:
+        side = "LONG"
+        tp   = round(middle, 6)
+        sl   = round(lower - 1.5 * atr, 6)
+        reason = f"GRID_LONG pos={position:.2f} lower={lower:.4f}"
+    elif position >= position_threshold_high:
+        side = "SHORT"
+        tp   = round(middle, 6)
+        sl   = round(upper + 1.5 * atr, 6)
+        reason = f"GRID_SHORT pos={position:.2f} upper={upper:.4f}"
+    else:
+        return {"ok": False, "side": None, "tp": None, "sl": None,
+                "reason": f"MID_CHANNEL pos={position:.2f}", "dc": dc}
+
+    return {"ok": True, "side": side, "tp": tp, "sl": sl, "reason": reason, "dc": dc}
+
+
+# ── Donchian HTF filter (Donchian core) ──────────────────────────────────────
+
+def donchian_htf_filter(
+    higher_klines: List[Dict],
+    side: str,
+    period: int = 20,
+) -> tuple:
+    """
+    Daily/4h Donchian trend direction gate.
+
+    Blocks entries that trade against the higher-timeframe Donchian trend:
+      - LONG  blocked when HTF Donchian position < 0.35 (HTF downtrend)
+      - SHORT blocked when HTF Donchian position > 0.65 (HTF uptrend)
+      - Mid-channel (0.35–0.65) allows both directions
+
+    Returns (allowed: bool, reason: str).
+    Not enough data → allow (don't block when we have no HTF view).
+    """
+    if not higher_klines or len(higher_klines) < period:
+        return True, ""
+
+    htf_highs  = [k["high"]  for k in higher_klines]
+    htf_lows   = [k["low"]   for k in higher_klines]
+    htf_closes = [k["close"] for k in higher_klines]
+
+    upper  = max(htf_highs[-period:])
+    lower  = min(htf_lows[-period:])
+    span   = upper - lower
+
+    if span <= 0:
+        return True, ""
+
+    position = (htf_closes[-1] - lower) / span
+
+    if side == "LONG" and position < 0.35:
+        return False, f"DC_HTF_BLOCK LONG vs HTF-DOWN pos={position:.2f}"
+    if side == "SHORT" and position > 0.65:
+        return False, f"DC_HTF_BLOCK SHORT vs HTF-UP pos={position:.2f}"
+
+    return True, f"DC_HTF_OK pos={position:.2f}"
 

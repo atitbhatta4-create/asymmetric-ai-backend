@@ -42,6 +42,7 @@ from indicators import (
     get_market_regime, check_weekly_trend,
     check_pullback_entry, check_volume_hour_confirmed,
     get_pattern_exec_params,
+    compute_grid_signal,
 )
 from coin_params import get_coin_params
 from mode_params import get_mode_config, get_style_config
@@ -107,6 +108,8 @@ ENABLE_REGIME_GATE  = False  # Step 1: set True only after backtest passes
 ENABLE_E2           = False  # Step 8: set True only after backtest passes
 ENABLE_STEP2_SCORE  = False  # Step 2: set True only after backtest passes
 ENABLE_GRADE_B_ALL  = False  # Option 3: all trades use Grade B T1/T2 exits regardless of signal grade
+ENABLE_GRID_MODULE  = False  # Step 4: ranging-only grid entries (Donchian channel, breakout stop)
+ENABLE_DC_FILTER    = False  # Donchian core: daily/4h trend direction gate (block against HTF trend)
 # ──────────────────────────────────────────────────────────────────────────────
 
 import sentry_sdk
@@ -2071,6 +2074,8 @@ class AutoRunner:
             intrabar_tp = trailing_activated  # trailing means TP is more likely
             intrabar_sl = not trailing_activated
 
+        outcome = None  # set by whichever exit branch fires; None = still holding
+
         if not _beyond_tp_triggered and intrabar_sl:
             if trailing_activated:
                 # Trailing SL hit — price went up past the lock-in level then pulled back.
@@ -2626,8 +2631,13 @@ class AutoRunner:
                 exit_price  = self._fetch_price_sync(self.symbol)
                 candle_high = exit_price
                 candle_low  = exit_price
+        except Exception as e:
+            self.log(f"Error fetching price for trade evaluation: {e}")
+            return
 
-            still_open: List[Dict] = []
+        still_open: List[Dict] = list(self.pending_trades)  # default: keep all if try fails
+        try:
+            still_open = []
             t1_won = False
             t1_entry_price: Optional[float] = None
 
@@ -2639,9 +2649,14 @@ class AutoRunner:
                     pt["breakeven"] = True
                     del pt["breakeven_next"]
 
-                eq = get_equity(self.email)
-                result = self._close_one_trade(pt, exit_price, eq,
-                                               candle_high=candle_high, candle_low=candle_low)
+                try:
+                    eq = get_equity(self.email)
+                    result = self._close_one_trade(pt, exit_price, eq,
+                                                   candle_high=candle_high, candle_low=candle_low)
+                except Exception as _pt_err:
+                    self.log(f"Error evaluating trade ({pt.get('label','?')}): {_pt_err}")
+                    still_open.append(pt)
+                    continue
 
                 if result is None:
                     # NATURAL_CLOSE — price between SL and TP, hold another candle
@@ -2687,9 +2702,10 @@ class AutoRunner:
             # Persist live state so a redeploy picks up the updated positions/strictness
             _save_runner_state(self)
 
-        except Exception as e:
-            self.log(f"Error evaluating trade(s): {e}")
-            # On error, leave pending_trades intact — retry next interval
+        finally:
+            # Always update pending_trades — prevents closed trades re-closing on next tick
+            # if an unexpected error occurs mid-loop after some trades were already processed.
+            self.pending_trades = still_open
 
     def _get_weekly_btc_candles(self) -> List[Dict]:
         """Return cached weekly BTC candles, refreshing every 6 hours."""
@@ -2779,13 +2795,45 @@ class AutoRunner:
             _weekly_btc, _cur_adx or 0.0, self.is_parabolic
         )
 
-        # RANGING = no trades at all
-        if self.global_regime == "RANGING":
+        # RANGING = no directional trades; grid module may still fire if enabled
+        if self.global_regime == "RANGING" and not ENABLE_GRID_MODULE:
             return {
                 "ok": False,
                 "blocked": "REGIME_RANGING: ADX too low — market ranging, no trades",
                 "signal": "BLOCKED", "score": 0.0, "breakdown": {},
                 "side": None, "market_regime": "RANGING",
+            }
+
+        # Grid module: mean-reversion entries at Donchian extremes during RANGING
+        if self.global_regime == "RANGING" and ENABLE_GRID_MODULE:
+            _atr_val = _atr(_highs, _lows, _closes, 14)
+            _grid = compute_grid_signal(
+                _highs, _lows, _closes,
+                atr=_atr_val,
+                adx=_cur_adx or 0.0,
+            )
+            if not _grid["ok"]:
+                return {
+                    "ok": False,
+                    "blocked": f"GRID_NO_ENTRY: {_grid['reason']}",
+                    "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+                    "side": None, "market_regime": "RANGING",
+                }
+            return {
+                "ok": True,
+                "signal": f"GRID_{_grid['side']}",
+                "side": _grid["side"],
+                "score": 0.70,
+                "grade": "B",
+                "blocked": None,
+                "breakdown": {"grid": {"ok": True, "reason": _grid["reason"]}},
+                "atr_pct": (_atr_val / _closes[-1]) if (_atr_val and _closes) else 0.0,
+                "market_regime": "RANGING",
+                "grid_tp": _grid["tp"],
+                "grid_sl": _grid["sl"],
+                "grid_dc": _grid["dc"],
+                "mtf_confirmed": False,
+                "mtf_size_mult": 1.0,
             }
 
         # ── Change 7: Economic calendar block ────────────────────────────────
@@ -2853,6 +2901,7 @@ class AutoRunner:
             enable_mr_4h_gate=ENABLE_MR_4H_GATE,
             enable_regime_gate=ENABLE_REGIME_GATE,
             enable_step2_score=ENABLE_STEP2_SCORE,
+            enable_dc_filter=ENABLE_DC_FILTER,
         )
 
         # Enforce side restriction from weekly filter or parabolic regime
