@@ -449,22 +449,23 @@ def _get_aligned_slice(
 
 
 def _sim_check_exit(
-    trade: Dict, candle: Dict, exchange: str, regime: str = "TRENDING"
+    trade: Dict, candle: Dict, exchange: str, regime: str = "TRENDING",
+    force_grade_b: bool = False,
 ) -> Optional[Dict]:
     """
     Check whether the open trade exits on this candle.
     Mutates trade dict for Grade B T1/T2 state and trail ratchet state.
     Returns dict with {closed, outcome, pnl} or None if trade stays open.
 
-    regime — current market regime (TRENDING/MARGINAL/RANGING/CHOPPY/PARABOLIC).
-             Used for the choppy-delay rule: beyond-TP trail activates at 1.5×TP
-             in RANGING/CHOPPY, 1.0×TP in all other regimes (mirrors live engine).
+    regime        — current market regime.
+    force_grade_b — Option 3: use Grade B T1/T2 exit for all trades regardless
+                    of trade['grade']. Grade label in trade record is preserved.
     """
     side     = trade["side"]
     entry    = trade["entry"]
     sl_pct   = trade["sl_pct"]
     tp_pct   = trade["tp_pct"]
-    grade    = trade["grade"]
+    grade    = "B" if force_grade_b else trade["grade"]
     leverage = trade["leverage"]
     equity   = trade["equity_at_open"]
 
@@ -835,6 +836,24 @@ def _calc_metrics(
     avg_scaled_win  = round(statistics.mean(t["pnl"] / start_equity * 100 for t in scaled_wins), 2)  if scaled_wins  else 0.0
     avg_normal_win  = round(statistics.mean(t["pnl"] / start_equity * 100 for t in wins if not t.get("scaled")), 2) if [w for w in wins if not w.get("scaled")] else 0.0
 
+    # Outcome breakdown — counts per exit type to diagnose loss sources
+    outcome_counts: Dict[str, int] = {}
+    outcome_pnl:    Dict[str, float] = {}
+    for t in trades:
+        o = t.get("outcome", "unknown")
+        outcome_counts[o] = outcome_counts.get(o, 0) + 1
+        outcome_pnl[o]    = round(outcome_pnl.get(o, 0.0) + t["pnl"], 4)
+
+    # BE-specific: trades that reached breakeven then closed at ~0
+    be_outcomes = {"SCALE_BE", "T1_TP_T2_BE", "T1_TP_T2_TRAIL_SL"}
+    be_count    = sum(outcome_counts.get(o, 0) for o in be_outcomes)
+    sl_count    = outcome_counts.get("SL_HIT", 0)
+    tp_count    = sum(outcome_counts.get(o, 0) for o in ("TP_HIT", "T1_TP_T2_TP", "TRAIL_STOP"))
+    # Win rate excluding BE closures (shows "true" directional win rate)
+    non_be_total  = total - be_count
+    non_be_wins   = [t for t in wins if t.get("outcome") not in be_outcomes]
+    win_rate_excl_be = round(len(non_be_wins) / non_be_total * 100, 1) if non_be_total > 0 else 0.0
+
     return {
         "total_trades": total,
         "win_count":    len(wins),
@@ -857,6 +876,13 @@ def _calc_metrics(
         "scaled_trades":    len(scaled_trades),
         "avg_scaled_win_pct": avg_scaled_win,
         "avg_normal_win_pct": avg_normal_win,
+        # Outcome breakdown — key diagnostic for loss source
+        "outcome_counts":     outcome_counts,
+        "outcome_pnl":        outcome_pnl,
+        "sl_hit_count":       sl_count,
+        "tp_hit_count":       tp_count,
+        "be_close_count":     be_count,
+        "win_rate_excl_be":   win_rate_excl_be,
         # Raw trade log — used by run_parity_test.py for trade-by-trade comparison
         "trade_log": [
             {
@@ -897,6 +923,9 @@ def _run_worker(
     enable_regime_gate: bool = False,
     enable_e2: bool = False,
     enable_step2_score: bool = False,
+    enable_grade_b_all: bool = False,
+    enable_score_cap: bool = False,
+    score_cap: float = 0.78,
     t1_tp_mult: float = 1.0,
     enable_floor: bool = True,
     random_seed: Optional[int] = None,
@@ -1102,7 +1131,8 @@ def _run_worker(
 
                 if open_trade:
                     result = _sim_check_exit(open_trade, candle, exchange,
-                                            regime=open_trade.get("regime", "TRENDING"))
+                                            regime=open_trade.get("regime", "TRENDING"),
+                                            force_grade_b=enable_grade_b_all)
                     if result and result.get("closed"):
                         equity += result["pnl"]
                         peak_equity = max(peak_equity, equity)
@@ -1292,6 +1322,10 @@ def _run_worker(
                     if not _vol_ok:
                         sig["ok"] = False
 
+                # Score cap: pre-registered variant — block entries above cap
+                if enable_score_cap and sig.get("ok") and sig.get("score", 0.0) > score_cap:
+                    sig["ok"] = False
+
                 # ── Cancel pending signal if conditions no longer met ──
                 if not sig.get("ok"):
                     if _signal_pending:
@@ -1467,6 +1501,9 @@ def start_backtest(
     enable_regime_gate: bool = False,
     enable_e2: bool = False,
     enable_step2_score: bool = False,
+    enable_grade_b_all: bool = False,
+    enable_score_cap: bool = False,
+    score_cap: float = 0.78,
     t1_tp_mult: float = 1.0,
     enable_floor: bool = True,
     random_seed: Optional[int] = None,
@@ -1523,7 +1560,9 @@ def start_backtest(
         target=_run_worker,
         args=(run_id, email, symbol.upper(), tf, mode, style, exchange,
               start_ms, end_ms, start_equity, enable_t16, enable_t18, enable_s4,
-              enable_mr_4h_gate, enable_regime_gate, enable_e2, enable_step2_score, t1_tp_mult, enable_floor, random_seed),
+              enable_mr_4h_gate, enable_regime_gate, enable_e2, enable_step2_score,
+              enable_grade_b_all, enable_score_cap, score_cap,
+              t1_tp_mult, enable_floor, random_seed),
         daemon=True,
     )
     t.start()

@@ -106,6 +106,7 @@ ENABLE_T18          = False
 ENABLE_REGIME_GATE  = False  # Step 1: set True only after backtest passes
 ENABLE_E2           = False  # Step 8: set True only after backtest passes
 ENABLE_STEP2_SCORE  = False  # Step 2: set True only after backtest passes
+ENABLE_GRADE_B_ALL  = False  # Option 3: all trades use Grade B T1/T2 exits regardless of signal grade
 # ──────────────────────────────────────────────────────────────────────────────
 
 import sentry_sdk
@@ -3824,7 +3825,7 @@ class AutoRunner:
                                 f"× btc={_btc_mult:.2f} × fund={_fund_mult:.2f} "
                                 f"= {size_pct*100:.1f}% → ${usdt_size:.2f}"
                             )
-                            if grade == "B":
+                            if grade == "B" or ENABLE_GRADE_B_ALL:
                                 # Real Grade B: entry + two partial reduceOnly TP limit orders
                                 real_b_result = place_real_grade_b_order(
                                     email=self.email, symbol=self.symbol, side=desired_side,
@@ -3891,7 +3892,8 @@ class AutoRunner:
                             "adx_at_open":    self.last_adx,
                             "pat_trail_mult": _pat_trail_mult,
                         }
-                        if grade == "B":
+                        if grade == "B" or ENABLE_GRADE_B_ALL:
+                            _gb_sig_lbl = "" if grade == "B" else f" [Option3 sig={grade}]"
                             self.pending_trades = [
                                 {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 1.00,
                                  "is_primary": True,  "label": "T1",
@@ -3903,7 +3905,7 @@ class AutoRunner:
                                  "t2_sl_id": None,
                                  "t2_qty": real_b_result.get("t2_qty")},
                             ]
-                            self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP T2 40%+100%TP+BE | score={self.last_score:.2f}")
+                            self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP T2 40%+100%TP+BE | score={self.last_score:.2f}{_gb_sig_lbl}")
                         else:
                             _real_t18   = self._scaling_enabled and self.signal_type not in ("MEAN_REVERSION", "REVERSAL")
                             _real_init_sm = round(0.70 * _mtf_sm if _real_t18 else 1.00 * _mtf_sm, 4)
@@ -3934,7 +3936,7 @@ class AutoRunner:
 
                         # ── Place SL — Grade B: two separate stops (T1+T2 independent)
                         #              Grade A: single position-level SL ──────────────
-                        if grade == "B":
+                        if grade == "B" or ENABLE_GRADE_B_ALL:
                             _b_ex    = real_b_result["ex"]
                             _b_ex_id = real_b_result["ex_id"]
                             _b_sl    = real_b_result["sl_price"]
@@ -4041,14 +4043,15 @@ class AutoRunner:
                             "pat_trail_mult": _pat_trail_mult,
                         }
                         _mtf_label = "" if res.get("mtf_confirmed", True) else f" | 15m unconfirmed→size {_mtf_sm*100:.0f}%"
-                        if grade == "B":
+                        if grade == "B" or ENABLE_GRADE_B_ALL:
+                            _gb_sig_lbl = "" if grade == "B" else f" [Option3 sig={grade}]"
                             self.pending_trades = [
                                 {**base_trade, "grade": "B", "size_mult": round(0.60 * _mtf_sm, 4), "tp_mult": 1.00,
                                  "is_primary": True,  "label": "T1"},
                                 {**base_trade, "grade": "B", "size_mult": round(0.40 * _mtf_sm, 4), "tp_mult": 1.00,
                                  "is_primary": False, "label": "T2", "breakeven_after_t1": True},
                             ]
-                            self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}{_mtf_label}")
+                            self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}{_mtf_label}{_gb_sig_lbl}")
                         else:
                             # Scaling enabled: open at 70% to allow scale-ins. Builds to 100% on winners.
                             # MR/REVERSAL skip T18 — they enter at 100% (no scale-in needed).
