@@ -68,6 +68,10 @@ _MID_CANDLE_INTERVAL  = 600   # seconds between mid-candle checks
 DUBAI_TZ = timezone(timedelta(hours=4))
 
 
+def now_utc_str() -> str:
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def now_dubai() -> datetime:
     return datetime.now(tz=DUBAI_TZ)
 

@@ -1,67 +1,113 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import secrets
 import time
-import hashlib
-import hmac
 import threading
-import smtplib
-import bcrypt
-from cryptography.fernet import Fernet
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Literal, Any, Deque
 from collections import deque
 
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Response, Cookie, Query, Request
+from fastapi import FastAPI, Depends, HTTPException, Response, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, field_validator
 
-from database import db, db_conn, USING_PG, column_exists, serial_pk
+from database import db, db_conn, USING_PG, serial_pk, log_trade_outcome, init_outcome_log_table
 from config import (
     ENV, IS_PROD, REAL_TRADING, FRONTEND_ORIGINS,
     SMTP_USER, SMTP_PASS, SMTP_HOST, SMTP_PORT,
     OKX_BASE, OKX_TF_MAP, TF_MIN_INTERVAL,
     START_EQUITY, RiskMode, Side, TF, TradeStyle, TF_MAP, HIGHER_TF_MAP,
     TRADE_STYLE_PARAMS, _MID_CANDLE_THRESHOLDS, _MID_CANDLE_MIN_SCORE, _MID_CANDLE_INTERVAL,
-    DUBAI_TZ, now_dubai, dubai_day_key,
+    DUBAI_TZ, now_dubai, dubai_day_key, now_utc_str,
 )
 from notifications import (
     tg_alert as _tg_alert,
-    send_email, _email_base,
-    email_password_changed, email_ai_started, email_trade_closed,
-    email_ai_stopped, email_otp_reset, email_2fa_enabled,
+    email_ai_started, email_trade_opened,
+    email_trade_closed, email_ai_stopped,
+    email_first_trade,
+    email_api_key_expired, email_exchange_disconnected_open_trade,
+    email_low_margin, email_exchange_not_connected_reminder,
 )
 from indicators import (
     _ema, _rsi, _atr, _adx, _rsi_series,
     _session_quality, _ema_spread_trend, _candle_pattern, _rsi_divergence,
     _classify_regime, _compute_signal_layers,
+    get_market_regime, check_weekly_trend,
+    check_pullback_entry, check_volume_hour_confirmed,
+    get_pattern_exec_params,
+)
+from coin_params import get_coin_params
+from mode_params import get_mode_config, get_style_config
+from data_feeds import _fetch_btc_weekly_candles, _fetch_economic_calendar
+from auth_helpers import require_user, require_admin, ADMIN_EMAILS
+from user_state import (
+    encrypt_key, decrypt_key, mask_key,
+    ensure_user_state, get_equity, set_equity,
+    get_session_id, set_session_id,
+    _compute_floor, update_peak_ath,
+    _check_first_trade_email,
+    get_exchange,
+    admin_get_setting, admin_set_setting,
+    signup_is_enabled, seat_capacity, seats_used,
+    _FIRST_TRADE_SENT,
+)
+from market_data import (
+    to_okx_inst,
+    _validate_exchange_param, _validate_symbol, _validate_path_symbol,
+    binance_price, _route_price,
+    _fetch_klines_sync, _route_klines,
+    _fetch_ticker_24h,
+    _fetch_symbols_for_exchange,
+)
+from exchange_utils import (
+    EXCHANGE_FEES,
+    exchange_fee_cost,
+    _make_ccxt_exchange, _ccxt_call,
+    BYBIT_HOSTS, _bybit_signed_get, _bybit_direct_balance,
+    _okx_direct_balance,
+    _binance_direct_balance,
+    _REAL_BAL_CACHE, _REAL_BAL_TTL, _REAL_BAL_REFRESHING,
+    _do_balance_refresh, get_real_usdt_balance,
+)
+from risk_engine import (
+    Trade,
+    clamp,
+    presets_for_mode,
+    default_max_trades_per_day,
+    build_reason,
+    mini_asym_risk_engine,
 )
 from routes_backtest import backtest_router
 from routes_optimizer import optimizer_router
+from routes_pipeline import pipeline_router
+from routes_support import support_router
+from routes_auth import auth_router, hash_pw
+from routes_admin import admin_router
+from routes_report import report_router
+from routes_portfolio import portfolio_router
+from routes_engine import engine_router
 
-import sentry_sdk
-from sentry_sdk.integrations.fastapi import FastApiIntegration
-from sentry_sdk.integrations.starlette import StarletteIntegration
-
-_SENTRY_DSN = os.getenv("SENTRY_DSN", "").strip()
-if _SENTRY_DSN:
-    sentry_sdk.init(
-        dsn=_SENTRY_DSN,
-        integrations=[
-            StarletteIntegration(transaction_style="endpoint"),
-            FastApiIntegration(transaction_style="endpoint"),
-        ],
-        traces_sample_rate=0.05,
-        environment=os.getenv("RENDER_SERVICE_NAME", "local"),
-        release=os.getenv("RENDER_GIT_COMMIT", "unknown"),
-    )
+# ── Engine feature flags ───────────────────────────────────────────────────────
+# MR_4H_GATE:    backtest Sharpe delta = -0.29 on corrected baseline — OFF
+# PAT_EXEC:      backtest Sharpe delta = -0.76 on corrected baseline — OFF
+# T18:           backtest Sharpe delta = -0.22 on corrected baseline — OFF
+# REGIME_GATE:   Step 1 — Donchian + MARGINAL block — OFF until backtest validates
+# TRAIL + CHOPPY_TRAIL are always active (built into the exit loop, +0.25 combined)
+ENABLE_MR_4H_GATE   = False
+ENABLE_PAT_EXEC     = False
+ENABLE_T18          = False
+ENABLE_REGIME_GATE  = False  # Step 1: set True only after backtest passes
+ENABLE_E2           = False  # Step 8: set True only after backtest passes
+ENABLE_STEP2_SCORE  = False  # Step 2: set True only after backtest passes
+ENABLE_GRADE_B_ALL  = True   # Option 3: all trades use Grade B T1/T2 exits regardless of signal grade
+# ──────────────────────────────────────────────────────────────────────────────
 
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
@@ -107,7 +153,13 @@ def _tg_alert(text: str) -> None:
 # =========================
 # App
 # =========================
-app = FastAPI(title="Asymmetric AI Backend", version="0.9.0")
+app = FastAPI(
+    title="Asymmetric AI Backend",
+    version="0.9.0",
+    docs_url=None if IS_PROD else "/docs",
+    redoc_url=None if IS_PROD else "/redoc",
+    openapi_url=None if IS_PROD else "/openapi.json",
+)
 
 # Simple in-memory rate limiter — keyed by (endpoint, ip)
 _rl_hits: Dict[str, List[float]] = {}
@@ -126,17 +178,52 @@ def _rate_limit(request: Request, limit: int, window: int = 60) -> None:
 # =========================
 # ENV / PROD SETTINGS
 # =========================
-# CORS
+# CORS + COMPRESSION
 # =========================
+app.add_middleware(GZipMiddleware, minimum_size=500)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept", "Cookie", "X-Requested-With"],
 )
+
+@app.on_event("startup")
+async def _startup():
+    import anyio
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    limiter.total_tokens = 100  # up from default 40 — handles more concurrent sync endpoints
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"]  = "nosniff"
+    response.headers["X-Frame-Options"]         = "DENY"
+    response.headers["X-XSS-Protection"]        = "1; mode=block"
+    response.headers["Referrer-Policy"]         = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"]      = "geolocation=(), microphone=(), camera=()"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none';"
+    )
+    if IS_PROD:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
 app.include_router(backtest_router)
 app.include_router(optimizer_router)
+app.include_router(pipeline_router)
+app.include_router(support_router)
+app.include_router(auth_router)
+app.include_router(admin_router)
+app.include_router(report_router)
+app.include_router(portfolio_router)
+app.include_router(engine_router)
 
 # Strip /api prefix forwarded by Vercel
 @app.middleware("http")
@@ -164,9 +251,9 @@ _GLOBAL_RL_DASHBOARD = {
     "/portfolio/stats", "/portfolio/pnl", "/market/tickers",
 }
 
-# Authenticated users: 300/min  |  Unauthenticated (IP): 60/min
+# Authenticated users: 300/min  |  Unauthenticated (real IP): 120/min
 _RL_LIMIT_AUTH = 300
-_RL_LIMIT_IP   = 60
+_RL_LIMIT_IP   = 120
 _RL_LIMIT_DASH = 600  # dashboard polling endpoints
 
 @app.middleware("http")
@@ -194,7 +281,12 @@ async def global_rate_limit(request: Request, call_next):
         except Exception:
             pass
     if not rl_key:
-        rl_key = f"ip:{(request.client.host if request.client else 'unknown')}"
+        # X-Forwarded-For is set by Render's proxy with the real client IP.
+        # Falling back to request.client.host gives Render's internal proxy IP,
+        # which is shared by all users — they all hit the same 60/min bucket.
+        xff = request.headers.get("x-forwarded-for", "")
+        real_ip = xff.split(",")[0].strip() if xff else (request.client.host if request.client else "unknown")
+        rl_key = f"ip:{real_ip}"
 
     # Choose limit based on endpoint type and auth status
     if path in _GLOBAL_RL_DASHBOARD and is_authed:
@@ -218,9 +310,6 @@ async def global_rate_limit(request: Request, call_next):
 
     return await call_next(request)
 
-
-def now_utc_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def init_db() -> None:
@@ -364,8 +453,7 @@ def init_db() -> None:
             msg         TEXT NOT NULL
         )
         """)
-        if not column_exists(conn, "ai_logs", "session_id"):
-            cur.execute("ALTER TABLE ai_logs ADD COLUMN session_id INTEGER")
+        cur.execute("ALTER TABLE ai_logs ADD COLUMN IF NOT EXISTS session_id INTEGER")
 
         # Performance indexes
         cur.execute("CREATE INDEX IF NOT EXISTS ix_ai_sessions_email ON ai_sessions(email)")
@@ -412,42 +500,25 @@ def init_db() -> None:
         )
         """)
 
-        if not column_exists(conn, "users", "display_name"):
-            cur.execute("ALTER TABLE users ADD COLUMN display_name TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT DEFAULT ''")
 
-        # Safe migrations for existing databases
-        if not column_exists(conn, "trades", "reason"):
-            cur.execute("ALTER TABLE trades ADD COLUMN reason TEXT")
-        if not column_exists(conn, "trades", "session_id"):
-            cur.execute("ALTER TABLE trades ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
-        if not column_exists(conn, "user_state", "session_id"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN session_id INTEGER NOT NULL DEFAULT 0")
-        if not column_exists(conn, "trades", "hard_floor"):
-            cur.execute("ALTER TABLE trades ADD COLUMN hard_floor REAL DEFAULT 0")
-        if not column_exists(conn, "trades", "is_primary"):
-            cur.execute("ALTER TABLE trades ADD COLUMN is_primary INTEGER DEFAULT 1")
-        if not column_exists(conn, "user_state", "peak_equity"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN peak_equity REAL DEFAULT 0")
-        if not column_exists(conn, "user_state", "all_time_high"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN all_time_high REAL DEFAULT 0")
-        # Floor reset tracking — records initial starting capital and reset history for Situation 1/2/3 logic
-        if not column_exists(conn, "user_state", "starting_capital"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN starting_capital REAL DEFAULT 0")
-        if not column_exists(conn, "user_state", "floor_reset_count"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN floor_reset_count INTEGER DEFAULT 0")
-        if not column_exists(conn, "user_state", "floor_reset_at"):
-            # JSON array of Unix timestamps — used to enforce 7-day cooldown after 3 resets in 30 days
-            cur.execute("ALTER TABLE user_state ADD COLUMN floor_reset_at TEXT DEFAULT '[]'")
-        # Persistent floor — separate from peak so it survives ai_runner_state deletion.
-        # Updated via max() only — never decreases except on explicit reset (reset_sandbox / reset-floor).
-        # Fixes: floor dropping after redeploy when ai_runner_state (and its floor_equity column) is cleared.
-        if not column_exists(conn, "user_state", "floor_equity"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN floor_equity REAL DEFAULT 0")
-        # Persists why the engine last stopped — allows frontend to show correct warning on restart.
-        # Cleared when engine starts successfully (auto_start writes NULL).
-        if not column_exists(conn, "user_state", "last_stop_reason"):
-            cur.execute("ALTER TABLE user_state ADD COLUMN last_stop_reason TEXT DEFAULT NULL")
-        # Live runner state — persists adaptive_strictness, open positions, etc. across redeploys
+        # Schema migrations — ADD COLUMN IF NOT EXISTS is atomic in Postgres,
+        # no pre-check needed (eliminates 16 information_schema round-trips on startup)
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS reason TEXT")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS session_id INTEGER NOT NULL DEFAULT 0")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS hard_floor REAL DEFAULT 0")
+        cur.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS is_primary INTEGER DEFAULT 1")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS session_id INTEGER NOT NULL DEFAULT 0")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS peak_equity REAL DEFAULT 0")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS all_time_high REAL DEFAULT 0")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS starting_capital REAL DEFAULT 0")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS floor_reset_count INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS floor_reset_at TEXT DEFAULT '[]'")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS floor_equity REAL DEFAULT 0")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS last_stop_reason TEXT DEFAULT NULL")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN NOT NULL DEFAULT FALSE")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS reference_email_sent BOOLEAN NOT NULL DEFAULT FALSE")
+        cur.execute("ALTER TABLE user_state ADD COLUMN IF NOT EXISTS last_exchange_reminder REAL DEFAULT 0")
         for col, coltype, defval in [
             ("adaptive_strictness",  "REAL",    "1.0"),
             ("last_trade_ts",        "REAL",    "0"),
@@ -457,10 +528,36 @@ def init_db() -> None:
             ("floor_equity",         "REAL",    "0"),
             ("consecutive_wins",     "INTEGER", "0"),
             ("session_start_equity", "REAL",    "0"),
-            ("strictness_day_key",   "TEXT",    "''"),  # Dubai date when strictness was last changed
+            ("strictness_day_key",   "TEXT",    "''"),
         ]:
-            if not column_exists(conn, "ai_runner_state", col):
-                cur.execute(f"ALTER TABLE ai_runner_state ADD COLUMN {col} {coltype} DEFAULT {defval}")
+            cur.execute(f"ALTER TABLE ai_runner_state ADD COLUMN IF NOT EXISTS {col} {coltype} DEFAULT {defval}")
+
+        # Support chat tables
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            id                  {_serial},
+            user_email          TEXT NOT NULL,
+            status              TEXT NOT NULL DEFAULT 'open',
+            subject             TEXT NOT NULL DEFAULT '',
+            created_at          TIMESTAMPTZ DEFAULT NOW(),
+            last_user_msg_at    TIMESTAMPTZ DEFAULT NOW(),
+            last_admin_reply_at TIMESTAMPTZ
+        )
+        """)
+
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS support_messages (
+            id          {_serial},
+            ticket_id   INTEGER NOT NULL,
+            sender      TEXT NOT NULL,
+            message     TEXT NOT NULL,
+            sent_at     TIMESTAMPTZ DEFAULT NOW()
+        )
+        """)
+
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_support_tickets_user ON support_tickets(user_email)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_support_tickets_status ON support_tickets(status, last_user_msg_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS ix_support_messages_ticket ON support_messages(ticket_id, sent_at)")
 
         # Seed admin settings defaults
         def _set_default(key: str, value: str):
@@ -480,262 +577,18 @@ def init_db() -> None:
 init_db()
 from backtester import init_backtest_tables; init_backtest_tables()
 from optimizer import init_optimizer_tables; init_optimizer_tables()
+init_outcome_log_table()
+from adaptive_pipeline import init_pipeline_tables, start_monthly_scheduler
+init_pipeline_tables()
+start_monthly_scheduler()
 
 # Runners are resumed after all AutoRunner code is defined — see bottom of file.
 
 # =========================
-# SECURITY — PASSWORDS + KEY ENCRYPTION
-# =========================
-
-def hash_pw(pw: str) -> str:
-    """Hash a new password with bcrypt."""
-    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt(rounds=12)).decode()
-
-
-def verify_pw(plain: str, stored: str) -> bool:
-    """
-    Verify password — handles both:
-    - Old SHA-256 hashes (legacy, migrated on next login)
-    - New bcrypt hashes
-    """
-    if not plain or not stored:
-        return False
-    if stored.startswith("$2b$") or stored.startswith("$2a$"):
-        # bcrypt
-        return bcrypt.checkpw(plain.encode(), stored.encode())
-    # Legacy SHA-256 — still works but will be re-hashed on login
-    return hashlib.sha256(plain.encode()).hexdigest() == stored
-
-
-# Fernet encryption for API keys stored in DB
-# Set ENCRYPTION_KEY env var to a Fernet key (generate once: Fernet.generate_key().decode())
-_RAW_ENC_KEY = os.getenv("ENCRYPTION_KEY", "")
-_FERNET: Fernet | None = None
-if _RAW_ENC_KEY:
-    try:
-        _FERNET = Fernet(_RAW_ENC_KEY.encode() if isinstance(_RAW_ENC_KEY, str) else _RAW_ENC_KEY)
-    except Exception:
-        pass
-
-if not _FERNET:
-    import base64, warnings
-    _FALLBACK = base64.urlsafe_b64encode(hashlib.sha256(b"asym-dev-key").digest())
-    _FERNET = Fernet(_FALLBACK)
-    if os.getenv("ENV", "dev") == "prod":
-        warnings.warn("ENCRYPTION_KEY not set — using dev fallback. Set ENCRYPTION_KEY in prod!")
-
-
-def encrypt_key(value: str) -> str:
-    if not value:
-        return ""
-    return _FERNET.encrypt(value.encode()).decode()
-
-
-def decrypt_key(value: str) -> str:
-    if not value:
-        return ""
-    try:
-        return _FERNET.decrypt(value.encode()).decode()
-    except Exception:
-        # Fallback: might be unencrypted legacy value
-        return value
-
-
-def mask_key(s: str) -> str:
-    s = (s or "").strip()
-    if len(s) <= 8:
-        return "*" * len(s)
-    return s[:4] + ("*" * (len(s) - 8)) + s[-4:]
-
-
-def ensure_user_state(email: str) -> None:
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT equity, session_id FROM user_state WHERE email = %s", (email,))
-        row = cur.fetchone()
-        if not row:
-            cur.execute(
-                "INSERT INTO user_state(email, equity, session_id) VALUES(%s, %s, %s)"
-                " ON CONFLICT (email) DO NOTHING",
-                (email, START_EQUITY, 0),
-            )
-            conn.commit()
-        elif START_EQUITY > 1000 and float(row["equity"]) <= 1000.0:
-            # User was created before SIMULATED_EQUITY was configured; bump to current default
-            cur.execute("UPDATE user_state SET equity = %s WHERE email = %s", (START_EQUITY, email))
-            conn.commit()
-
-
-def get_equity(email: str) -> float:
-    ensure_user_state(email)
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT equity FROM user_state WHERE email = %s", (email,))
-        row = cur.fetchone()
-    return float(row["equity"])
-
-
-def set_equity(email: str, equity: float) -> None:
-    ensure_user_state(email)
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE user_state SET equity = %s WHERE email = %s", (float(equity), email))
-        conn.commit()
-
-
-def update_peak_ath(email: str, peak: float, equity_after: float) -> None:
-    """Update peak_equity, all_time_high, and floor_equity in user_state after each trade.
-    All three columns only ever increase — never decrease — so the floor survives runner
-    restarts, redeploys, and ai_runner_state deletions without dropping."""
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT peak_equity, all_time_high, floor_equity FROM user_state WHERE email = %s",
-            (email,),
-        )
-        row = cur.fetchone()
-        if row:
-            new_peak = max(float(row["peak_equity"] or 0), peak)
-            new_ath = max(float(row["all_time_high"] or 0), equity_after)
-            # Floor is 85% of the running peak — but only ever moves UP.
-            # Stored here so it persists even after ai_runner_state is deleted on stop.
-            new_floor = max(float(row["floor_equity"] or 0), round(new_peak * 0.85, 2))
-            cur.execute(
-                "UPDATE user_state SET peak_equity=%s, all_time_high=%s, floor_equity=%s "
-                "WHERE email=%s",
-                (new_peak, new_ath, new_floor, email),
-            )
-            conn.commit()
-
-
-def get_session_id(email: str) -> int:
-    ensure_user_state(email)
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT session_id FROM user_state WHERE email = %s", (email,))
-        row = cur.fetchone()
-    return int(row["session_id"] or 0)
-
-
-def set_session_id(email: str, sid: int) -> None:
-    ensure_user_state(email)
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE user_state SET session_id = %s WHERE email = %s", (int(sid), email))
-        conn.commit()
-
-
-def get_exchange(email: str) -> Optional[dict]:
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM exchange_keys WHERE email = %s", (email,))
-        row = cur.fetchone()
-    if not row:
-        return None
-    # Decrypt keys before returning — callers always get plain text
-    return {
-        **dict(row),
-        "api_key":    decrypt_key(row["api_key"]),
-        "api_secret": decrypt_key(row["api_secret"]),
-        "passphrase": decrypt_key(row.get("passphrase") or ""),
-    }
-
-
-_SESSION_CACHE: Dict[str, tuple] = {}    # token → (email, cached_at_ts)
-_SESSION_TTL = 300                        # reuse cached token for 5 minutes
-
-_EX_STATUS_CACHE: Dict[str, tuple] = {}  # email → (status_dict, ts)
-_EX_STATUS_TTL = 60                       # re-read DB at most once per minute
-_EX_TEST_CACHE: Dict[str, tuple] = {}    # email → (test_result_dict, ts)
-_EX_TEST_TTL = 60                         # live Bybit test cached 60s
-
-def require_user(session: Optional[str] = Cookie(default=None)) -> Dict[str, str]:
-    if not session:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    now = time.time()
-    cached = _SESSION_CACHE.get(session)
-    if cached:
-        email, ts = cached
-        if now - ts < _SESSION_TTL:
-            return {"email": email}
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT email FROM sessions WHERE token = %s", (session,))
-        row = cur.fetchone()
-    if not row:
-        _SESSION_CACHE.pop(session, None)
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    _SESSION_CACHE[session] = (row["email"], now)
-    return {"email": row["email"]}
-
-
-# =========================
-# ADMIN
+# ADMIN SEED + EXCHANGE CACHES
 # =========================
 DEMO_EMAIL = "admin@demo.com"
-DEMO_PASS = "demo123"
-
-ADMIN_EMAILS = set(
-    e.strip().lower()
-    for e in os.getenv("ADMIN_EMAILS", DEMO_EMAIL).split(",")
-    if e.strip()
-)
-
-ADMIN_FORCE_RESET_TOKEN = os.getenv("ADMIN_FORCE_RESET_TOKEN", "")
-
-
-def require_admin(user=Depends(require_user)) -> str:
-    email = user["email"].strip().lower()
-    if email not in ADMIN_EMAILS:
-        raise HTTPException(status_code=403, detail="Admin access only")
-    return email
-
-
-def admin_get_setting(key: str, default: str) -> str:
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT v FROM admin_settings WHERE k=%s", (key,))
-        row = cur.fetchone()
-    return (row["v"] if row else default)
-
-
-def admin_set_setting(key: str, value: str) -> None:
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO admin_settings(k,v,updated_at) VALUES(%s,%s,%s)
-            ON CONFLICT(k) DO UPDATE SET
-                v=excluded.v,
-                updated_at=excluded.updated_at
-            """,
-            (key, value, now_utc_str()),
-        )
-        conn.commit()
-
-
-def signup_is_enabled() -> bool:
-    if os.environ.get("INVITE_ONLY", "").lower() == "true":
-        return False
-    return admin_get_setting("signup_enabled", "true").lower() == "true"
-
-
-def seat_capacity() -> int:
-    try:
-        return int(admin_get_setting("seat_capacity", "50"))
-    except Exception:
-        return 50
-
-
-def seats_used() -> int:
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) AS n FROM users")
-        n = int(cur.fetchone()["n"])
-    return n
-
+DEMO_PASS  = "demo123"
 
 # Seed demo admin user if missing
 with db_conn() as conn:
@@ -748,6 +601,11 @@ with db_conn() as conn:
         )
         conn.commit()
 
+_EX_STATUS_CACHE: Dict[str, tuple] = {}  # email → (status_dict, ts)
+_EX_STATUS_TTL = 60
+_EX_TEST_CACHE: Dict[str, tuple] = {}    # email → (test_result_dict, ts)
+_EX_TEST_TTL = 60
+
 # =========================
 # BASIC INFO
 # =========================
@@ -756,515 +614,16 @@ def config():
     return {
         "market": "okx",
         "timezone": "Asia/Dubai (UTC+4)",
-        "env": ENV,
-        "frontend_origins": FRONTEND_ORIGINS,
-        "db": "postgresql" if USING_PG else "sqlite",
+        "real_trading": REAL_TRADING,
     }
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
-    return {
-        "health": "green",
-        "market": "okx",
-        "db": "postgresql" if USING_PG else "sqlite",
-        "env": ENV,
-    }
+    return {"health": "green"}
 
 
-# =========================
-# AUTH MODELS
-# =========================
-class AuthIn(BaseModel):
-    """Used for both login and signup — no password min_length so existing users can always log in."""
-    email: str = Field(..., min_length=5, max_length=254)
-    password: str = Field(..., max_length=256)
-
-
-class SignupIn(AuthIn):
-    """Signup only — enforces minimum password length for new accounts."""
-    password: str = Field(..., min_length=8, max_length=256)
-
-
-class SessionOut(BaseModel):
-    ok: bool
-    email: Optional[str] = None
-
-
-# =========================
-# COOKIE SETTINGS
-# =========================
-def set_session_cookie(response: Response, token: str) -> None:
-    base = dict(
-        key="session",
-        value=token,
-        httponly=True,
-        max_age=60 * 60 * 24 * 7,
-        path="/",
-    )
-    if IS_PROD:
-        response.set_cookie(**base, samesite="none", secure=True)
-    else:
-        response.set_cookie(**base, samesite="lax", secure=False)
-
-
-def clear_session_cookie(response: Response) -> None:
-    if IS_PROD:
-        response.delete_cookie("session", path="/", samesite="none", secure=True)
-    else:
-        response.delete_cookie("session", path="/", samesite="lax", secure=False)
-
-
-# =========================
-# AUTH ENDPOINTS
-# =========================
-@app.post("/auth/signup")
-def signup(request: Request, payload: SignupIn):
-    _rate_limit(request, limit=3, window=3600)  # 3 per hour per IP
-    email = payload.email.strip().lower()
-    if not email or not payload.password:
-        raise HTTPException(status_code=400, detail="Email and password required")
-
-    if not signup_is_enabled():
-        raise HTTPException(status_code=403, detail="Signup is currently disabled by admin.")
-    if seats_used() >= seat_capacity():
-        raise HTTPException(status_code=403, detail="Seats are full. Signup is closed.")
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT email FROM users WHERE email = %s", (email,))
-        if cur.fetchone():
-            raise HTTPException(status_code=400, detail="User already exists")
-
-        cur.execute(
-            "INSERT INTO users(email, password_hash, created_at) VALUES(%s, %s, %s)",
-            (email, hash_pw(payload.password), now_utc_str()),
-        )
-        conn.commit()
-
-    return {"ok": True}
-
-
-@app.post("/auth/login", response_model=SessionOut)
-def login(request: Request, payload: AuthIn, response: Response):
-    _rate_limit(request, limit=15, window=900)  # 15 per 15 minutes per IP
-    email = payload.email.strip().lower()
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT password_hash FROM users WHERE email = %s", (email,))
-        row = cur.fetchone()
-
-    if not row or not verify_pw(payload.password, row["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    # Silently migrate legacy SHA-256 hash to bcrypt on successful login
-    stored = row["password_hash"]
-    if not (stored.startswith("$2b$") or stored.startswith("$2a$")):
-        new_hash = hash_pw(payload.password)
-        with db_conn() as conn2:
-            cur2 = conn2.cursor()
-            cur2.execute("UPDATE users SET password_hash=%s WHERE email=%s", (new_hash, email))
-            conn2.commit()
-
-    token = secrets.token_urlsafe(32)
-    now = int(time.time())
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO sessions(token, email, created_at) VALUES(%s, %s, %s)", (token, email, now))
-        conn.commit()
-
-    set_session_cookie(response, token)
-    ensure_user_state(email)
-
-    # Check if 2FA is enabled — tell frontend to prompt for TOTP code
-    totp_row = _get_totp_row(email)
-    requires_2fa = bool(totp_row and totp_row["enabled"])
-    return {"ok": True, "email": email, "requires_2fa": requires_2fa}
-
-
-@app.post("/auth/logout")
-def logout(response: Response, session: Optional[str] = Cookie(default=None)):
-    if session:
-        _SESSION_CACHE.pop(session, None)   # evict from auth cache immediately
-        with db_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("DELETE FROM sessions WHERE token = %s", (session,))
-            conn.commit()
-
-    clear_session_cookie(response)
-    return {"ok": True}
-
-
-@app.get("/session", response_model=SessionOut)
-def session_me(session: Optional[str] = Cookie(default=None)):
-    if not session:
-        return {"ok": False, "email": None}
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT email FROM sessions WHERE token = %s", (session,))
-        row = cur.fetchone()
-    return {"ok": bool(row), "email": row["email"] if row else None}
-
-
-# =========================
-# FORGOT PASSWORD
-# =========================
-class ForgotIn(BaseModel):
-    email: str
-
-
-class ResetIn(BaseModel):
-    token: str
-    new_password: str
-
-
-class ChangePasswordIn(BaseModel):
-    current_password: str
-    new_password: str
-
-
-@app.post("/auth/change-password")
-def change_password(payload: ChangePasswordIn, user=Depends(require_user)):
-    email = user["email"]
-    if not payload.current_password or not payload.new_password:
-        raise HTTPException(status_code=400, detail="Both current and new password are required.")
-    if len(payload.new_password) < 6:
-        raise HTTPException(status_code=400, detail="New password must be at least 6 characters.")
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT password_hash FROM users WHERE email = %s", (email,))
-        row = cur.fetchone()
-
-    if not row or not verify_pw(payload.current_password, row["password_hash"]):
-        raise HTTPException(status_code=400, detail="Current password is incorrect.")
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET password_hash = %s WHERE email = %s", (hash_pw(payload.new_password), email))
-        conn.commit()
-
-    email_password_changed(email)
-    return {"ok": True}
-
-
-# =========================
-# FORGOT PASSWORD (OTP via email)
-# =========================
-
-class ForgotPasswordIn(BaseModel):
-    email: str
-
-class VerifyOtpIn(BaseModel):
-    email: str
-    code: str
-    new_password: str
-
-@app.post("/auth/forgot-password")
-def forgot_password(request: Request, payload: ForgotPasswordIn):
-    _rate_limit(request, limit=3, window=3600)  # 3 per hour per IP
-    email = payload.email.strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="Email required")
-
-    # Check user exists — but don't reveal it in the response
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT email FROM users WHERE email = %s", (email,))
-        exists = cur.fetchone() is not None
-
-    if exists:
-        code = str(secrets.randbelow(900000) + 100000)   # 100000-999999
-        now_ts = int(time.time())
-        with db_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("""
-                INSERT INTO otp_codes(email, code, created_at, used)
-                VALUES(%s, %s, %s, 0)
-                ON CONFLICT(email) DO UPDATE SET code=EXCLUDED.code,
-                    created_at=EXCLUDED.created_at, used=0
-            """, (email, code, now_ts))
-            conn.commit()
-        email_otp_reset(email, code)
-
-    # Always return ok — prevents email enumeration
-    return {"ok": True, "detail": "If that email exists, a reset code has been sent."}
-
-
-@app.post("/auth/reset-password")
-def reset_password(request: Request, payload: VerifyOtpIn):
-    _rate_limit(request, limit=3, window=3600)  # 3 per hour per IP
-    email = payload.email.strip().lower()
-    code  = payload.code.strip()
-
-    if not email or not code or not payload.new_password:
-        raise HTTPException(status_code=400, detail="Email, code and new password required")
-    if len(payload.new_password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
-
-    OTP_TTL = 15 * 60  # 15 minutes
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT code, created_at, used FROM otp_codes WHERE email = %s", (email,)
-        )
-        row = cur.fetchone()
-
-    if not row:
-        raise HTTPException(status_code=400, detail="No reset code found. Request a new one.")
-    if row["used"]:
-        raise HTTPException(status_code=400, detail="Code already used. Request a new one.")
-    if int(time.time()) - row["created_at"] > OTP_TTL:
-        raise HTTPException(status_code=400, detail="Code expired. Request a new one.")
-    if not hmac.compare_digest(str(row["code"]), code):
-        raise HTTPException(status_code=400, detail="Incorrect code.")
-
-    # Mark used + update password
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE otp_codes SET used=1 WHERE email=%s", (email,))
-        cur.execute("UPDATE users SET password_hash=%s WHERE email=%s",
-                    (hash_pw(payload.new_password), email))
-        conn.commit()
-
-    email_password_changed(email)
-    return {"ok": True, "detail": "Password reset successfully. You can now log in."}
-
-
-# =========================
-# TWO-FACTOR AUTH (TOTP — Google Authenticator compatible)
-# =========================
-import pyotp
-import base64
-
-def _get_totp_row(email: str) -> Optional[dict]:
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT secret, enabled FROM totp_secrets WHERE email=%s", (email,))
-        row = cur.fetchone()
-    return dict(row) if row else None
-
-
-@app.get("/auth/2fa/status")
-def totp_status(user=Depends(require_user)):
-    """Returns whether 2FA is enabled for this account."""
-    row = _get_totp_row(user["email"])
-    return {"enabled": bool(row and row["enabled"])}
-
-
-@app.post("/auth/2fa/setup")
-def totp_setup(user=Depends(require_user)):
-    """
-    Generate a new TOTP secret + QR code URI for Google Authenticator.
-    User scans the QR, then calls /auth/2fa/confirm with a valid code to activate.
-    """
-    email = user["email"]
-    secret = pyotp.random_base32()
-    uri = pyotp.totp.TOTP(secret).provisioning_uri(
-        name=email,
-        issuer_name="Asymmetric AI"
-    )
-    # Store secret but NOT enabled yet — only enabled after confirm
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO totp_secrets(email, secret, enabled, created_at)
-            VALUES(%s, %s, 0, %s)
-            ON CONFLICT(email) DO UPDATE SET secret=EXCLUDED.secret,
-                enabled=0, created_at=EXCLUDED.created_at
-        """, (email, encrypt_key(secret), now_utc_str()))
-        conn.commit()
-    return {"ok": True, "uri": uri, "secret": secret}
-
-
-class TotpCodeIn(BaseModel):
-    code: str
-
-@app.post("/auth/2fa/confirm")
-def totp_confirm(payload: TotpCodeIn, user=Depends(require_user)):
-    """
-    Confirm 2FA setup by verifying the first code from the authenticator app.
-    Only after this succeeds is 2FA actually activated.
-    """
-    email = user["email"]
-    row = _get_totp_row(email)
-    if not row:
-        raise HTTPException(status_code=400, detail="Run /auth/2fa/setup first")
-
-    secret = decrypt_key(row["secret"])
-    totp   = pyotp.TOTP(secret)
-    if not totp.verify(payload.code.strip(), valid_window=1):
-        raise HTTPException(status_code=400, detail="Invalid code — check your authenticator app")
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE totp_secrets SET enabled=1 WHERE email=%s", (email,))
-        conn.commit()
-
-    email_2fa_enabled(email)
-    return {"ok": True, "detail": "2FA is now active on your account"}
-
-
-@app.post("/auth/2fa/verify")
-def totp_verify(payload: TotpCodeIn, user=Depends(require_user)):
-    """
-    Called after password login when 2FA is enabled.
-    Frontend: after login returns {requires_2fa: true}, show code input → POST here.
-    On success, session is fully authenticated.
-    """
-    email = user["email"]
-    row = _get_totp_row(email)
-    if not row or not row["enabled"]:
-        return {"ok": True, "detail": "2FA not enabled"}   # no-op if not set up
-
-    secret = decrypt_key(row["secret"])
-    totp   = pyotp.TOTP(secret)
-    # valid_window=1 allows 30s clock drift (one period before/after)
-    if not totp.verify(payload.code.strip(), valid_window=1):
-        raise HTTPException(status_code=400, detail="Invalid 2FA code")
-
-    return {"ok": True}
-
-
-@app.post("/auth/2fa/disable")
-def totp_disable(payload: TotpCodeIn, user=Depends(require_user)):
-    """
-    Disable 2FA. Requires a valid TOTP code to confirm it's really the user.
-    """
-    email = user["email"]
-    row = _get_totp_row(email)
-    if not row or not row["enabled"]:
-        raise HTTPException(status_code=400, detail="2FA is not enabled")
-
-    secret = decrypt_key(row["secret"])
-    totp   = pyotp.TOTP(secret)
-    if not totp.verify(payload.code.strip(), valid_window=1):
-        raise HTTPException(status_code=400, detail="Invalid code — cannot disable 2FA")
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE totp_secrets SET enabled=0 WHERE email=%s", (email,))
-        conn.commit()
-
-    return {"ok": True, "detail": "2FA disabled"}
-
-
-@app.get("/debug/email")
-def debug_email(to: str = Query(default="")):
-    """Send a test email. Pass ?to=your@email.com to test delivery. No auth needed."""
-    if not SMTP_USER or not SMTP_PASS:
-        return {"ok": False, "error": "SMTP_USER or SMTP_PASS not set", "smtp_user": repr(SMTP_USER)}
-    target = to.strip() if to.strip() else SMTP_USER
-    content = "<h2 style='color:#f1f5f9;'>Test Email</h2><p style='opacity:0.85;'>SMTP is working on Asymmetric AI.</p>"
-    err = None
-    try:
-        # Call raw SMTP directly (bypass the internal try/except) so errors surface here
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = "Asymmetric AI — SMTP Test"
-        msg["From"] = f"Asymmetric AI <{SMTP_USER}>"
-        msg["To"] = target
-        msg.attach(MIMEText(_email_base(content), "html"))
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as srv:
-            srv.ehlo()
-            srv.starttls()
-            srv.login(SMTP_USER, SMTP_PASS)
-            srv.sendmail(SMTP_USER, target, msg.as_string())
-    except Exception as e:
-        err = str(e)
-    return {"ok": err is None, "sent_to": target, "smtp_user": SMTP_USER, "error": err}
-
-
-@app.post("/auth/forgot")
-def auth_forgot(payload: ForgotIn):
-    email = payload.email.strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="email required")
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT email FROM users WHERE email=%s", (email,))
-        u = cur.fetchone()
-        if not u:
-            return {"ok": True}
-
-        token = secrets.token_urlsafe(32)
-        cur.execute(
-            "INSERT INTO password_resets(token,email,created_at,used) VALUES(%s,%s,%s,0)",
-            (token, email, int(time.time())),
-        )
-        conn.commit()
-
-    return {"ok": True, "reset_token": token}
-
-
-@app.post("/auth/reset")
-def auth_reset(payload: ResetIn):
-    token = payload.token.strip()
-    new_pw = payload.new_password or ""
-    if not token or len(new_pw) < 4:
-        raise HTTPException(status_code=400, detail="token + new_password required (min 4 chars)")
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT email, used, created_at FROM password_resets WHERE token=%s", (token,))
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=400, detail="Invalid token")
-
-        if int(row["used"]) == 1:
-            raise HTTPException(status_code=400, detail="Token already used")
-
-        created_at = int(row["created_at"])
-        if int(time.time()) - created_at > 1800:
-            raise HTTPException(status_code=400, detail="Token expired")
-
-        email = row["email"]
-        cur.execute("UPDATE users SET password_hash=%s WHERE email=%s", (hash_pw(new_pw), email))
-        cur.execute("UPDATE password_resets SET used=1 WHERE token=%s", (token,))
-        cur.execute("DELETE FROM sessions WHERE email=%s", (email,))
-        conn.commit()
-
-    return {"ok": True}
-
-
-class AdminForceResetIn(BaseModel):
-    token: str
-    email: str
-    new_password: str
-
-
-@app.post("/admin/force-reset-password")
-def admin_force_reset(payload: AdminForceResetIn):
-    if not ADMIN_FORCE_RESET_TOKEN or payload.token.strip() != ADMIN_FORCE_RESET_TOKEN:
-        raise HTTPException(status_code=403, detail="Not allowed")
-
-    email = payload.email.strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="email required")
-    if email not in ADMIN_EMAILS:
-        raise HTTPException(status_code=400, detail="email is not an admin")
-    if not payload.new_password or len(payload.new_password) < 4:
-        raise HTTPException(status_code=400, detail="new_password min 4 chars")
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT email FROM users WHERE email=%s", (email,))
-        u = cur.fetchone()
-        if not u:
-            cur.execute(
-                "INSERT INTO users(email, password_hash, created_at) VALUES(%s,%s,%s)",
-                (email, hash_pw(payload.new_password), now_utc_str()),
-            )
-        else:
-            cur.execute("UPDATE users SET password_hash=%s WHERE email=%s", (hash_pw(payload.new_password), email))
-        cur.execute("DELETE FROM sessions WHERE email=%s", (email,))
-        conn.commit()
-
-    return {"ok": True}
-
+# Auth endpoints moved to routes_auth.py (auth_router)
 
 # =========================
 # PROFILE + CONFIG
@@ -1294,11 +653,6 @@ def update_profile(payload: ProfileIn, user=Depends(require_user)):
         cur.execute("UPDATE users SET display_name = %s WHERE email = %s", (name, email))
         conn.commit()
     return {"ok": True, "display_name": name}
-
-@app.get("/config")
-def get_config():
-    return {"real_trading": REAL_TRADING}
-
 
 # =========================
 # EXCHANGE CONNECT
@@ -1383,91 +737,6 @@ def exchange_disconnect(user=Depends(require_user)):
     return {"ok": True}
 
 
-# ── Per-exchange fee table (futures/perpetuals, USD-margined) ─────────────────
-# maker = limit order (you add liquidity)   taker = market order (you take liquidity)
-# SL exits are always market (taker). TP exits can be limit (maker).
-# Slippage estimate is conservative round-trip for <$20k position size.
-EXCHANGE_FEES = {
-    "bybit": {
-        "maker":     0.00020,   # 0.020%
-        "taker":     0.00055,   # 0.055%
-        "slippage":  0.00025,   # ~0.025% round-trip (BTC liquid, alts slightly more)
-        "min_qty":   0.001,     # BTC minimum order size
-    },
-    "okx": {
-        "maker":     0.00020,   # 0.020%
-        "taker":     0.00050,   # 0.050%
-        "slippage":  0.00030,   # ~0.030% round-trip
-        "min_qty":   0.001,
-    },
-    "binance": {
-        "maker":     0.00020,   # 0.020% (futures)
-        "taker":     0.00040,   # 0.040% (futures, lower than spot)
-        "slippage":  0.00020,   # ~0.020% round-trip (most liquid exchange)
-        "min_qty":   0.001,
-    },
-}
-
-def exchange_fee_cost(exchange_id: str, size_dollar: float, outcome: str) -> float:
-    """
-    Calculate total fee + slippage cost for one complete trade (entry + exit).
-    outcome: "TP_HIT" (limit exit) | "SL_HIT" | "TRAIL_STOP" | other (market exit)
-    Returns dollar cost to deduct from PnL.
-    """
-    fees = EXCHANGE_FEES.get(exchange_id.lower(), EXCHANGE_FEES["bybit"])
-    entry_fee   = size_dollar * fees["maker"]           # entry always limit
-    exit_fee    = size_dollar * (fees["maker"] if outcome == "TP_HIT" else fees["taker"])
-    slippage    = size_dollar * fees["slippage"]
-    return round(entry_fee + exit_fee + slippage, 4)
-
-
-def _make_ccxt_exchange(row: dict):
-    """Build a ccxt exchange instance from stored (decrypted) keys."""
-    import ccxt
-    exchange_id = (row.get("exchange") or "bybit").lower()
-    config = {
-        "apiKey":   row["api_key"],
-        "secret":   row["api_secret"],
-        "options":  {"defaultType": "linear"},
-        "enableRateLimit": True,
-        "timeout":  10000,   # 10-second timeout on every ccxt network call
-    }
-    if row.get("passphrase"):
-        config["password"] = row["passphrase"]  # required for OKX
-    cls = getattr(ccxt, exchange_id, None)
-    if cls is None:
-        raise ValueError(f"Unsupported exchange: {exchange_id}")
-    return cls(config)
-
-
-def _ccxt_call(fn, *args, label: str = "exchange", retries: int = 1, **kwargs):
-    """
-    Wrap any ccxt call with timeout detection, 1 retry, and clear error logging.
-    Raises a RuntimeError with a specific EXCHANGE_TIMEOUT prefix on timeout.
-    Never crashes the engine — caller catches RuntimeError and continues.
-    """
-    import ccxt
-    last_exc = None
-    for attempt in range(1, retries + 2):  # attempts = retries + 1
-        try:
-            return fn(*args, **kwargs)
-        except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
-            last_exc = e
-            is_timeout = isinstance(e, ccxt.RequestTimeout) or "timeout" in str(e).lower()
-            tag = "EXCHANGE_TIMEOUT" if is_timeout else "EXCHANGE_NETWORK_ERROR"
-            print(f"[{tag}] {label} attempt {attempt}: {e}", flush=True)
-            if attempt <= retries:
-                import time as _t
-                _t.sleep(2)
-        except ccxt.AuthenticationError as e:
-            raise RuntimeError(f"EXCHANGE_AUTH_ERROR: API key rejected by exchange — {e}")
-        except ccxt.ExchangeError as e:
-            raise RuntimeError(f"EXCHANGE_ERROR ({label}): {e}")
-        except Exception as e:
-            raise RuntimeError(f"EXCHANGE_UNEXPECTED ({label}): {type(e).__name__}: {e}")
-    raise RuntimeError(f"EXCHANGE_TIMEOUT: {label} did not respond within 10 seconds after {retries + 1} attempts")
-
-
 @app.get("/exchange/test")
 def exchange_test(user=Depends(require_user)):
     """Test API key against the real exchange — cached 60s so page loads stay fast."""
@@ -1547,438 +816,10 @@ def exchange_balance(user=Depends(require_user)):
         }
 
 
-BYBIT_HOSTS = ["https://api.bybit.com", "https://api.bytick.com"]
-
-def _bybit_signed_get(api_key: str, api_secret: str, path: str, query: str) -> tuple[Optional[dict], str]:
-    """Make a signed Bybit GET request, trying both hosts. Returns (parsed JSON or None, last_error)."""
-    ts = str(int(time.time() * 1000))
-    recv_window = "5000"
-    sign_str = ts + api_key + recv_window + query
-    sig = hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY":     api_key,
-        "X-BAPI-TIMESTAMP":   ts,
-        "X-BAPI-SIGN":        sig,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "Content-Type":       "application/json",
-    }
-    last_error = "unknown"
-    for host in BYBIT_HOSTS:
-        try:
-            resp = httpx.get(f"{host}{path}?{query}", headers=headers, timeout=10)
-            print(f"[bybit] {host}{path} → HTTP {resp.status_code}")
-            if resp.status_code == 200:
-                return resp.json(), ""
-            last_error = f"HTTP {resp.status_code} from {host}: {resp.text[:200]}"
-            print(f"[bybit] non-200: {last_error}")
-        except Exception as e:
-            last_error = f"{type(e).__name__} from {host}: {e}"
-            print(f"[bybit] exception: {last_error}")
-    return None, last_error
-
-
-def _bybit_direct_balance(api_key: str, api_secret: str) -> tuple:
-    """
-    Direct Bybit V5 signed request for USDT balance.
-    Checks Unified Trading wallet first, then Funding wallet.
-    Returns (balance_float, None) on success, (None, error_str) on failure.
-    """
-    try:
-        # 1. Try Unified Trading wallet (required for trading)
-        data, net_err = _bybit_signed_get(api_key, api_secret, "/v5/account/wallet-balance", "accountType=UNIFIED")
-        if data is None:
-            return (None, f"Could not reach Bybit API{' (' + net_err + ')' if net_err else ''}")
-        ret_code = data.get("retCode")
-        ret_msg  = data.get("retMsg", "")
-        print(f"[bybit-balance] UNIFIED retCode={ret_code} retMsg={ret_msg}")
-        if ret_code in (10003, 10004):
-            return (None, f"Invalid API key or secret (retCode={ret_code}: {ret_msg})")
-        if ret_code != 0:
-            return (None, f"Bybit API error retCode={ret_code}: {ret_msg}")
-        for acc in data.get("result", {}).get("list", []):
-            for coin in acc.get("coin", []):
-                if coin.get("coin") == "USDT":
-                    val = float(coin.get("walletBalance") or coin.get("equity") or 0)
-                    print(f"[bybit-balance] USDT in Unified Trading: {val}")
-                    return (val, None)
-
-        # 2. USDT not in Unified — check Funding wallet
-        print("[bybit-balance] No USDT in Unified, checking Funding wallet...")
-        fund_data, _ = _bybit_signed_get(api_key, api_secret, "/v5/asset/transfer/query-account-coins-balance", "accountType=FUND&coin=USDT")
-        if fund_data and fund_data.get("retCode") == 0:
-            for item in fund_data.get("result", {}).get("balance", []):
-                if item.get("coin") == "USDT":
-                    val = float(item.get("walletBalance") or item.get("transferBalance") or 0)
-                    print(f"[bybit-balance] USDT in Funding wallet: {val}")
-                    if val > 0:
-                        return (None, f"Your {val:.2f} USDT is in the Funding wallet — transfer it to Unified Trading in Bybit before the engine can trade.")
-        return (None, "No USDT found in Unified Trading or Funding wallet. Please deposit USDT to your Bybit account.")
-    except Exception as ex:
-        return (None, f"Exception: {ex}")
-
-
-def _okx_direct_balance(api_key: str, api_secret: str, passphrase: str) -> Optional[float]:
-    """Direct OKX V5 signed request for USDT balance."""
-    import base64
-    from datetime import timezone as _tz
-    ts = datetime.now(_tz.utc).strftime('%Y-%m-%dT%H:%M:%S.') + \
-         str(datetime.now(_tz.utc).microsecond // 1000).zfill(3) + 'Z'
-    path = "/api/v5/account/balance"
-    sign_str = ts + "GET" + path + ""
-    sig = base64.b64encode(
-        hmac.new(api_secret.encode(), sign_str.encode(), hashlib.sha256).digest()
-    ).decode()
-    headers = {
-        "OK-ACCESS-KEY":        api_key,
-        "OK-ACCESS-SIGN":       sig,
-        "OK-ACCESS-TIMESTAMP":  ts,
-        "OK-ACCESS-PASSPHRASE": passphrase,
-        "Content-Type":         "application/json",
-    }
-    try:
-        resp = httpx.get(f"https://www.okx.com{path}", headers=headers, timeout=10)
-        data = resp.json()
-        if data.get("code") == "0":
-            for detail in data.get("data", [{}])[0].get("details", []):
-                if detail.get("ccy") == "USDT":
-                    return float(detail.get("cashBal") or detail.get("availBal") or 0)
-    except Exception:
-        pass
-    return None
-
-
-def _binance_direct_balance(api_key: str, api_secret: str) -> Optional[float]:
-    """Direct Binance Futures V2 signed request for USDT balance."""
-    ts = str(int(time.time() * 1000))
-    params = f"timestamp={ts}"
-    sig = hmac.new(api_secret.encode(), params.encode(), hashlib.sha256).hexdigest()
-    headers = {"X-MBX-APIKEY": api_key}
-    try:
-        resp = httpx.get(
-            f"https://fapi.binance.com/fapi/v2/balance?{params}&signature={sig}",
-            headers=headers, timeout=10,
-        )
-        data = resp.json()
-        if isinstance(data, list):
-            for item in data:
-                if item.get("asset") == "USDT":
-                    return float(item.get("balance") or item.get("availableBalance") or 0)
-    except Exception:
-        pass
-    return None
-
-
-_REAL_BAL_CACHE: Dict[str, tuple] = {}      # email → (balance, fetched_at_ts)
-_REAL_BAL_TTL = 30                           # seconds before background refresh fires
-_REAL_BAL_REFRESHING: set = set()            # emails with a refresh already in flight
-
-def _do_balance_refresh(email: str) -> None:
-    """Background thread: fetch live balance and silently update cache."""
-    try:
-        row = get_exchange(email)
-        if not row:
-            return
-        ex_id = (row.get("exchange") or "bybit").lower()
-        if ex_id == "bybit":
-            bal, _ = _bybit_direct_balance(row["api_key"], row["api_secret"])
-        elif ex_id == "okx":
-            bal = _okx_direct_balance(row["api_key"], row["api_secret"], row.get("passphrase") or "")
-        elif ex_id == "binance":
-            bal = _binance_direct_balance(row["api_key"], row["api_secret"])
-        else:
-            bal = None
-        if bal is not None:
-            _REAL_BAL_CACHE[email] = (bal, time.time())
-    finally:
-        _REAL_BAL_REFRESHING.discard(email)
-
-def get_real_usdt_balance(email: str, force: bool = False) -> Optional[float]:
-    """Return cached balance instantly; refresh from Bybit in background when stale.
-    force=True blocks for a fresh fetch (used before runner init)."""
-    cached = _REAL_BAL_CACHE.get(email)
-
-    if not force and cached:
-        bal, fetched_at = cached
-        if time.time() - fetched_at >= _REAL_BAL_TTL and email not in _REAL_BAL_REFRESHING:
-            _REAL_BAL_REFRESHING.add(email)
-            threading.Thread(target=_do_balance_refresh, args=(email,), daemon=True).start()
-        return bal  # always instant when any cached value exists
-
-    # No cache yet or force=True — block for fresh data
-    row = get_exchange(email)
-    if not row:
-        return None
-    ex_id = (row.get("exchange") or "bybit").lower()
-    if ex_id == "bybit":
-        bal, _ = _bybit_direct_balance(row["api_key"], row["api_secret"])
-    elif ex_id == "okx":
-        bal = _okx_direct_balance(row["api_key"], row["api_secret"], row.get("passphrase") or "")
-    elif ex_id == "binance":
-        bal = _binance_direct_balance(row["api_key"], row["api_secret"])
-    else:
-        bal = None
-    if bal is not None:
-        _REAL_BAL_CACHE[email] = (bal, time.time())
-    return bal
-
 
 # =========================
-# MARKET (PUBLIC) — PRICE (multi-source fallback)
-# OKX geo-blocks Render US; Binance US is primary, OKX as secondary fallback.
+# MARKET ROUTES — data functions live in market_data.py
 # =========================
-def to_okx_inst(symbol: str) -> str:
-    s = (symbol or "").upper().strip()
-    if "-" in s:
-        return s
-    if s.endswith("USDT"):
-        return f"{s[:-4]}-USDT"
-    return s
-
-
-async def _fetch_price_binance_us(symbol: str) -> float:
-    async with httpx.AsyncClient(timeout=8) as client:
-        r = await client.get(
-            "https://api.binance.us/api/v3/ticker/price",
-            params={"symbol": symbol.upper()},
-            headers={"accept": "application/json"},
-        )
-    if r.status_code != 200:
-        raise ValueError(f"HTTP {r.status_code}: {r.text[:120]}")
-    price = r.json().get("price")
-    if price is None:
-        raise ValueError("no price field")
-    return float(price)
-
-
-async def _fetch_price_mexc(symbol: str) -> float:
-    """MEXC global exchange — no geo-blocking, same format as Binance."""
-    async with httpx.AsyncClient(timeout=8) as client:
-        r = await client.get(
-            "https://api.mexc.com/api/v3/ticker/price",
-            params={"symbol": symbol.upper()},
-            headers={"accept": "application/json"},
-        )
-    if r.status_code != 200:
-        raise ValueError(f"HTTP {r.status_code}: {r.text[:120]}")
-    price = r.json().get("price")
-    if price is None:
-        raise ValueError("no price field")
-    return float(price)
-
-
-async def _fetch_price_okx(symbol: str) -> float:
-    inst = to_okx_inst(symbol)
-    async with httpx.AsyncClient(timeout=8) as client:
-        r = await client.get(
-            f"{OKX_BASE}/api/v5/market/ticker",
-            params={"instId": inst},
-            headers={"accept": "application/json"},
-        )
-    if r.status_code == 429:
-        raise ValueError(f"OKX 429 rate-limit — backing off")
-    if r.status_code != 200:
-        raise ValueError(f"HTTP {r.status_code}: {r.text[:120]}")
-    arr = (r.json() or {}).get("data") or []
-    if not arr:
-        raise ValueError(f"no ticker for {inst}")
-    last = arr[0].get("last")
-    if last is None:
-        raise ValueError(f"missing last price for {inst}")
-    return float(last)
-
-
-async def okx_price(symbol: str) -> float:
-    """Fetch spot price with fallback: Binance US → MEXC → OKX."""
-    errors: list = []
-    for name, fn in [
-        ("BinanceUS", _fetch_price_binance_us),
-        ("MEXC",      _fetch_price_mexc),
-        ("OKX",       _fetch_price_okx),
-    ]:
-        try:
-            return await fn(symbol)
-        except Exception as e:
-            errors.append(f"{name}: {e}")
-            print(f"[price] {name} failed for {symbol}: {e}")
-    raise HTTPException(
-        status_code=503,
-        detail=f"All price sources failed for {symbol} — {'; '.join(errors)}"
-    )
-
-
-# ── Market data cache ─────────────────────────────────────────────────────
-# All users on the same symbol+tf share ONE OKX fetch per TTL period.
-# 1000 BTCUSDT/15m users → 1 API call per minute instead of 1000.
-_KLINES_CACHE: Dict[tuple, tuple] = {}   # (symbol, tf) → (fetched_at, klines)
-_KLINES_CACHE_LOCK = threading.Lock()
-_KLINES_CACHE_TTL = 55  # seconds — refresh just under 1 minute
-
-
-def _fetch_klines_raw(symbol: str, tf: str, limit: int) -> List[Dict[str, Any]]:
-    """Direct OKX fetch — no cache."""
-    inst = to_okx_inst(symbol)
-    bar = OKX_TF_MAP.get(str(tf))
-    if not bar:
-        print(f"[klines] unknown tf={tf!r} for {symbol}")
-        return []
-    try:
-        r = httpx.get(
-            f"{OKX_BASE}/api/v5/market/candles",
-            params={"instId": inst, "bar": bar, "limit": int(limit)},
-            timeout=12,
-            headers={"accept": "application/json"},
-        )
-        if r.status_code == 429:
-            print(f"[klines] OKX 429 rate-limit for {inst}/{bar} — sleeping 60s")
-            time.sleep(60)
-            return []
-        if r.status_code != 200:
-            print(f"[klines] OKX HTTP {r.status_code} for {inst}/{bar}: {r.text[:120]}")
-            return []
-        rows = (r.json() or {}).get("data") or []
-        if not rows:
-            print(f"[klines] OKX returned empty data for {inst}/{bar} limit={limit}")
-            return []
-        out: List[Dict[str, Any]] = []
-        for k in rows:
-            out.append({"t": int(k[0]), "open": float(k[1]), "high": float(k[2]),
-                        "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])})
-        out.reverse()
-        return out
-    except Exception as e:
-        print(f"[klines] exception fetching {inst}/{bar}: {e}")
-        return []
-
-
-def _fetch_klines_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
-    """Cached OKX fetch — all users sharing same symbol+tf get the same data."""
-    key = (symbol.upper(), tf)
-    now = time.time()
-    with _KLINES_CACHE_LOCK:
-        if key in _KLINES_CACHE:
-            fetched_at, cached = _KLINES_CACHE[key]
-            # Only use cache if it's fresh AND has enough candles for this request
-            if now - fetched_at < _KLINES_CACHE_TTL and len(cached) >= limit:
-                return cached
-    # Cache miss, expired, or insufficient length — fetch fresh
-    fresh = _fetch_klines_raw(symbol, tf, limit)
-    if fresh:
-        with _KLINES_CACHE_LOCK:
-            _KLINES_CACHE[key] = (now, fresh)
-    return fresh
-
-
-# =========================
-# MARKET (PUBLIC) — BYBIT
-# =========================
-BYBIT_BASE = "https://api.bybit.com"
-BYBIT_TF_MAP = {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}
-
-
-def to_bybit_symbol(symbol: str) -> str:
-    """Bybit uses BTCUSDT format (no dash)."""
-    s = (symbol or "").upper().strip()
-    if "-" in s:
-        return s.replace("-", "")
-    return s
-
-
-async def bybit_price(symbol: str) -> float:
-    sym = to_bybit_symbol(symbol)
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(
-            f"{BYBIT_BASE}/v5/market/tickers",
-            params={"category": "linear", "symbol": sym},
-            headers={"accept": "application/json"},
-        )
-    if r.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"Bybit price error: {r.text[:200]}")
-    data = (r.json() or {})
-    items = (data.get("result") or {}).get("list") or []
-    if not items:
-        raise HTTPException(status_code=400, detail=f"Bybit: no ticker for {sym}")
-    last = items[0].get("lastPrice")
-    if last is None:
-        raise HTTPException(status_code=400, detail=f"Bybit: missing lastPrice for {sym}")
-    return float(last)
-
-
-def _fetch_klines_bybit_sync(symbol: str, tf: str, limit: int = 200) -> List[Dict[str, Any]]:
-    sym = to_bybit_symbol(symbol)
-    interval = BYBIT_TF_MAP.get(str(tf))
-    if not interval:
-        return []
-    try:
-        r = httpx.get(
-            f"{BYBIT_BASE}/v5/market/kline",
-            params={"category": "linear", "symbol": sym, "interval": interval, "limit": int(limit)},
-            timeout=12,
-            headers={"accept": "application/json"},
-        )
-        if r.status_code != 200:
-            print(f"[klines-bybit] HTTP {r.status_code} for {sym}/{interval}: {r.text[:120]}")
-            return []
-        items = ((r.json() or {}).get("result") or {}).get("list") or []
-        if not items:
-            return []
-        out: List[Dict[str, Any]] = []
-        # Bybit returns: [startTime, open, high, low, close, volume, turnover]
-        for k in items:
-            out.append({
-                "t": int(k[0]),
-                "open": float(k[1]),
-                "high": float(k[2]),
-                "low": float(k[3]),
-                "close": float(k[4]),
-                "volume": float(k[5]),
-            })
-        out.reverse()
-        return out
-    except Exception:
-        return []
-
-
-# alias used by trade engine (OKX has no geo-restriction on Render)
-binance_price = okx_price
-
-
-async def _route_price(symbol: str, exchange: str) -> float:
-    # OKX is the only exchange whose public API is accessible from Render US servers.
-    # Binance and Bybit both geo-block US infrastructure.
-    # We use OKX as the data source for all exchanges — prices are essentially identical.
-    return await okx_price(symbol)
-
-
-def _route_klines(symbol: str, tf: str, exchange: str, limit: int) -> List[Dict[str, Any]]:
-    return _fetch_klines_sync(symbol, tf, limit=limit)
-
-
-_EXCHANGE_ALLOWLIST = {"bybit", "okx", "binance"}
-
-def _validate_exchange_param(ex: Optional[str]) -> str:
-    """Normalise and allowlist-check the ?exchange= query param."""
-    v = (ex or "okx").lower().strip()
-    if v not in _EXCHANGE_ALLOWLIST:
-        raise HTTPException(status_code=400, detail=f"Unknown exchange '{v}'. Use: bybit, okx, binance")
-    return v
-
-import re as _re
-_SYMBOL_RE = _re.compile(r'^[A-Z0-9]{2,20}$')
-
-
-def _validate_symbol(v: str) -> str:
-    """Normalise a symbol from a Pydantic model field — uppercase + strip only.
-    Endpoint-level checks (USDT suffix, length) happen after this."""
-    return v.upper().strip()
-
-
-def _validate_path_symbol(symbol: str) -> str:
-    """Validate and normalise a symbol coming in as a URL path segment."""
-    sym = symbol.upper().strip()
-    if not _SYMBOL_RE.match(sym):
-        raise HTTPException(status_code=400, detail=f"Invalid symbol '{sym}' — use format like BTCUSDT")
-    return sym
-
 
 @app.get("/price/{symbol}")
 async def get_price(symbol: str, exchange: Optional[str] = Query(default=None)):
@@ -1988,60 +829,8 @@ async def get_price(symbol: str, exchange: Optional[str] = Query(default=None)):
     return {"symbol": sym, "price": price, "exchange": ex}
 
 
-def _parse_binance_style_24h(d: dict) -> dict:
-    """Parse Binance-format 24h ticker (used by Binance US and MEXC)."""
-    last   = float(d.get("lastPrice") or 0)
-    open24 = float(d.get("openPrice") or last or 1)
-    high   = float(d.get("highPrice") or 0)
-    low    = float(d.get("lowPrice") or 0)
-    vol    = float(d.get("quoteVolume") or 0)
-    chg    = ((last - open24) / open24 * 100) if open24 else 0.0
-    return {"price": last, "open24h": open24, "high24h": high, "low24h": low,
-            "change24h": round(chg, 3), "volume24h": round(vol, 2)}
-
-
-async def _fetch_ticker_24h(symbol: str) -> dict:
-    """24h stats: Binance US → MEXC → OKX."""
-    sym = symbol.upper().strip()
-    for name, url in [
-        ("BinanceUS", "https://api.binance.us/api/v3/ticker/24hr"),
-        ("MEXC",      "https://api.mexc.com/api/v3/ticker/24hr"),
-    ]:
-        try:
-            async with httpx.AsyncClient(timeout=8) as client:
-                r = await client.get(url, params={"symbol": sym},
-                                     headers={"accept": "application/json"})
-            if r.status_code == 200:
-                return _parse_binance_style_24h(r.json())
-        except Exception as e:
-            print(f"[ticker24h] {name} failed for {sym}: {e}")
-    # OKX fallback
-    try:
-        inst = to_okx_inst(sym)
-        async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(
-                f"{OKX_BASE}/api/v5/market/ticker",
-                params={"instId": inst},
-                headers={"accept": "application/json"},
-            )
-        if r.status_code == 200:
-            d = ((r.json() or {}).get("data") or [{}])[0]
-            last   = float(d.get("last") or 0)
-            open24 = float(d.get("open24h") or last or 1)
-            high   = float(d.get("high24h") or 0)
-            low    = float(d.get("low24h") or 0)
-            vol    = float(d.get("volCcy24h") or 0)
-            chg    = ((last - open24) / open24 * 100) if open24 else 0.0
-            return {"price": last, "open24h": open24, "high24h": high, "low24h": low,
-                    "change24h": round(chg, 3), "volume24h": round(vol, 2)}
-    except Exception as e:
-        print(f"[ticker24h] OKX failed for {sym}: {e}")
-    return {"price": 0, "open24h": 0, "high24h": 0, "low24h": 0, "change24h": 0.0, "volume24h": 0}
-
-
 @app.get("/market/ticker/{symbol}")
 async def market_ticker(symbol: str, exchange: Optional[str] = Query(default=None)):
-    """24h stats for a symbol: price, change%, high, low, volume in USDT."""
     sym = _validate_path_symbol(symbol)
     stats = await _fetch_ticker_24h(sym)
     return {"symbol": sym, **stats, "exchange": (exchange or "okx").lower()}
@@ -2049,7 +838,6 @@ async def market_ticker(symbol: str, exchange: Optional[str] = Query(default=Non
 
 @app.get("/market/tickers")
 async def market_tickers(symbols: str = Query(..., max_length=500)):
-    """Batch 24h stats. Pass ?symbols=BTCUSDT,ETHUSDT,... (max 20 symbols)"""
     syms = [s.strip().upper() for s in symbols.split(",") if s.strip()][:20]
     results = await asyncio.gather(*[_fetch_ticker_24h(s) for s in syms], return_exceptions=True)
     out = []
@@ -2063,7 +851,6 @@ async def market_tickers(symbols: str = Query(..., max_length=500)):
 
 @app.get("/market/orderbook/{symbol}")
 async def market_orderbook(symbol: str, depth: int = Query(default=15, ge=5, le=50)):
-    """Live order book bids/asks."""
     inst = to_okx_inst(symbol.upper().strip())
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(
@@ -2076,14 +863,13 @@ async def market_orderbook(symbol: str, depth: int = Query(default=15, ge=5, le=
         return [{"price": float(row[0]), "size": float(row[1])} for row in (rows or [])]
     return {
         "symbol": symbol.upper().strip(),
-        "asks": parse_side(d.get("asks", [])),   # ascending (lowest ask first)
-        "bids": parse_side(d.get("bids", [])),   # descending (highest bid first)
+        "asks": parse_side(d.get("asks", [])),
+        "bids": parse_side(d.get("bids", [])),
     }
 
 
 @app.get("/market/trades/{symbol}")
 async def market_trades(symbol: str, limit: int = Query(default=20, ge=5, le=50)):
-    """Recent trades."""
     inst = to_okx_inst(symbol.upper().strip())
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.get(
@@ -2100,127 +886,10 @@ async def market_trades(symbol: str, limit: int = Query(default=20, ge=5, le=50)
     return {"symbol": symbol.upper().strip(), "trades": trades}
 
 
-# ── Symbol list cache ─────────────────────────────────────────────────────────
-# Stores the full USDT perpetual coin list per exchange so the market search
-# dropdown shows the correct coins for the user's connected exchange.
-# Refreshed every 5 minutes — symbol lists rarely change more often than that.
-_symbols_cache: Dict[str, Any] = {}  # key = exchange name, value = {"ts": float, "symbols": list}
-_SYMBOLS_TTL = 300  # 5 minutes in seconds
-
-async def _fetch_symbols_for_exchange(exchange: str) -> List[str]:
-    """
-    Return all active USDT perpetual trading pairs for the given exchange.
-
-    Why OKX is the fallback:
-        Render deploys on US servers. Binance and Bybit geo-block US IPs on
-        some endpoints. OKX does not. So we always try the native exchange API
-        first, and silently fall back to OKX's list if it fails.
-        Coins are ~95% the same across all three exchanges.
-
-    Returns a sorted list of symbols in plain format e.g. ["BTCUSDT", "ETHUSDT"]
-    """
-    ex = exchange.lower()
-    now = time.time()
-
-    # Return cached list if it's still fresh (within 5 minutes)
-    cached = _symbols_cache.get(ex)
-    if cached and (now - cached["ts"]) < _SYMBOLS_TTL:
-        return cached["symbols"]
-
-    symbols: List[str] = []
-
-    async with httpx.AsyncClient(timeout=12) as client:
-
-        # ── Binance Futures ────────────────────────────────────────────────────
-        # exchangeInfo returns every pair with its type and status.
-        # We filter to: USDT-quoted + PERPETUAL contract + currently TRADING.
-        if ex == "binance":
-            try:
-                r = await client.get(
-                    "https://fapi.binance.com/fapi/v1/exchangeInfo",
-                    headers={"accept": "application/json"},
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    symbols = sorted([
-                        s["symbol"] for s in (data.get("symbols") or [])
-                        if s.get("quoteAsset") == "USDT"        # USDT pairs only
-                        and s.get("status") == "TRADING"        # actively trading
-                        and s.get("contractType") == "PERPETUAL" # perps only, not delivery
-                    ])
-            except Exception:
-                pass  # geo-block or timeout — fall through to OKX fallback below
-
-        # ── Bybit Linear Perpetuals ────────────────────────────────────────────
-        # category=linear covers USDT-margined perps (not inverse BTC-margined).
-        elif ex == "bybit":
-            try:
-                r = await client.get(
-                    f"{BYBIT_BASE}/v5/market/instruments-info",
-                    params={"category": "linear", "limit": 1000},
-                    headers={"accept": "application/json"},
-                )
-                if r.status_code == 200:
-                    items = ((r.json() or {}).get("result") or {}).get("list") or []
-                    symbols = sorted([
-                        i["symbol"] for i in items
-                        if i.get("quoteCoin") == "USDT"         # USDT pairs only
-                        and i.get("status") == "Trading"        # actively trading
-                        and i.get("symbol", "").endswith("USDT") # double-check suffix
-                    ])
-            except Exception:
-                pass  # fall through to OKX fallback below
-
-        # ── OKX fallback (or primary if exchange == "okx") ────────────────────
-        # instType=SWAP covers perpetual contracts on OKX.
-        # OKX uses "BTC-USDT-SWAP" format — we convert to plain "BTCUSDT" so all
-        # three exchanges return symbols in the same format to the frontend.
-        if not symbols:
-            try:
-                r = await client.get(
-                    f"{OKX_BASE}/api/v5/public/instruments",
-                    params={"instType": "SWAP"},
-                    headers={"accept": "application/json"},
-                )
-                if r.status_code == 200:
-                    items = (r.json() or {}).get("data") or []
-                    symbols = sorted([
-                        i["instId"].replace("-USDT-SWAP", "USDT")  # "BTC-USDT-SWAP" → "BTCUSDT"
-                        for i in items
-                        if i.get("instId", "").endswith("-USDT-SWAP")
-                        and i.get("state") == "live"
-                    ])
-            except Exception:
-                pass
-
-    # Store the result in cache with the current timestamp
-    _symbols_cache[ex] = {"ts": now, "symbols": symbols}
-    return symbols
-
-
 @app.get("/market/symbols")
 async def market_symbols(exchange: str = Query(default="okx")):
-    """
-    Return all tradeable USDT perpetual symbols for the given exchange.
-
-    The frontend market search calls this endpoint on page load to populate
-    the coin search dropdown. Without this, the search would only show a
-    hardcoded list instead of the actual coins available on the user's exchange.
-
-    Usage:
-        GET /market/symbols?exchange=binance   → Binance USDT perp list
-        GET /market/symbols?exchange=bybit     → Bybit USDT linear list
-        GET /market/symbols?exchange=okx       → OKX USDT swap list (default)
-
-    Response:
-        { "exchange": "binance", "count": 320, "symbols": ["BTCUSDT", ...] }
-    """
     syms = await _fetch_symbols_for_exchange(exchange.lower())
-    return {
-        "exchange": exchange.lower(),
-        "count": len(syms),
-        "symbols": syms,
-    }
+    return {"exchange": exchange.lower(), "count": len(syms), "symbols": syms}
 
 
 @app.get("/klines/{symbol}")
@@ -2230,755 +899,19 @@ def klines(
     limit: int = Query(200, ge=20, le=1000),
     exchange: Optional[str] = Query(default=None),
 ):
-    rows = _route_klines(symbol, tf, exchange or "okx", limit)
+    ex = (exchange or "bybit").lower()
+    rows = _route_klines(symbol, tf, ex, limit)
     if not rows:
         raise HTTPException(status_code=400, detail="No kline data (bad symbol/tf or exchange unavailable).")
-    return {"symbol": symbol.upper().strip(), "tf": tf, "klines": rows, "exchange": (exchange or "okx").lower()}
+    return {"symbol": symbol.upper().strip(), "tf": tf, "klines": rows, "exchange": ex}
 
 
 # =========================
-# TRADING + RISK ENGINE (sandbox)
+# TRADING + RISK ENGINE
 # =========================
-@dataclass
-class Trade:
-    time: str
-    side: Side
-    symbol: str
-    mode: RiskMode
-    size: float
-    sl: float
-    tp: float
-    leverage: float
-    entry_price: float
-    current_price: float
-    unreal_pnl_percent: float
-    unreal_pnl_value: float
-    equity_after: float
-    reason: Optional[str] = None
-    is_primary: int = 1
-
-
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-
-def presets_for_mode(mode: RiskMode) -> Dict[str, float]:
-    return {
-        "ULTRA_SAFE": dict(size=0.30, sl=0.35, tp=0.60, leverage=2),
-        "SAFE": dict(size=0.45, sl=0.45, tp=0.80, leverage=3),
-        "NORMAL": dict(size=0.60, sl=0.55, tp=1.00, leverage=5),
-        "MINI_ASYM": dict(size=0.65, sl=0.55, tp=1.10, leverage=6),
-        "AGGRESSIVE": dict(size=0.85, sl=0.70, tp=1.50, leverage=8),
-    }[mode]
-
-
-def default_max_trades_per_day(mode: RiskMode) -> int:
-    return {"ULTRA_SAFE": 1, "SAFE": 2, "NORMAL": 3, "MINI_ASYM": 3, "AGGRESSIVE": 5}[mode]
-
-
-def build_reason(mode: RiskMode, equity: float, computed: Dict[str, float], extra: Optional[str] = None) -> str:
-    from_start = equity - START_EQUITY
-    dir_word = "up" if from_start >= 0 else "down"
-    pct = abs(from_start / START_EQUITY * 100)
-    size_dollar = equity * computed["size"]
-    effective = size_dollar * computed["leverage"]
-    reduced = pct >= 10.0
-
-    lines = [
-        f"{mode}  •  Manual trade",
-        "",
-        "Account",
-        f"  Equity:      ${equity:,.2f}  ({dir_word} {pct:.1f}% from ${START_EQUITY:.0f} start)",
-        "",
-        "Position",
-        f"  Size:        {computed['size'] * 100:.1f}% of equity  →  ${size_dollar:.2f} at risk",
-        f"  Leverage:    {computed['leverage']:.0f}×  →  ${effective:.2f} total exposure",
-        f"  Stop loss:   {computed['sl']:.2f}% from entry",
-        f"  Take profit: {computed['tp']:.2f}% from entry",
-    ]
-    if reduced:
-        lines.append("")
-        lines.append("Risk note: Equity up 10%+ — size & leverage reduced ~10% to protect profits.")
-
-    if extra:
-        lines.append("")
-        lines.append(extra)
-
-    return "\n".join(lines)
-
-
-def mini_asym_risk_engine(mode: RiskMode, equity: float) -> Dict[str, Any]:
-    p = presets_for_mode(mode).copy()
-    growth = (equity - START_EQUITY) / START_EQUITY
-    if growth >= 0.10:
-        p["size"] *= 0.9
-        p["leverage"] *= 0.9
-    computed = {
-        "size": clamp(p["size"], 0.10, 1.50),
-        "sl": clamp(p["sl"], 0.10, 2.50),
-        "tp": clamp(p["tp"], 0.20, 5.00),
-        "leverage": clamp(p["leverage"], 1.0, 10.0),
-    }
-    return {"allowed": True, "computed": computed, "reason": build_reason(mode, equity, computed)}
-
-
-class TradeIn(BaseModel):
-    symbol: str
-    side: Side
-    mode: RiskMode
-    size: float = Field(..., gt=0, le=1_000_000)
-    sl: float = Field(..., gt=0)
-    tp: float = Field(..., gt=0)
-    leverage: float = Field(..., ge=1, le=125)
-
-    @field_validator("symbol")
-    @classmethod
-    def _check_symbol(cls, v: str) -> str:
-        return _validate_symbol(v)
-
-
-class RiskPreviewIn(BaseModel):
-    symbol: str
-    side: Side
-    mode: RiskMode
-    size: float = Field(..., gt=0, le=1_000_000)
-    sl: float = Field(..., gt=0)
-    tp: float = Field(..., gt=0)
-    leverage: float = Field(..., ge=1, le=125)
-
-    @field_validator("symbol")
-    @classmethod
-    def _check_symbol(cls, v: str) -> str:
-        return _validate_symbol(v)
-
-
-@app.post("/risk/preview")
-def risk_preview(payload: RiskPreviewIn, user=Depends(require_user)):
-    email = user["email"]
-    equity = get_equity(email)
-    out = mini_asym_risk_engine(payload.mode, equity)
-    c = out["computed"]
-    return {
-        "allowed": True,
-        "reason": out.get("reason"),
-        "computed": {
-            "symbol": payload.symbol.upper().strip(),
-            "side": payload.side,
-            "mode": payload.mode,
-            "size": float(c["size"]),
-            "sl": float(c["sl"]),
-            "tp": float(c["tp"]),
-            "leverage": float(c["leverage"]),
-        },
-    }
-
-
-@app.get("/balance")
-def balance(user=Depends(require_user)):
-    email = user["email"]
-
-    real_bal = get_real_usdt_balance(email)
-    if real_bal is not None:
-        # Exchange connected — always show real balance on equity card
-        equity = real_bal
-        db_equity = get_equity(email)
-        if abs(db_equity - real_bal) > 0.01:
-            set_equity(email, real_bal)
-    elif REAL_TRADING:
-        # Real trading mode but exchange unreachable — show 0, not fake balance
-        equity = 0.0
-    else:
-        equity = get_equity(email)
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT time FROM trades WHERE email = %s ORDER BY id DESC LIMIT 1", (email,))
-        last_row = cur.fetchone()
-        cur.execute(
-            "SELECT peak_equity, all_time_high, floor_equity, starting_capital FROM user_state WHERE email = %s",
-            (email,),
-        )
-        state_row = cur.fetchone()
-        # If peak_equity was never written (column newly added, runner not yet started),
-        # recover the best historical peak from trade equity_after values.
-        # This prevents "floor = equity × 0.85" on fresh deploys before runner starts.
-        _db_peak = float(state_row["peak_equity"] or 0) if state_row else 0.0
-        if _db_peak == 0:
-            cur.execute(
-                "SELECT MAX(equity_after) AS max_eq FROM trades WHERE email = %s",
-                (email,),
-            )
-            _tp = cur.fetchone()
-            _trade_peak = float((_tp or {}).get("max_eq") or 0)
-            if _trade_peak > 0:
-                _db_peak = _trade_peak
-                # Persist so next call is instant
-                _new_floor = round(_db_peak * 0.85, 2)
-                cur.execute(
-                    "UPDATE user_state SET peak_equity=%s, floor_equity=%s WHERE email=%s",
-                    (_db_peak, _new_floor, email),
-                )
-                conn.commit()
-
-    # start_eq is the balance when trading began — used for locked_profit and floor % display.
-    # Using current equity as start_eq was wrong: it made locked_profit always 0 or negative.
-    _sc = float(state_row["starting_capital"] or 0) if state_row else 0.0
-    if real_bal is not None:
-        start_eq = _sc if _sc > 0 else equity
-    elif REAL_TRADING:
-        start_eq = 0.0
-    else:
-        start_eq = START_EQUITY
-    peak = _db_peak
-    # floor_equity is the persistent, historically-max floor stored in user_state.
-    # It only ever increases (via max in update_peak_ath) and survives runner restarts.
-    stored_floor = float(state_row["floor_equity"] or 0) if state_row else 0.0
-    # Include live runner's peak and floor — more up-to-date than DB between saves
-    with AUTO_LOCK:
-        _r = AUTO_RUNNERS.get(email)
-    if _r and _r.is_running():
-        peak = max(peak, _r.peak_equity)
-        stored_floor = max(stored_floor, _r.floor_equity)
-    if peak < equity:
-        peak = equity
-    # Hard floor = max of: (current peak × 0.85) and the historically stored floor.
-    # Using max() means the floor can NEVER go lower than its best historical value,
-    # even if peak_equity had a transient undercount or was reset by a bug.
-    hard_floor = round(max(peak * 0.85, stored_floor), 2)
-    locked_profit = round(hard_floor - start_eq, 2)
-    distance_to_floor = round(equity - hard_floor, 2)
-    distance_pct = round(distance_to_floor / hard_floor * 100, 2) if hard_floor > 0 else 0.0
-    ath = float(state_row["all_time_high"] or 0) if state_row else 0.0
-    if ath < equity:
-        ath = equity
-    return {
-        "total": equity,
-        "equity_after_last_trade": equity,
-        "last_trade": last_row["time"] if last_row else None,
-        "start_equity": start_eq,
-        "peak_equity": round(peak, 2),
-        "hard_floor": hard_floor,
-        "locked_profit": locked_profit,
-        "distance_to_floor": distance_to_floor,
-        "distance_pct": distance_pct,
-        "all_time_high": round(ath, 2),
-    }
-
-
-@app.get("/trades")
-def trades(
-    user=Depends(require_user),
-    symbol: Optional[str] = Query(default=None),
-    current_session: bool = Query(default=False),
-    limit: int = Query(default=500, ge=1, le=2000),
-):
-    email = user["email"]
-    where = ["email = %s"]
-    params: List[Any] = [email]
-
-    if current_session:
-        sid = get_session_id(email)
-        where.append("session_id = %s")
-        params.append(sid)
-
-    if symbol:
-        where.append("UPPER(symbol) = %s")
-        params.append(symbol.strip().upper())
-
-    q = f"SELECT * FROM trades WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT %s"
-    params.append(int(limit))
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(q, tuple(params))
-        rows = cur.fetchall()
-
-    return {"trades": [dict(r) for r in rows]}
-
-
-@app.get("/portfolio/stats")
-def portfolio_stats(user=Depends(require_user)):
-    import statistics as _st
-    from datetime import timezone as _tz, timedelta as _td
-
-    email = user["email"]
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM trades WHERE email = %s ORDER BY time ASC", (email,))
-        rows = [dict(r) for r in cur.fetchall()]
-
-    if not rows:
-        return {"empty": True}
-
-    # ── helpers ──────────────────────────────────────────────────────────────
-    def _parse_dt(s):
-        s = str(s).strip()
-        iso = s if "T" in s else s.replace(" ", "T")
-        if not iso.endswith("Z"):
-            iso += "Z"
-        try:
-            from datetime import datetime as _dt
-            return _dt.fromisoformat(iso.replace("Z", "+00:00"))
-        except Exception:
-            return None
-
-    def _dubai_hour(s):
-        dt = _parse_dt(s)
-        if not dt:
-            return -1
-        return (dt + _td(hours=4)).hour
-
-    def _session(h):
-        if 2 <= h < 6:   return "Dead"
-        if 6 <= h < 12:  return "Asia"
-        if 12 <= h < 16: return "London"
-        if 16 <= h < 21: return "London+NY"
-        if 21 <= h <= 23: return "NY"
-        return "NY-close"
-
-    def _style(reason):
-        r = str(reason or "")
-        if "Scalp" in r or "SCALP" in r: return "SCALP"
-        if "Swing" in r or "SWING" in r: return "SWING"
-        return "DAY_TRADE"
-
-    def _grade(trade: dict):
-        stored = trade.get("grade")
-        if stored in ("A", "B"):
-            return stored
-        return "B" if "Grade B" in str(trade.get("reason") or "") else "A"
-
-    # ── base arrays ───────────────────────────────────────────────────────────
-    pnls     = [float(t["unreal_pnl_value"])   for t in rows]
-    pnl_pcts = [float(t["unreal_pnl_percent"]) for t in rows]
-    total    = len(rows)
-    wins     = [t for t in rows if float(t["unreal_pnl_value"]) >= 0]
-    losses   = [t for t in rows if float(t["unreal_pnl_value"]) <  0]
-    win_rate = len(wins) / total if total else 0
-    total_pnl = sum(pnls)
-
-    # ── equity + drawdown curve ───────────────────────────────────────────────
-    first_eq = float(rows[0]["equity_after"]) - pnls[0]
-    eq_curve = [{"time": str(rows[0]["time"]), "equity": round(first_eq, 2)}]
-    for t in rows:
-        eq_curve.append({"time": str(t["time"]), "equity": round(float(t["equity_after"]), 2)})
-
-    peak = eq_curve[0]["equity"]
-    max_dd = 0.0
-    dd_curve = [{"time": eq_curve[0]["time"], "dd": 0.0}]
-    for pt in eq_curve[1:]:
-        if pt["equity"] > peak:
-            peak = pt["equity"]
-        dd = (peak - pt["equity"]) / peak if peak > 0 else 0.0
-        max_dd = max(max_dd, dd)
-        dd_curve.append({"time": pt["time"], "dd": round(-dd * 100, 3)})
-
-    # ── avg R/R ───────────────────────────────────────────────────────────────
-    win_p  = [abs(p) for p in pnl_pcts if p >= 0]
-    loss_p = [abs(p) for p in pnl_pcts if p <  0]
-    avg_rr = ((_st.mean(win_p) if win_p else 0) / (_st.mean(loss_p) if loss_p else 1))
-
-    # ── monthly P&L ───────────────────────────────────────────────────────────
-    monthly: dict = {}
-    for t in rows:
-        dt = _parse_dt(t["time"])
-        if not dt:
-            continue
-        key = dt.strftime("%Y-%m")
-        if key not in monthly:
-            monthly[key] = {"month": key, "pnl": 0.0, "trades": 0, "wins": 0}
-        monthly[key]["pnl"]    += float(t["unreal_pnl_value"])
-        monthly[key]["trades"] += 1
-        if float(t["unreal_pnl_value"]) >= 0:
-            monthly[key]["wins"] += 1
-    monthly_list = sorted(monthly.values(), key=lambda x: x["month"])
-    for m in monthly_list:
-        m["pnl"] = round(m["pnl"], 2)
-    best_month  = max(monthly_list, key=lambda x: x["pnl"])  if monthly_list else None
-    worst_month = min(monthly_list, key=lambda x: x["pnl"]) if monthly_list else None
-
-    # ── current streak ────────────────────────────────────────────────────────
-    streak_type  = "W" if pnls[-1] >= 0 else "L"
-    streak_count = 0
-    for p in reversed(pnls):
-        if (p >= 0) == (streak_type == "W"):
-            streak_count += 1
-        else:
-            break
-
-    # ── session distribution ──────────────────────────────────────────────────
-    sessions: dict = {}
-    for t in rows:
-        h = _dubai_hour(t["time"])
-        if h < 0:
-            continue
-        s = _session(h)
-        if s not in sessions:
-            sessions[s] = {"trades": 0, "wins": 0, "pnl": 0.0, "pnl_history": []}
-        sessions[s]["trades"] += 1
-        pv = float(t["unreal_pnl_value"])
-        sessions[s]["pnl"]  += pv
-        sessions[s]["pnl_history"].append(round(pv, 2))
-        if pv >= 0:
-            sessions[s]["wins"] += 1
-    for s in sessions.values():
-        s["win_rate"] = round(s["wins"] / s["trades"] * 100, 1) if s["trades"] else 0
-        s["pnl"] = round(s["pnl"], 2)
-
-    # ── grade distribution ────────────────────────────────────────────────────
-    grades: dict = {"A": 0, "B": 0}
-    for t in rows:
-        g = _grade(t)
-        grades[g] = grades.get(g, 0) + 1
-
-    # ── symbol breakdown ──────────────────────────────────────────────────────
-    syms: dict = {}
-    for t in rows:
-        sym = t["symbol"]
-        if sym not in syms:
-            syms[sym] = {"symbol": sym, "trades": 0, "wins": 0, "pnl": 0.0}
-        syms[sym]["trades"] += 1
-        pv = float(t["unreal_pnl_value"])
-        syms[sym]["pnl"] += pv
-        if pv >= 0:
-            syms[sym]["wins"] += 1
-    sym_list = sorted(syms.values(), key=lambda x: -x["trades"])
-    for s in sym_list:
-        s["win_rate"] = round(s["wins"] / s["trades"] * 100, 1) if s["trades"] else 0
-        s["pnl"] = round(s["pnl"], 2)
-
-    # ── mode breakdown ────────────────────────────────────────────────────────
-    modes: dict = {}
-    for t in rows:
-        m = t["mode"]
-        if m not in modes:
-            modes[m] = {"mode": m, "trades": 0, "wins": 0, "pnl": 0.0}
-        modes[m]["trades"] += 1
-        pv = float(t["unreal_pnl_value"])
-        modes[m]["pnl"] += pv
-        if pv >= 0:
-            modes[m]["wins"] += 1
-    mode_list = sorted(modes.values(), key=lambda x: -x["trades"])
-    for m in mode_list:
-        m["win_rate"] = round(m["wins"] / m["trades"] * 100, 1) if m["trades"] else 0
-        m["pnl"] = round(m["pnl"], 2)
-
-    # ── style breakdown ───────────────────────────────────────────────────────
-    stls: dict = {}
-    hold_map = {"SCALP": "~15m", "DAY_TRADE": "~1–2h", "SWING": "~4–12h"}
-    for t in rows:
-        st = _style(t.get("reason"))
-        if st not in stls:
-            stls[st] = {"style": st, "trades": 0, "wins": 0, "pnl": 0.0}
-        stls[st]["trades"] += 1
-        pv = float(t["unreal_pnl_value"])
-        stls[st]["pnl"] += pv
-        if pv >= 0:
-            stls[st]["wins"] += 1
-    style_list = sorted(stls.values(), key=lambda x: -x["trades"])
-    for s in style_list:
-        s["win_rate"] = round(s["wins"] / s["trades"] * 100, 1) if s["trades"] else 0
-        s["pnl"] = round(s["pnl"], 2)
-        s["avg_hold"] = hold_map.get(s["style"], "~1h")
-
-    # ── time heatmap (Dubai hour) ─────────────────────────────────────────────
-    heatmap: dict = {h: {"wins": 0, "losses": 0} for h in range(24)}
-    for t in rows:
-        h = _dubai_hour(t["time"])
-        if h < 0:
-            continue
-        if float(t["unreal_pnl_value"]) >= 0:
-            heatmap[h]["wins"]   += 1
-        else:
-            heatmap[h]["losses"] += 1
-
-    # ── best / worst trade ────────────────────────────────────────────────────
-    best_trade  = max(rows, key=lambda t: float(t["unreal_pnl_value"]))
-    worst_trade = min(rows, key=lambda t: float(t["unreal_pnl_value"]))
-
-    # ── consistency & health scores ───────────────────────────────────────────
-    if len(pnls) > 1:
-        mean_abs = _st.mean(abs(p) for p in pnls)
-        std_pnl  = _st.stdev(pnls)
-        cv       = std_pnl / mean_abs if mean_abs > 0 else 2.0
-        consistency_score = max(0, min(100, int(100 - cv * 25)))
-    else:
-        consistency_score = 50
-
-    wr_pts   = min(40, int(win_rate * 80))
-    dd_pts   = max(0, int(30 * (1 - max_dd / 0.20)))
-    con_pts  = int(consistency_score * 0.30)
-    health_score = min(100, wr_pts + dd_pts + con_pts)
-
-    # ── daily returns → Sharpe / Sortino / Calmar ────────────────────────────
-    daily: dict = {}
-    for t in rows:
-        dt = _parse_dt(t["time"])
-        if not dt:
-            continue
-        key = dt.strftime("%Y-%m-%d")
-        daily[key] = daily.get(key, 0.0) + float(t["unreal_pnl_percent"])
-    daily_rets = list(daily.values())
-
-    sharpe = sortino = calmar = 0.0
-    if len(daily_rets) >= 2:
-        mean_dr  = _st.mean(daily_rets)
-        std_dr   = _st.stdev(daily_rets)
-        neg_rets = [r for r in daily_rets if r < 0]
-        sor_std  = _st.stdev(neg_rets) if len(neg_rets) > 1 else std_dr
-        if std_dr:
-            sharpe  = round(mean_dr * (365 ** 0.5) / std_dr, 2)
-        if sor_std:
-            sortino = round(mean_dr * (365 ** 0.5) / sor_std, 2)
-        eq_start = eq_curve[0]["equity"]
-        eq_end   = eq_curve[-1]["equity"]
-        days     = max(1, len(daily_rets))
-        ann_ret  = ((eq_end / eq_start) ** (365 / days) - 1) * 100 if eq_start > 0 else 0
-        if max_dd > 0.001:
-            calmar = round(ann_ret / (max_dd * 100), 2)
-
-    # ── mistake detection ─────────────────────────────────────────────────────
-    mistakes = []
-    eligible_sess = [(k, v) for k, v in sessions.items() if v["trades"] >= 2]
-    if eligible_sess:
-        worst_s = min(eligible_sess, key=lambda x: x[1]["win_rate"])
-        if worst_s[1]["win_rate"] < 40:
-            mistakes.append(
-                f"Most losses during {worst_s[0]} session "
-                f"({worst_s[1]['win_rate']:.0f}% win rate)"
-            )
-    eligible_modes = [m for m in mode_list if m["trades"] >= 2]
-    if eligible_modes:
-        worst_m = min(eligible_modes, key=lambda x: x["win_rate"])
-        if worst_m["win_rate"] < win_rate * 100 * 0.8:
-            mistakes.append(
-                f"{worst_m['mode']} underperformed "
-                f"({worst_m['win_rate']:.0f}% vs {win_rate*100:.0f}% avg)"
-            )
-    if not mistakes:
-        mistakes.append("No significant loss pattern detected yet — keep trading!")
-
-    # ── AI summary sentence ───────────────────────────────────────────────────
-    streak_str = f"{streak_count} consecutive {'win' if streak_type=='W' else 'loss'}{'s' if streak_count!=1 else ''}"
-    best_s_name = max(sessions.items(), key=lambda x: x[1]["win_rate"])[0] if sessions else None
-    summary_parts = [
-        f"{streak_str}",
-        f"{win_rate*100:.0f}% win rate over {total} trades",
-        f"{'Up' if total_pnl >= 0 else 'Down'} ${abs(total_pnl):.2f} all time",
-    ]
-    if best_s_name:
-        summary_parts.append(f"Best during {best_s_name} session")
-    ai_summary = " · ".join(summary_parts)
-
-    return {
-        "empty": False,
-        "summary": {
-            "total_pnl":        round(total_pnl, 2),
-            "total_trades":     total,
-            "win_rate":         round(win_rate * 100, 1),
-            "avg_rr":           round(avg_rr, 2),
-            "best_month":       best_month,
-            "worst_month":      worst_month,
-            "current_streak":   {"type": streak_type, "count": streak_count},
-            "max_drawdown":     round(max_dd * 100, 2),
-            "health_score":     health_score,
-            "consistency_score": consistency_score,
-        },
-        "equity_curve":        eq_curve,
-        "drawdown_curve":      dd_curve,
-        "monthly_pnl":         monthly_list,
-        "session_distribution": sessions,
-        "grade_distribution":  grades,
-        "symbol_breakdown":    sym_list[:10],
-        "mode_breakdown":      mode_list,
-        "style_breakdown":     style_list,
-        "time_heatmap":        heatmap,
-        "best_trade":          dict(best_trade),
-        "worst_trade":         dict(worst_trade),
-        "ai_summary":          ai_summary,
-        "mistake_detection":   mistakes,
-        "ratios":              {"sharpe": sharpe, "sortino": sortino, "calmar": calmar},
-        "most_traded_symbol":  sym_list[0]["symbol"] if sym_list else "-",
-    }
-
-
-@app.get("/portfolio/pnl")
-def portfolio_pnl(user=Depends(require_user)):
-    """Today / week / month PnL cards + full monthly history for the PnL section."""
-    from datetime import timezone as _tz, timedelta as _td, datetime as _dt
-
-    email = user["email"]
-    now_utc = _dt.now(_tz.utc)
-    dubai_now = now_utc + _td(hours=4)
-
-    # Dubai midnight boundaries
-    today_dubai  = dubai_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    week_start   = today_dubai - _td(days=today_dubai.weekday())
-    month_start  = today_dubai.replace(day=1)
-
-    # Convert back to UTC ISO for DB comparison
-    def _to_utc(dt_dubai):
-        return (dt_dubai - _td(hours=4)).strftime("%Y-%m-%dT%H:%M:%S")
-
-    today_utc = _to_utc(today_dubai)
-    week_utc  = _to_utc(week_start)
-    month_utc = _to_utc(month_start)
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT time, unreal_pnl_value, equity_after FROM trades "
-            "WHERE email = %s ORDER BY time ASC",
-            (email,),
-        )
-        rows = cur.fetchall()
-
-    if not rows:
-        return {"empty": True}
-
-    def _agg(subset):
-        if not subset:
-            return {"pnl": 0.0, "pnl_pct": 0.0, "trades": 0, "wins": 0}
-        pnls = [float(r["unreal_pnl_value"]) for r in subset]
-        wins = sum(1 for p in pnls if p >= 0)
-        # Use equity_before of first trade as base for % calc
-        first_eq_after = float(subset[0]["equity_after"])
-        first_pnl      = float(subset[0]["unreal_pnl_value"])
-        base_eq        = first_eq_after - first_pnl
-        total_pnl      = sum(pnls)
-        pnl_pct        = round(total_pnl / base_eq * 100, 2) if base_eq > 0 else 0.0
-        return {"pnl": round(total_pnl, 2), "pnl_pct": pnl_pct,
-                "trades": len(subset), "wins": wins}
-
-    today_rows = [r for r in rows if str(r["time"]) >= today_utc]
-    week_rows  = [r for r in rows if str(r["time"]) >= week_utc]
-    month_rows = [r for r in rows if str(r["time"]) >= month_utc]
-
-    # ── monthly history ───────────────────────────────────────────────────────
-    monthly: dict = {}
-    for r in rows:
-        ts  = str(r["time"])
-        key = ts[:7]  # "YYYY-MM"
-        if key not in monthly:
-            monthly[key] = {"period": key, "pnl": 0.0, "trades": 0, "wins": 0,
-                            "_first_pnl": float(r["unreal_pnl_value"]),
-                            "_first_eq_after": float(r["equity_after"])}
-        monthly[key]["pnl"]    += float(r["unreal_pnl_value"])
-        monthly[key]["trades"] += 1
-        if float(r["unreal_pnl_value"]) >= 0:
-            monthly[key]["wins"] += 1
-
-    history = []
-    for m in sorted(monthly.values(), key=lambda x: x["period"]):
-        base = m["_first_eq_after"] - m["_first_pnl"]
-        pnl  = round(m["pnl"], 2)
-        pct  = round(pnl / base * 100, 2) if base > 0 else 0.0
-        history.append({
-            "period": m["period"],
-            "pnl":    pnl,
-            "pnl_pct": pct,
-            "trades": m["trades"],
-            "wins":   m["wins"],
-            "losses": m["trades"] - m["wins"],
-        })
-
-    best_month  = max(history, key=lambda x: x["pnl"])  if history else None
-    worst_month = min(history, key=lambda x: x["pnl"]) if history else None
-
-    # ── yearly grouping ───────────────────────────────────────────────────────
-    years_dict: dict = {}
-    for m in history:
-        yr = m["period"][:4]
-        if yr not in years_dict:
-            years_dict[yr] = {"year": yr, "pnl": 0.0, "trades": 0, "wins": 0, "months": []}
-        years_dict[yr]["pnl"]    += m["pnl"]
-        years_dict[yr]["trades"] += m["trades"]
-        years_dict[yr]["wins"]   += m["wins"]
-        years_dict[yr]["months"].append(m)
-    for y in years_dict.values():
-        y["pnl"]    = round(y["pnl"], 2)
-        y["losses"] = y["trades"] - y["wins"]
-
-    yearly = sorted(years_dict.values(), key=lambda x: x["year"])
-
-    return {
-        "today":       _agg(today_rows),
-        "week":        _agg(week_rows),
-        "month":       _agg(month_rows),
-        "history":     history,
-        "yearly":      yearly,
-        "best_month":  best_month,
-        "worst_month": worst_month,
-        "has_multiple_years": len(years_dict) > 1,
-    }
-
-
-@app.get("/portfolio/pnl/month/{year_month}")
-def portfolio_pnl_month(year_month: str, user=Depends(require_user)):
-    """Return individual trades for a specific month (YYYY-MM) — drill-down view."""
-    if len(year_month) != 7 or year_month[4] != "-":
-        raise HTTPException(status_code=400, detail="Format must be YYYY-MM")
-    email = user["email"]
-    yr, mo = int(year_month[:4]), int(year_month[5:])
-    next_yr, next_mo = (yr + 1, 1) if mo == 12 else (yr, mo + 1)
-    end_str = f"{next_yr}-{next_mo:02d}-01"
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT time, side, symbol, mode, unreal_pnl_value, unreal_pnl_percent, "
-            "entry_price, current_price, equity_after, leverage, reason "
-            "FROM trades WHERE email = %s AND time >= %s AND time < %s "
-            "ORDER BY time ASC",
-            (email, year_month + "-01", end_str),
-        )
-        trades = [dict(r) for r in cur.fetchall()]
-    return {"month": year_month, "trades": trades, "count": len(trades)}
-
-
-@app.get("/portfolio/pnl/csv/{year}")
-def portfolio_pnl_csv(year: str, user=Depends(require_user)):
-    """Download all trades for a given year as CSV (tax export)."""
-    from fastapi.responses import StreamingResponse
-    import io, csv as _csv
-
-    if not year.isdigit() or len(year) != 4:
-        raise HTTPException(status_code=400, detail="Year must be 4 digits")
-
-    email = user["email"]
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT time, side, symbol, mode, size, leverage, "
-            "entry_price, current_price, unreal_pnl_value, unreal_pnl_percent, "
-            "equity_after, reason "
-            "FROM trades WHERE email = %s AND time >= %s AND time < %s "
-            "ORDER BY time ASC",
-            (email, f"{year}-01-01", f"{int(year)+1}-01-01"),
-        )
-        rows = cur.fetchall()
-
-    buf = io.StringIO()
-    w   = _csv.writer(buf)
-    w.writerow(["Date (UTC)", "Side", "Symbol", "Mode", "Size %", "Leverage",
-                "Entry Price", "Exit Price", "PnL ($)", "PnL (%)", "Equity After"])
-    for r in rows:
-        w.writerow([
-            str(r["time"])[:19],
-            r["side"], r["symbol"], r["mode"],
-            r["size"], r["leverage"],
-            r["entry_price"], r["current_price"],
-            round(float(r["unreal_pnl_value"]), 4),
-            round(float(r["unreal_pnl_percent"]), 4),
-            round(float(r["equity_after"]), 4),
-        ])
-
-    buf.seek(0)
-    return StreamingResponse(
-        iter([buf.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=trades_{year}.csv"},
-    )
-
+# TradeIn, AutoStartIn, FloorResetIn, CorrectTradeIn → routes_engine.py (engine_router)
+# /trade, /reset, /auto/* → routes_engine.py (engine_router)
+# /risk/preview, /balance, /trades, /portfolio/* → routes_portfolio.py (portfolio_router)
 
 async def _place_trade_internal(
     email: str,
@@ -3218,39 +1151,22 @@ class AutoState:
     market_regime: str
 
 
-class AutoStartIn(BaseModel):
-    symbol: str
-    trade_style: TradeStyle = "DAY_TRADE"
-    mode: RiskMode = "MINI_ASYM"
-    max_trades_per_day: Optional[int] = Field(default=None, ge=1, le=50)
-    stop_after_bad_trades: int = Field(default=2, ge=1, le=20)
-    duration_days: int = Field(default=0, ge=0, le=365)
-    trend_filter: bool = True
-    chop_min_sep_pct: float = Field(default=0.005, ge=0.001, le=0.05)
+# AutoStartIn, FloorResetIn, CorrectTradeIn → routes_engine.py
 
-    @field_validator("symbol")
-    @classmethod
-    def _check_symbol(cls, v: str) -> str:
-        return _validate_symbol(v)
-
-
-class FloorResetIn(BaseModel):
-    # confirm=False → dry-run (returns situation/status without applying any changes)
-    # confirm=True  → apply the reset
-    confirm: bool = False
-    # Must be exactly "CONFIRM" (case-insensitive) for Situation 2 when confirm=True
-    typed_confirm: str = ""
-
-
-class CorrectTradeIn(BaseModel):
-    # symbol that was traded (e.g. "NEAR/USDT:USDT" or "NEARUSDT")
-    symbol: str = Field(..., min_length=3, max_length=30)
-    # total real P&L from the exchange for all legs combined (positive = profit)
-    real_pnl: float = Field(..., ge=-100_000, le=100_000)
-    # how many recent trade records to correct — 2 for Grade B (T1+T2), 1 for Grade A
-    num_trades: int = Field(default=2, ge=1, le=10)
-    # correct outcome label written to reason text
-    new_outcome: Literal["TP_HIT", "SL_HIT", "TRAIL_STOP", "NATURAL_CLOSE"] = "TP_HIT"
+# ── Trail stop levels ─────────────────────────────────────────────────────────
+# (tp_fraction, lock_fraction, level_name)
+# tp_fraction:   price must reach this % of the TP target
+# lock_fraction: how much of best_move to lock as profit (0.0 = breakeven only)
+# Ratchet rule: locked profit can only increase — SL never moves backward.
+TRAIL_LEVELS = [
+    (0.35, 0.00, "L1-BE"),   # 35% of TP → SL to breakeven (never lose)
+    (0.40, 0.05, "L2"),      # 40% of TP → lock 5% of profit made
+    (0.50, 0.25, "L3"),      # 50% of TP → lock 25% of profit made
+    (0.60, 0.35, "L4"),      # 60% of TP → lock 35% of profit made
+    (0.70, 0.50, "L5"),      # 70% of TP → lock 50% of profit made
+    (0.80, 0.65, "L6"),      # 80% of TP → lock 65% of profit made
+    (0.90, 0.80, "L7"),      # 90% of TP → lock 80% of profit made
+]
 
 
 class _MidCandleSkip(Exception):
@@ -3294,7 +1210,7 @@ class AutoRunner:
         if self.duration_days > 0:
             end_dt = now_dubai() + timedelta(days=self.duration_days)
             self.end_at_ts = end_dt.timestamp()
-        self.history: Deque[Dict[str, str]] = deque(maxlen=200)
+        self.history: Deque[Dict[str, str]] = deque(maxlen=500)
         self.ai_session_id: Optional[int] = None  # DB row id for this AI run
         self.pending_trades: List[Dict] = []
         self._pt_lock: threading.Lock = threading.Lock()
@@ -3304,36 +1220,78 @@ class AutoRunner:
         self.last_breakdown: Dict = {}
         self.last_score: float = 0.0
         self.last_atr_pct: float = 0.01   # fallback 1% ATR until first signal
+        self.last_adx: float = 0.0        # ADX at last signal — stored in trade dict
         self.market_grade: str = "-"
         self.signal_type: str = "NORMAL"  # "NORMAL" or "REVERSAL" (T16)
         self.sl_atr_override: Optional[float] = None   # T16 reversal uses 1.5
         self.tp_atr_override: Optional[float] = None   # T16 reversal uses 3.0
         self.market_regime: str = "-"     # Phase 4: TRENDING / MARGINAL / CHOPPY / VOLATILE
+
+        # ── Change 4: Regime detector state ──────────────────────────────────
+        self.is_parabolic: bool = False          # BTC > 1.55× 200w EMA hysteresis flag
+        self.global_regime: str = "TRENDING"     # RANGING / TRENDING / PARABOLIC
+        self._weekly_btc_cache: List[Dict] = []  # cached weekly BTC candles
+        self._weekly_btc_cache_ts: float = 0.0   # unix ts of last weekly fetch
+
+        # ── Change 2: Pullback entry pending state ────────────────────────────
+        self.signal_pending: bool = False         # True = waiting for pullback entry
+        self.signal_direction: str = ""           # "LONG" or "SHORT"
+        self.candles_since_signal: int = 0        # candles elapsed since signal fired
+        self.pending_signal_score: float = 0.0    # original signal score (for logging)
+        self.pending_signal_side: str = ""
+        self.pending_strong_trend_override: bool = False  # extends pullback timeout to 6
+
+        # ── Change 7: Economic calendar cache ────────────────────────────────
+        self._calendar_cache: List[Dict] = []
+        self._calendar_cache_ts: float = 0.0     # unix ts of last calendar fetch
+
         self._last_trade_bad: bool = False
         self._last_holding_log_ts: float = 0.0   # throttle repeated holding logs
-        self._last_drawdown_log_ts: float = 0.0  # throttle repeated drawdown tier logs
-        self._last_dd_tier: int = 0              # 0=none 1=65% 2=40% 3=25% 4=stop
         self._last_mc_log_ts: float = 0.0        # throttle mid-candle noise logs
+        self._last_margin_email_ts: float = 0.0  # 24h cooldown for SKIP_LOW_MARGIN emails
+        # Session-end-with-open-trade: defer engine stop until trade closes naturally
+        self.waiting_for_trade_close: bool = False
+        self._delayed_stop_reason: Optional[str] = None
+        self._waiting_since_ts: float = 0.0
+        self._last_waiting_log_ts: float = 0.0
+        # Exchange ID for klines routing — read once at startup so the hot loop never hits DB
+        try:
+            _ex_row = get_exchange(self.email)
+            self._exchange_id: str = (_ex_row.get("exchange") or "bybit").lower() if _ex_row else "bybit"
+        except Exception:
+            self._exchange_id = "bybit"
         # Momentum scaling (pyramiding) — tracks scale-in state per active trade
         # Allowed modes: MINI_ASYM, NORMAL, AGGRESSIVE only
-        self._scaling_enabled: bool = mode in ("MINI_ASYM", "NORMAL", "AGGRESSIVE")
+        self._scaling_enabled: bool = ENABLE_T18 and mode in ("MINI_ASYM", "NORMAL", "AGGRESSIVE")
         self.session_start_equity: float = get_equity(email)
         # Peak must be the highest equity ever seen — read from user_state which survives
         # AI stop/restart (ai_runner_state is deleted on stop, user_state is permanent).
         # This prevents floor from drifting down when equity dips between sessions.
         _saved_peak = 0.0
+        _saved_sc = 0.0
         try:
             with db_conn() as conn:
                 _pcur = conn.cursor()
-                _pcur.execute("SELECT peak_equity FROM user_state WHERE email = %s", (email,))
+                _pcur.execute(
+                    "SELECT peak_equity, starting_capital FROM user_state WHERE email = %s",
+                    (email,),
+                )
                 _prow = _pcur.fetchone()
                 _saved_peak = float(_prow["peak_equity"] or 0) if _prow else 0.0
+                _saved_sc   = float(_prow["starting_capital"] or 0) if _prow else 0.0
         except Exception:
             _saved_peak = 0.0
-        self.peak_equity: float = max(get_equity(email), _saved_peak)
+        self.peak_equity: float   = max(get_equity(email), _saved_peak)
+        self.start_capital: float = _saved_sc  # first-ever balance — used for R1 hybrid floor
         self.consecutive_wins: int = 0    # reset strictness after 3 wins in a row
-        # Hard floor = 85% of peak equity — trails UP with new highs, never decreases.
-        self.floor_equity: float = self.peak_equity * 0.85
+        self._htf_block_start: Optional[float] = None   # timestamp when HTF blocking began
+        self._htf_timeout_12h_logged: bool = False   # log once at 12h, not every hour
+        self._htf_timeout_24h_logged: bool = False   # log once at 24h, not every hour
+        self._last_dd_tier: int = 0                  # last logged drawdown tier (0=none)
+        self._last_drawdown_log_ts: float = 0.0      # throttle drawdown reminder logs
+        self._last_perf_log_ts: float = 0.0          # throttle PERF logs to once/hour
+        # R1 Hybrid floor: flat 85% until 2× start capital, then tightens to 90% from peak.
+        self.floor_equity: float = _compute_floor(self.peak_equity, self.start_capital)
         # Persist the correct peak immediately so /balance endpoint shows the right floor
         # even before the first trade is recorded.
         update_peak_ath(email, self.peak_equity, self.peak_equity)
@@ -3409,7 +1367,7 @@ class AutoRunner:
             # ai_runner_state may have been saved with a lower value if equity had dipped.
             if row.get("peak_equity") and float(row["peak_equity"]) > 0:
                 self.peak_equity = max(self.peak_equity, float(row["peak_equity"]))
-                self.floor_equity = self.peak_equity * 0.85
+                self.floor_equity = _compute_floor(self.peak_equity, self.start_capital)
             if row.get("floor_equity") and float(row["floor_equity"]) > 0:
                 self.floor_equity = max(self.floor_equity, float(row["floor_equity"]))
             # ── Hard floor persistence fix ─────────────────────────────────────
@@ -3451,12 +1409,12 @@ class AutoRunner:
                     self.ai_session_id = int(sess_row["id"])
                     cur.execute(
                         "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
-                        "ORDER BY id DESC LIMIT 200",
+                        "ORDER BY id DESC LIMIT 500",
                         (self.email, self.ai_session_id),
                     )
                 else:
                     cur.execute(
-                        "SELECT t, msg FROM ai_logs WHERE email=%s ORDER BY id DESC LIMIT 200",
+                        "SELECT t, msg FROM ai_logs WHERE email=%s ORDER BY id DESC LIMIT 500",
                         (self.email,),
                     )
                 rows = cur.fetchall()
@@ -3604,8 +1562,28 @@ class AutoRunner:
         self.thread.start()
         # Mid-candle monitor runs in parallel — fires early trades on big price moves
         threading.Thread(target=self._run_mid_candle_monitor, daemon=True).start()
+        # Active trade watcher — polls live price every 60s when a trade is open,
+        # moves trail SL immediately when a new level is crossed (never on a timer).
+        threading.Thread(target=self._run_trade_watcher, daemon=True).start()
 
     def stop(self, reason="Stopped by user."):
+        if self.pending_trades and not self.waiting_for_trade_close:
+            # First stop call with an open trade — defer until it closes naturally
+            self.waiting_for_trade_close = True
+            self._delayed_stop_reason = reason
+            self._waiting_since_ts = time.time()
+            self._last_waiting_log_ts = 0.0
+            self.log(f"Stop requested ({reason}) — open trade detected. Deferring stop until trade closes.")
+            _tg_alert(
+                f"⏳ <b>AI stop deferred — open trade</b>\n"
+                f"{self.email} | {self.symbol}\n"
+                f"Reason: {reason}\n"
+                f"Engine will stop once the trade closes naturally."
+            )
+            return
+        if self.waiting_for_trade_close and self.pending_trades:
+            # Second stop call while already waiting — force-abandon the trade
+            self.log(f"Forced stop while waiting for trade close. Trade abandoned. ({reason})")
         self.log(reason)
         self._close_ai_session(reason)
         self.stop_event.set()
@@ -3622,18 +1600,40 @@ class AutoRunner:
             self.bad_trades_today = 0
             self.log("Daily counters reset (Dubai timezone).")
 
+            # Compute effective score threshold before/after for the log.
+            # Mirrors indicators.py: max(mode_base, coin_thresh) + style_add + strictness_add
+            _cp = get_coin_params(self.symbol)
+            _mode_base = {"ULTRA_SAFE": 0.75, "SAFE": 0.68, "NORMAL": 0.62,
+                          "MINI_ASYM": 0.63, "AGGRESSIVE": 0.58}.get(self.mode, 0.63)
+            _style_add = {"DAY_TRADE": 0.02, "SCALP": 0.02, "SWING": 0.0}.get(self.trade_style, 0.02)
+            _base_thresh = round(max(_mode_base, _cp["score_threshold"]) + _style_add, 3)
+            _old_strict  = self.adaptive_strictness
+            _thresh_was  = round(
+                _base_thresh + max(0.0, (_old_strict - 1) * 0.12), 3
+            ) if self.mode == "MINI_ASYM" and _old_strict > 1.0 else _base_thresh
+
             # Reset adaptive strictness at Dubai midnight so a bad day never
             # bleeds into the next. Step down gradually if very elevated.
             STEP_DOWN = {2.50: 1.50, 1.50: 1.25}
             if self.adaptive_strictness <= 1.25:
                 self.adaptive_strictness = 1.0
                 self.consecutive_wins = 0
-                self.log("Midnight reset — strictness cleared to 1.0x. Fresh start.")
+                self.log(
+                    f"Midnight reset — strictness {_old_strict:.2f}x → 1.0x. "
+                    f"Score threshold: was {_thresh_was:.2f} → now {_base_thresh:.2f}. "
+                    f"Vars cleared: bad_trades=0, trades_today=0, consecutive_wins=0. Fresh start."
+                )
             else:
                 self.adaptive_strictness = STEP_DOWN.get(
                     round(self.adaptive_strictness, 2), 1.25
                 )
-                self.log(f"Midnight reset — strictness stepped down to {self.adaptive_strictness:.2f}x")
+                _thresh_now = round(
+                    _base_thresh + max(0.0, (self.adaptive_strictness - 1) * 0.12), 3
+                ) if self.mode == "MINI_ASYM" else _base_thresh
+                self.log(
+                    f"Midnight reset — strictness {_old_strict:.2f}x → {self.adaptive_strictness:.2f}x (stepped down). "
+                    f"Score threshold: was {_thresh_was:.2f} → now {_thresh_now:.2f}."
+                )
             self.strictness_day_key = dubai_day_key()
             # Persist immediately so a server restart won't revert the reset
             _save_runner_state(self)
@@ -3667,9 +1667,13 @@ class AutoRunner:
         )
 
     def _fetch_price_sync(self, symbol: str) -> float:
-        """Sync OKX price fetch for use inside runner thread. 1 retry on transient errors."""
-        inst = to_okx_inst(symbol)
-        last_err: Exception = RuntimeError("price fetch failed")
+        """Sync price fetch for use inside runner thread.
+        Tries OKX → MEXC → BinanceUS. On OKX 429, skips straight to MEXC."""
+        inst   = to_okx_inst(symbol)
+        sym_up = symbol.upper()
+        errors: list = []
+
+        # ── OKX ──────────────────────────────────────────────────────────────
         for _attempt in range(2):
             try:
                 r = httpx.get(
@@ -3678,17 +1682,53 @@ class AutoRunner:
                     timeout=8,
                     headers={"accept": "application/json"},
                 )
+                if r.status_code == 429:
+                    errors.append(f"OKX: 429 rate-limit")
+                    break                      # skip retry — go straight to fallbacks
                 if r.status_code != 200:
                     raise RuntimeError(f"OKX HTTP {r.status_code} for {inst}")
                 arr = (r.json() or {}).get("data") or []
                 if not arr:
-                    raise RuntimeError(f"No price data for {symbol}")
+                    raise RuntimeError(f"OKX: no price data for {symbol}")
                 return float(arr[0]["last"])
             except Exception as _pe:
-                last_err = _pe
+                errors.append(f"OKX: {_pe}")
                 if _attempt == 0:
                     time.sleep(2)
-        raise RuntimeError(f"Price fetch failed after 2 attempts: {last_err}")
+
+        # ── MEXC fallback ─────────────────────────────────────────────────────
+        try:
+            r = httpx.get(
+                "https://api.mexc.com/api/v3/ticker/price",
+                params={"symbol": sym_up},
+                timeout=8,
+                headers={"accept": "application/json"},
+            )
+            if r.status_code == 200:
+                price = r.json().get("price")
+                if price is not None:
+                    return float(price)
+            errors.append(f"MEXC: HTTP {r.status_code}")
+        except Exception as _me:
+            errors.append(f"MEXC: {_me}")
+
+        # ── BinanceUS fallback ────────────────────────────────────────────────
+        try:
+            r = httpx.get(
+                "https://api.binance.us/api/v3/ticker/price",
+                params={"symbol": sym_up},
+                timeout=8,
+                headers={"accept": "application/json"},
+            )
+            if r.status_code == 200:
+                price = r.json().get("price")
+                if price is not None:
+                    return float(price)
+            errors.append(f"BinanceUS: HTTP {r.status_code}")
+        except Exception as _be:
+            errors.append(f"BinanceUS: {_be}")
+
+        raise RuntimeError(f"Price fetch failed (all sources): {' | '.join(errors)}")
 
     def _close_one_trade(self, pt: Dict, exit_price: float, equity_before: float,
                          candle_high: float = 0.0, candle_low: float = 0.0) -> float:
@@ -3803,7 +1843,7 @@ class AutoRunner:
         # At -15% from peak: full stop. Hard floor (85% of session start) is a second wall.
         if equity_before > self.peak_equity:
             self.peak_equity = equity_before
-            self.floor_equity = round(self.peak_equity * 0.85, 2)  # trail floor up with every new high
+            self.floor_equity = _compute_floor(self.peak_equity, self.start_capital)  # trail floor up with every new high
             # Persist immediately — called on every candle evaluation (holding or closing)
             # so the DB always has the latest peak/floor even between trade closes.
             # This ensures the balance endpoint shows the correct floor when runner is stopped.
@@ -3814,7 +1854,7 @@ class AutoRunner:
         # Determine which drawdown tier we are in (0 = no drawdown).
         # Used for throttled logging — only log when tier changes or every 30 min.
         _dd_now = time.time()
-        _dd_log_interval = 1800  # 30 minutes between repeated drawdown reminders
+        _dd_log_interval = 7200  # 2 hours between repeated drawdown reminders
 
         if drawdown_pct >= 0.15:
             # -15%+ from peak: stop trading, protect what's left — always log this
@@ -3860,6 +1900,7 @@ class AutoRunner:
         # ── Intrabar SL/TP detection ──────────────────────────────────────
         # Use candle high/low to check if SL or TP was touched DURING the
         # interval, not just at close. This is more realistic for paper trading.
+        sl_pct_orig = sl_pct   # save before trail stop may overwrite it (used in display)
         sl_price = entry * (1 - sl_pct) if side == "LONG" else entry * (1 + sl_pct)
         tp_price = entry * (1 + tp_pct) if side == "LONG" else entry * (1 - tp_pct)
 
@@ -3881,6 +1922,42 @@ class AutoRunner:
             (side == "LONG"  and candle_high >= tp_price) or
             (side == "SHORT" and candle_low  <= tp_price)
         )
+
+        # ── Beyond-TP trail: regime-aware activation ─────────────────────
+        # TRENDING/PARABOLIC: trail fires at 1× TP (2× ATR) — normal behavior.
+        # RANGING/CHOPPY: trail fires at 1.5× TP (3× ATR) — delay in chop.
+        _cur_regime      = getattr(self, 'market_regime', 'TRENDING')
+        _choppy_delay    = _cur_regime in ("RANGING", "CHOPPY")
+        _trail_act_pct   = tp_pct * 1.5 if _choppy_delay else tp_pct
+        _trail_act_price = (entry * (1.0 + _trail_act_pct) if side == "LONG"
+                            else entry * (1.0 - _trail_act_pct))
+        _trail_act_hit   = candle_high > 0 and (
+            (side == "LONG"  and candle_high >= _trail_act_price) or
+            (side == "SHORT" and candle_low  <= _trail_act_price)
+        )
+        if intrabar_tp:
+            if _trail_act_hit or pt.get("tp_trail_active"):
+                if not pt.get("tp_trail_active"):
+                    pt["tp_trail_active"] = True
+                    pt["tp_trail_floor"]  = _trail_act_price
+                    _p0 = (candle_high if side == "LONG"
+                           else candle_low if candle_high > 0 else _trail_act_price)
+                    pt["tp_trail_peak"] = _p0
+                    _trail_dist_label = "1.5×ATR" if pt.get("adx_at_open", 0) >= 35 else "1.0×ATR"
+                    _chp_label = " (1.5×TP — choppy delay)" if _choppy_delay else ""
+                    self.log(
+                        f"BEYOND-TP TRAIL: {side} @ {entry:.4f} exceeded TP "
+                        f"({_trail_act_price:.4f}){_chp_label}. Trailing instead of closing. "
+                        f"ADX={pt.get('adx_at_open', 0):.1f} → trail={_trail_dist_label}"
+                    )
+                    _tg_alert(
+                        f"🚀 <b>Beyond-TP Trail activated</b>\n"
+                        f"{self.email} | {self.symbol} {side}\n"
+                        f"TP exceeded → now trailing ({_trail_dist_label}){_chp_label}\n"
+                        f"Entry <b>{entry:.4f}</b> | TP was <b>{_trail_act_price:.4f}</b>"
+                    )
+                intrabar_tp = False  # suppress TP close — trail instead
+            # else: choppy regime + below 1.5× TP threshold → normal TP close at 1× TP
 
         # ── Progressive trailing stop ─────────────────────────────────────
         # Simulates a real trailing stop using intrabar high/low:
@@ -3909,14 +1986,15 @@ class AutoRunner:
         _t2_waiting = pt.get("breakeven_after_t1") and not pt.get("breakeven") and not pt.get("breakeven_next")
 
         if candle_high > 0 and not intrabar_tp and not _t2_waiting:
-            if best_move >= tp_pct * 0.70:
-                # Deep in profit — trail SL to lock in half the SL distance as profit
-                trail_locked_pct  = sl_pct * 0.50
-                trailing_activated = True
-            elif best_move >= tp_pct * 0.40:
-                # At break-even trigger — SL moves to entry
-                trail_locked_pct  = 0.0
-                trailing_activated = True
+            for _tl_tp_frac, _tl_lock_frac, _tl_name in reversed(TRAIL_LEVELS):
+                if best_move >= tp_pct * _tl_tp_frac:
+                    # Breakeven level (lock_frac=0): require price moved ≥0.5×ATR
+                    # so micro-noise below the ATR floor never triggers a BE exit.
+                    if _tl_lock_frac == 0.0 and atr and best_move < atr * 0.50:
+                        continue
+                    trail_locked_pct  = best_move * _tl_lock_frac
+                    trailing_activated = True
+                    break
 
         # Ratchet: if a profit lock was established in a prior candle, keep it
         # even if the current candle didn't re-reach the trigger threshold.
@@ -3937,13 +2015,63 @@ class AutoRunner:
                 sl_price = entry * (1 - trail_locked_pct)
             sl_pct = trail_locked_pct  # effective SL distance from entry
 
+        # ── Beyond-TP trail stop check ────────────────────────────────────
+        # Runs each candle while tp_trail_active. Updates peak, checks if
+        # ATR-based trail stop was hit (1.0× ATR normal, 1.5× ADX ≥ 35).
+        _beyond_tp_triggered = False
+        if pt.get("tp_trail_active"):
+            _atr_val = float(atr) if atr else 0.0
+            if _atr_val > 0:
+                _adx_open   = float(pt.get("adx_at_open", 25.0))
+                _pat_ovr    = float(pt.get("pat_trail_mult", 0.0))
+                _trail_mult = _pat_ovr if _pat_ovr > 0.0 else (1.5 if _adx_open >= 35.0 else 1.0)
+                # Ratchet peak upward (LONG) or downward (SHORT)
+                if candle_high > 0:
+                    if side == "LONG":
+                        pt["tp_trail_peak"] = max(float(pt.get("tp_trail_peak", tp_price)), candle_high)
+                    else:
+                        pt["tp_trail_peak"] = min(float(pt.get("tp_trail_peak", tp_price)), candle_low)
+                _tp_peak = float(pt["tp_trail_peak"])
+                _tp_floor = float(pt.get("tp_trail_floor",
+                    entry * (1.0 + tp_pct) if side == "LONG" else entry * (1.0 - tp_pct)))
+                if side == "LONG":
+                    _beyond_sl = max(_tp_peak * (1.0 - _trail_mult * _atr_val),
+                                     _tp_floor)
+                    _hit = ((candle_high > 0 and candle_low <= _beyond_sl)
+                            or exit_price <= _beyond_sl)
+                    if _hit:
+                        final_move = max((_beyond_sl - entry) / entry, tp_pct)
+                else:
+                    _beyond_sl = min(_tp_peak * (1.0 + _trail_mult * _atr_val),
+                                     _tp_floor)
+                    _hit = ((candle_high > 0 and candle_high >= _beyond_sl)
+                            or exit_price >= _beyond_sl)
+                    if _hit:
+                        final_move = max((entry - _beyond_sl) / entry, tp_pct)
+                if _hit:
+                    outcome = "TRAIL_STOP"
+                    _beyond_tp_triggered = True
+                    _bonus_pct = (final_move - tp_pct) * 100
+                    self.log(
+                        f"BEYOND-TP TRAIL STOP: {side} @ {entry:.4f} | "
+                        f"peak {_tp_peak:.4f} | trail_SL {_beyond_sl:.4f} | "
+                        f"profit +{final_move*100:.2f}% (vs fixed TP +{tp_pct*100:.2f}%)"
+                    )
+                    _tg_alert(
+                        f"🎯 <b>Beyond-TP Trail closed</b>\n"
+                        f"{self.email} | {self.symbol} {side}\n"
+                        f"Profit <b>+{final_move*100:.2f}%</b> price move\n"
+                        f"Fixed TP was +{tp_pct*100:.2f}% → extra <b>+{_bonus_pct:.2f}%</b> captured\n"
+                        f"Peak {_tp_peak:.4f} | Trail stop {_beyond_sl:.4f}"
+                    )
+
         # SL and TP both touched in same candle → TP wins if trailing activated
         # (trade moved to profit first), otherwise SL wins (worst case)
-        if intrabar_sl and intrabar_tp:
+        if not _beyond_tp_triggered and intrabar_sl and intrabar_tp:
             intrabar_tp = trailing_activated  # trailing means TP is more likely
             intrabar_sl = not trailing_activated
 
-        if intrabar_sl:
+        if not _beyond_tp_triggered and intrabar_sl:
             if trailing_activated:
                 # Trailing SL hit — price went up past the lock-in level then pulled back.
                 # Exit at the locked-in profit level, NOT at a loss.
@@ -3952,10 +2080,10 @@ class AutoRunner:
             else:
                 final_move = -sl_pct
                 outcome = "SL_HIT"
-        elif intrabar_tp:
+        elif not _beyond_tp_triggered and intrabar_tp:
             final_move = tp_pct
             outcome = "TP_HIT"
-        else:
+        elif not _beyond_tp_triggered:
             # No intrabar trigger — use actual close price
             raw_move = (exit_price - entry) / entry if side == "LONG" else (entry - exit_price) / entry
             if trailing_activated and raw_move < trail_locked_pct:
@@ -3965,7 +2093,7 @@ class AutoRunner:
             elif raw_move <= -sl_pct:
                 final_move = -sl_pct
                 outcome = "SL_HIT"
-            elif raw_move >= tp_pct:
+            elif raw_move >= tp_pct and not pt.get("tp_trail_active"):
                 final_move = tp_pct
                 outcome = "TP_HIT"
             else:
@@ -3980,18 +2108,58 @@ class AutoRunner:
                 _now = time.time()
                 if _now - self._last_holding_log_ts >= self.interval_sec:
                     self._last_holding_log_ts = _now
+                    _trail_log = ""
+                    if trailing_activated:
+                        _ex_sl_stored = float(pt.get("trail_sl_on_exchange", 0.0))
+                        if REAL_TRADING and _ex_sl_stored > 0:
+                            _match = abs(_ex_sl_stored - sl_price) <= 0.0002
+                            _trail_log = (
+                                f" | trail_SL={sl_price:.4f} "
+                                f"exchange_SL={_ex_sl_stored:.4f} "
+                                f"{'✅' if _match else '⚠️ MISMATCH'}"
+                            )
+                        else:
+                            _trail_log = f" | trail_SL={sl_price:.4f}"
                     self.log(
                         f"Holding ({side} @ {entry:.4f}) — candle {candles_held_so_far + 1} | "
                         f"close {exit_price:.4f} ({((exit_price - entry)/entry if side=='LONG' else (entry - exit_price)/entry)*100:+.3f}%) | "
-                        f"SL={sl_price:.4f}  TP={tp_price:.4f}"
+                        f"SL={sl_price:.4f}  TP={tp_price:.4f}{_trail_log}"
                     )
 
-                # ── Momentum Scaling (Pyramiding) — paper/demo only ───────────────────
-                # Scale into winning Grade A positions in two stages.
-                # Guards: must be in profit, drawdown < 7%, strictness ≤ 1.10.
-                # Not applied to Grade B (T1/T2 already multi-entry) or real trading.
-                if (not REAL_TRADING
-                        and pt.get("scaling_enabled")
+                # ── E1: Stall exit — force-close if stuck near entry for 20+ candles ──
+                # Prevents dead capital sitting in a trade going nowhere.
+                # 20 candles = 20h (DAY_TRADE), 5h (SCALP), 80h (SWING).
+                _e1_pnl = ((exit_price - entry) / entry if side == "LONG"
+                           else (entry - exit_price) / entry)
+                if candles_held_so_far >= 20 and abs(_e1_pnl) < 0.005:
+                    self.log(
+                        f"E1 STALL EXIT: {side} @ {entry:.4f} | "
+                        f"{candles_held_so_far} candles held, {_e1_pnl*100:+.3f}% progress — "
+                        f"force-closing at market."
+                    )
+                    outcome = "E1_STALL"
+                    final_move = _e1_pnl
+
+                # ── E2: Score-scaled time exit — max hold time by signal strength ──
+                # Weak signals get a shorter leash; strong signals get more time.
+                # Only fires if E1 hasn't already triggered.
+                if outcome != "E1_STALL" and ENABLE_E2:
+                    _e2_score = float(pt.get("score_open", 0.65))
+                    _e2_max = 30 if _e2_score >= 0.80 else (22 if _e2_score >= 0.70 else 15)
+                    if candles_held_so_far >= _e2_max:
+                        self.log(
+                            f"E2 TIME EXIT: {side} @ {entry:.4f} | "
+                            f"score={_e2_score:.2f} max={_e2_max}c held={candles_held_so_far}c "
+                            f"pnl={_e1_pnl*100:+.3f}% — time budget exhausted."
+                        )
+                        outcome = "E2_TIME"
+                        final_move = _e1_pnl
+
+                # ── Momentum Scaling (Pyramiding) — Grade A only, both paper and real ──
+                # Scale into winning positions in two stages.
+                # Guards: in profit, drawdown < 7%, strictness ≤ 1.10.
+                # Grade B excluded (T1/T2 already multi-entry).
+                if (pt.get("scaling_enabled")
                         and best_move > 0
                         and not pt.get("breakeven_after_t1")
                         and drawdown_pct < 0.07
@@ -4000,7 +2168,14 @@ class AutoRunner:
                     if _atr_now > 0 and not pt.get("scale1_done") and best_move >= 1.5 * _atr_now:
                         pt["scale1_done"] = True
                         pt["size_mult"] = round(float(pt.get("size_mult", 0.70)) + 0.20, 4)
-                        pt["breakeven"] = True   # SL → entry (breakeven)
+                        pt["breakeven"] = True
+                        if REAL_TRADING:
+                            _si_usdt = pt.get("usdt_size_base", 0) * 0.20
+                            _si_lev  = pt.get("leverage_used", 6)
+                            if _si_usdt > 0:
+                                _si_ok = _place_real_scalein(self, self.symbol, side, _si_usdt, _si_lev)
+                                if _si_ok:
+                                    _move_real_sl_to_breakeven(self.email, self.symbol, entry)  # Grade A: no T2
                         self.log(
                             f"SCALE IN 1: +20% added at +{best_move*100:.2f}% "
                             f"(threshold 1.5×ATR={1.5*_atr_now*100:.2f}%). "
@@ -4010,14 +2185,80 @@ class AutoRunner:
                         pt["scale2_done"] = True
                         pt["size_mult"] = round(float(pt.get("size_mult", 0.90)) + 0.10, 4)
                         pt["breakeven"] = False
-                        pt["trail_locked_pct"] = round(1.5 * _atr_now, 6)  # lock +1.5× ATR profit
+                        pt["trail_locked_pct"] = round(1.5 * _atr_now, 6)
+                        if REAL_TRADING:
+                            _si2_usdt = pt.get("usdt_size_base", 0) * 0.10
+                            _si2_lev  = pt.get("leverage_used", 6)
+                            _sl2_price = (entry * (1 - 1.5 * _atr_now) if side == "LONG"
+                                          else entry * (1 + 1.5 * _atr_now))
+                            if _si2_usdt > 0:
+                                _si2_ok = _place_real_scalein(self, self.symbol, side, _si2_usdt, _si2_lev)
+                                if _si2_ok:
+                                    try:
+                                        _ex_row = get_exchange(self.email)
+                                        if _ex_row:
+                                            _ex2 = _make_ccxt_exchange(_ex_row)
+                                            _set_position_sl(_ex2, _ex_row.get("exchange","bybit"), self.symbol, side, _sl2_price)
+                                    except Exception:
+                                        pass
                         self.log(
                             f"SCALE IN 2: +10% added at +{best_move*100:.2f}% "
                             f"(threshold 3.0×ATR={3.0*_atr_now*100:.2f}%). "
                             f"SL locked at +{1.5*_atr_now*100:.2f}%. Total size {pt['size_mult']*100:.0f}% of mode."
                         )
 
-                return None
+                # ── Push trail SL to real exchange when level changes ─────────────
+                # Paper sim updates sl_price; this pushes the same price to Bybit/OKX/Binance
+                # so the exchange actually protects locked profit, not just the paper sim.
+                # Grade A: always update. Grade B T2: update after breakeven is set.
+                # Grade B T1: skip — T1 carries its own TP order; moving the position SL
+                # risks interfering with the independent T2 stop management.
+                if REAL_TRADING and trailing_activated:
+                    _tr_grade = pt.get("grade", "A")
+                    _tr_is_t2 = (pt.get("label") == "T2")
+                    _tr_eligible = (_tr_grade == "A") or (_tr_is_t2 and pt.get("breakeven"))
+                    if _tr_eligible:
+                        _prev_ex_sl = float(pt.get("trail_sl_on_exchange", 0.0))
+                        _sl_moved = (
+                            (side == "LONG"  and sl_price > _prev_ex_sl + 0.0002) or
+                            (side == "SHORT" and (_prev_ex_sl == 0.0 or sl_price < _prev_ex_sl - 0.0002))
+                        )
+                        if _sl_moved:
+                            _tr_label = (
+                                f"breakeven ({sl_price:.4f})"
+                                if trail_locked_pct == 0.0
+                                else f"lock +{trail_locked_pct*100:.2f}% ({sl_price:.4f})"
+                            )
+                            _tr_pushed = False
+                            for _tr_attempt in range(2):
+                                try:
+                                    _tr_row = get_exchange(self.email)
+                                    if _tr_row:
+                                        _tr_ex = _make_ccxt_exchange(_tr_row)
+                                        _tr_ex_id = (_tr_row.get("exchange") or "bybit").lower()
+                                        _set_position_sl(_tr_ex, _tr_ex_id, self.symbol, side, sl_price)
+                                        pt["trail_sl_on_exchange"] = sl_price
+                                        _tr_pushed = True
+                                        if _tr_attempt == 0:
+                                            self.log(f"TRAIL REAL: SL → {_tr_label} | {self.symbol} {side}")
+                                        else:
+                                            self.log(f"TRAIL RETRY OK: SL → {_tr_label}")
+                                        _tg_alert(
+                                            f"🔒 <b>Trailing stop moved</b>\n"
+                                            f"{self.email} | {self.symbol} {side}\n"
+                                            f"Real SL → <b>{_tr_label}</b>\n"
+                                            f"Best move so far: +{best_move*100:.2f}%"
+                                        )
+                                        break
+                                except Exception as _tr_err:
+                                    if _tr_attempt == 0:
+                                        self.log(f"TRAIL ERROR: SL update failed — {_tr_err}. Retrying...")
+                                    else:
+                                        self.log(f"TRAIL ERROR: Retry also failed — {_tr_err}. Manual check needed for {self.symbol}.")
+
+                if outcome not in ("E1_STALL", "E2_TIME"):
+                    return None
+                # E1_STALL / E2_TIME falls through to close at current price
 
         # Use the actual SL/TP price for display and DB when those levels were hit,
         # not the raw candle close — otherwise exit price and PnL are inconsistent.
@@ -4026,7 +2267,7 @@ class AutoRunner:
         elif outcome == "TP_HIT":
             actual_exit = entry * (1 + tp_pct) if side == "LONG" else entry * (1 - tp_pct)
         elif outcome == "TRAIL_STOP":
-            actual_exit = entry * (1 + trail_locked_pct) if side == "LONG" else entry * (1 - trail_locked_pct)
+            actual_exit = entry * (1 + final_move) if side == "LONG" else entry * (1 - final_move)
         else:
             actual_exit = exit_price
 
@@ -4057,7 +2298,6 @@ class AutoRunner:
         )
         grade_label = pt.get("grade", "A")
         style_label = self.trade_style.replace("_", " ").title()
-        tp_display = tp_pct * 100 / tp_mult   # show full ATR TP in display
         reason_text = "\n".join([
             f"{mode}  •  AI Trade  •  {style_label} ({self.tf})",
             f"Grade {grade_label}{' — ' + label if label else ''}",
@@ -4069,11 +2309,13 @@ class AutoRunner:
             f"Fees+Slip    -${fee_cost:.2f}  ({ex_id})",
             "",
             "Position (ATR-based)",
-            f"  Size:        {effective_size * 100:.1f}% of equity  →  ${size_dollar:.2f}",
+            f"  Size:        {effective_size * 100:.1f}% of equity  →  ${size_dollar:.2f}"
+            + (f"  (total position: {effective_size / pt.get('size_mult', 1.0) * 100:.1f}% → ${size_dollar / pt.get('size_mult', 1.0):.2f})"
+               if pt.get("grade") == "B" and pt.get("size_mult", 1.0) < 1.0 else ""),
             f"  Leverage:    {c['leverage']:.0f}×",
-            f"  SL (1×ATR):  {sl_pct * 100:.3f}%   |   TP ({tp_mult:.1f}×ATR): {tp_pct * 100:.3f}%",
+            f"  SL (1×ATR):  {sl_pct_orig * 100:.3f}%   |   TP ({tp_mult:.1f}×ATR): {tp_pct * 100:.3f}%",
             f"  ATR:         {atr * 100:.3f}%",
-            f"  Trailing:    {'activated — locked ' + f'{trail_locked_pct*100:.2f}%' if trailing_activated else 'not triggered'}",
+            f"  Trailing:    {('L3 (90%) — locked ' + f'{trail_locked_pct*100:.2f}%') if (trailing_activated and best_move >= tp_pct * 0.90) else ('L2 (70%) — locked ' + f'{trail_locked_pct*100:.2f}%') if (trailing_activated and trail_locked_pct > 0) else 'L1 (40%) — breakeven' if trailing_activated else 'not triggered'}",
             f"  Vol adj:     {vol_size_mult*100:.0f}%  |  DD adj: {dd_size_mult*100:.0f}%",
             "",
             "Account",
@@ -4188,9 +2430,10 @@ class AutoRunner:
                     # of base size — a $6 loss on a $5.60 T2 position shows -107% (impossible).
                     pnl_pct_leveraged = real_pnl / equity_before if equity_before > 0 else 0.0
                 _old_outcome = outcome
-                if real_pnl > 0 and outcome in ("SL_HIT", "TRAIL_STOP"):
+                _min_tp_value = (size_dollar * tp_pct * 0.5) if size_dollar > 0 else 0.50
+                if real_pnl >= _min_tp_value and outcome in ("SL_HIT", "TRAIL_STOP"):
                     outcome = "TP_HIT"
-                elif real_pnl < -(equity_before * 0.005) and outcome == "TP_HIT":
+                elif real_pnl < -(equity_before * 0.005) and outcome in ("TP_HIT", "TRAIL_STOP"):
                     outcome = "SL_HIT"
                 if outcome != _old_outcome:
                     self.log(
@@ -4336,6 +2579,34 @@ class AutoRunner:
             session_losses=_sess_losses, session_pnl=_sess_pnl,
         )
 
+        # ── Outcome log — analytics only, never blocks engine ────────────────
+        _open_ts   = pt.get("open_ts", 0.0)
+        _candles_open = int((time.time() - _open_ts) / self.interval_sec) if _open_ts and self.interval_sec > 0 else 0
+        _opened_at = datetime.utcfromtimestamp(_open_ts).strftime("%Y-%m-%dT%H:%M:%SZ") if _open_ts else ""
+        _closed_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        log_trade_outcome(
+            email=self.email, symbol=self.symbol, side=side, mode=mode,
+            trade_style=self.trade_style, grade=grade_label,
+            label=label or pt.get("label", ""),
+            signal=pt.get("signal", self.last_signal) or "-",
+            score=pt.get("score_open", self.last_score),
+            regime=pt.get("regime_open", self.market_regime),
+            outcome=outcome, entry_price=entry, exit_price=actual_exit,
+            sl_pct=sl_pct, tp_pct=tp_pct,
+            atr_pct=pt.get("atr_pct_open", self.last_atr_pct),
+            effective_size=effective_size, leverage=int(c["leverage"]),
+            pnl_pct=pnl_pct_leveraged, pnl_value=pnl_value,
+            equity_before=equity_before, equity_after=equity_after,
+            peak_equity=self.peak_equity,
+            t18_scale1=bool(pt.get("scale1_done")),
+            t18_scale2=bool(pt.get("scale2_done")),
+            trailing_used=trailing_activated,
+            vol_adj=vol_size_mult, dd_adj=dd_size_mult,
+            candles_open=_candles_open,
+            opened_at=_opened_at, closed_at=_closed_at,
+            consecutive_wins_before=self.consecutive_wins,
+        )
+
         return equity_after
 
     def _close_pending_trades(self) -> None:
@@ -4345,7 +2616,7 @@ class AutoRunner:
         if not self.pending_trades:
             return
         try:
-            klines = _fetch_klines_sync(self.symbol, self.tf, limit=10)
+            klines = _fetch_klines_sync(self.symbol, self.tf, limit=10, exchange=self._exchange_id)
             if klines:
                 last_candle = klines[-1]
                 candle_high = last_candle["high"]
@@ -4397,9 +2668,17 @@ class AutoRunner:
                         pt["breakeven_next"] = True
                         if REAL_TRADING and t1_entry_price:
                             try:
-                                ok = _move_real_sl_to_breakeven(self.email, self.symbol, t1_entry_price)
+                                ok, new_t2_sl_id = _move_real_sl_to_breakeven(
+                                    self.email, self.symbol, t1_entry_price,
+                                    t2_sl_id=pt.get("t2_sl_id"),
+                                    t2_qty=pt.get("t2_qty"),
+                                    side=pt.get("side"),
+                                )
                                 if ok:
                                     self.log(f"REAL T2 SL→BREAKEVEN @ {t1_entry_price:.4f}")
+                                    if new_t2_sl_id:
+                                        pt["t2_sl_id"] = new_t2_sl_id
+                                        _save_runner_state(self)
                                 else:
                                     self.log("REAL T2 SL breakeven move failed — T2 continues with original SL")
                             except Exception as _slm:
@@ -4412,36 +2691,222 @@ class AutoRunner:
             self.log(f"Error evaluating trade(s): {e}")
             # On error, leave pending_trades intact — retry next interval
 
+    def _get_weekly_btc_candles(self) -> List[Dict]:
+        """Return cached weekly BTC candles, refreshing every 6 hours."""
+        now_ts = time.time()
+        if not self._weekly_btc_cache or (now_ts - self._weekly_btc_cache_ts) > 21600:
+            candles = _fetch_btc_weekly_candles(limit=52)
+            if candles:
+                self._weekly_btc_cache    = candles
+                self._weekly_btc_cache_ts = now_ts
+        return self._weekly_btc_cache
+
+    def _is_high_impact_event_soon(self) -> tuple:
+        """Check ForexFactory calendar for high-impact events within ±2h.
+        Returns (blocked: bool, event_name: str). Cache refreshes every 6 hours."""
+        now_ts = time.time()
+        if (now_ts - self._calendar_cache_ts) > 21600:
+            data = _fetch_economic_calendar()
+            if data:
+                self._calendar_cache    = data
+                self._calendar_cache_ts = now_ts
+
+        if not self._calendar_cache:
+            return False, ""
+
+        from datetime import datetime, timezone as _tz, timedelta as _td2
+        now_utc     = datetime.now(_tz.utc)
+        win_before  = now_utc + _td2(minutes=120)
+        win_after   = now_utc - _td2(minutes=60)
+
+        _high_titles = {"CPI", "Fed", "FOMC", "GDP", "NFP", "Non-Farm",
+                        "Interest Rate", "Unemployment", "Payroll"}
+
+        for event in self._calendar_cache:
+            if str(event.get("impact", "")).upper() not in ("HIGH", "3"):
+                continue
+            try:
+                ev_dt = datetime.fromisoformat(
+                    str(event.get("date", "")).replace("Z", "+00:00")
+                )
+                if ev_dt.tzinfo is None:
+                    ev_dt = ev_dt.replace(tzinfo=_tz.utc)
+            except Exception:
+                continue
+            if win_after <= ev_dt <= win_before:
+                name = event.get("title") or event.get("name") or "High-impact event"
+                if any(t in name for t in _high_titles):
+                    return True, name
+        return False, ""
+
     def _signal_and_filters(self):
-        klines = _fetch_klines_sync(self.symbol, self.tf, limit=260)
+        klines = _fetch_klines_sync(self.symbol, self.tf, limit=260, exchange=self._exchange_id)
         higher_tf = HIGHER_TF_MAP.get(self.tf, "4h")
         higher_klines: List[Dict] = []
         if higher_tf != self.tf:
             try:
-                higher_klines = _fetch_klines_sync(self.symbol, higher_tf, limit=100)
+                higher_klines = _fetch_klines_sync(self.symbol, higher_tf, limit=100, exchange=self._exchange_id)
             except Exception:
                 higher_klines = []
         # 15m confirmation layer — DAY_TRADE and SWING only (SCALP IS 15m already)
         mtf_klines: List[Dict] = []
         if self.trade_style in ("DAY_TRADE", "SWING") and self.tf != "15m":
             try:
-                mtf_klines = _fetch_klines_sync(self.symbol, "15m", limit=50)
+                mtf_klines = _fetch_klines_sync(self.symbol, "15m", limit=50, exchange=self._exchange_id)
             except Exception:
                 mtf_klines = []
-        res = _compute_signal_layers(klines, self.mode, self.adaptive_strictness, higher_klines, self.trade_style, mtf_klines)
+
+        # Daily bias — 30 daily candles for EMA21 slope + price position check.
+        # Adds ±0.05 to direction score: agrees with daily trend = +0.05, opposes = -0.05.
+        # Blocks weak counter-trend entries (e.g. LONG when daily is bearish).
+        daily_klines: List[Dict] = []
+        try:
+            daily_klines = _fetch_klines_sync(self.symbol, "1d", limit=35, exchange=self._exchange_id)
+        except Exception:
+            daily_klines = []
+
+        # ── Change 4: Global market regime ───────────────────────────────────
+        _weekly_btc = self._get_weekly_btc_candles()
+        _cur_adx: Optional[float] = None
+        if klines and len(klines) >= 15:
+            from indicators import _adx as _adx_fn
+            _closes = [k["close"] for k in klines]
+            _highs  = [k["high"]  for k in klines]
+            _lows   = [k["low"]   for k in klines]
+            _cur_adx = _adx_fn(_highs, _lows, _closes, 14)
+        self.last_adx = _cur_adx or 0.0
+        self.global_regime, self.is_parabolic = get_market_regime(
+            _weekly_btc, _cur_adx or 0.0, self.is_parabolic
+        )
+
+        # RANGING = no trades at all
+        if self.global_regime == "RANGING":
+            return {
+                "ok": False,
+                "blocked": "REGIME_RANGING: ADX too low — market ranging, no trades",
+                "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+                "side": None, "market_regime": "RANGING",
+            }
+
+        # ── Change 7: Economic calendar block ────────────────────────────────
+        _cal_blocked, _cal_event = self._is_high_impact_event_soon()
+        if _cal_blocked:
+            return {
+                "ok": False,
+                "blocked": f"CALENDAR: High-impact event within 2h — {_cal_event}",
+                "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+                "side": None, "market_regime": self.global_regime,
+            }
+
+        # ── Change 5: Mode/style regime guard ────────────────────────────────
+        _mode_cfg  = get_mode_config(self.mode)
+        _style_cfg = get_style_config(self.trade_style)
+        if self.global_regime not in _mode_cfg["allowed_regimes"]:
+            return {
+                "ok": False,
+                "blocked": f"MODE_REGIME: {self.global_regime} not allowed for {self.mode}",
+                "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+                "side": None, "market_regime": self.global_regime,
+            }
+
+        # ── Change 5: SWING weekly trend filter ──────────────────────────────
+        _weekly_trend: Optional[str] = None
+        _allowed_sides: Optional[List[str]] = None
+        if _style_cfg.get("swing_weekly_filter") and _weekly_btc:
+            _weekly_trend = check_weekly_trend(_weekly_btc)
+            if _weekly_trend == "TRANSITIONING":
+                return {
+                    "ok": False,
+                    "blocked": "SWING_WEEKLY: Weekly trend transitioning — swing entry blocked",
+                    "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+                    "side": None, "market_regime": self.global_regime,
+                }
+            _allowed_sides = (
+                ["LONG"]  if _weekly_trend == "BULLISH"
+                else ["SHORT"] if _weekly_trend == "BEARISH"
+                else None
+            )
+
+        # ── PARABOLIC overrides: loosen score, widen TP, LONG only ───────────
+        _param_overrides = {}
+        if self.global_regime == "PARABOLIC":
+            _cp = get_coin_params(self.symbol)
+            _param_overrides = {
+                "min_score": max(0.35, _cp["score_threshold"] - 0.05),
+            }
+            _allowed_sides = ["LONG"]   # parabolic = bull mania, long only
+
+        # HTF timeout: inject htf_score_floor after 12h/24h of consecutive HTF blocking
+        if self._htf_block_start is not None:
+            _htf_hrs = (time.time() - self._htf_block_start) / 3600
+            if _htf_hrs >= 24:
+                _param_overrides = {**(_param_overrides or {}), "htf_score_floor": 0.60}
+            elif _htf_hrs >= 12:
+                _param_overrides = {**(_param_overrides or {}), "htf_score_floor": 0.35}
+
+        res = _compute_signal_layers(
+            klines, self.mode, self.adaptive_strictness,
+            higher_klines, self.trade_style, mtf_klines,
+            param_overrides=_param_overrides if _param_overrides else None,
+            symbol=self.symbol,
+            daily_klines=daily_klines or None,
+            enable_mr_4h_gate=ENABLE_MR_4H_GATE,
+            enable_regime_gate=ENABLE_REGIME_GATE,
+            enable_step2_score=ENABLE_STEP2_SCORE,
+        )
+
+        # Enforce side restriction from weekly filter or parabolic regime
+        if _allowed_sides and res.get("ok") and res.get("side") not in _allowed_sides:
+            return {
+                "ok": False,
+                "blocked": (
+                    f"PARABOLIC_LONG_ONLY: SHORT blocked in parabolic regime"
+                    if self.global_regime == "PARABOLIC"
+                    else f"SWING_WEEKLY_{_weekly_trend}: only {_allowed_sides[0]} allowed"
+                ),
+                "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+                "side": res.get("side"), "market_regime": self.global_regime,
+            }
+
+        # ── Hour-of-day volume confirmation (with high-score bypass) ──────────
+        if res.get("ok") and klines:
+            _signal_score = res.get("score", 0.0)
+            _cp = get_coin_params(self.symbol)
+            if _signal_score >= 0.68:
+                # 6-7 filters already confirmed — volume check is redundant at this level
+                self.log(
+                    f"[VOLUME BYPASS] Score {_signal_score:.2f} exceeds 0.68 override "
+                    f"threshold. Volume check skipped. Proceeding to entry."
+                )
+            else:
+                _vol_ok, _vol_curr, _vol_req = check_volume_hour_confirmed(klines, _cp)
+                if not _vol_ok:
+                    return {
+                        "ok": False,
+                        "blocked": (
+                            f"VOLUME_HOUR: {_vol_curr:.0f} < required {_vol_req:.0f} "
+                            f"(hour-of-day avg × {_cp['volume_confirmation_mult']}×)"
+                        ),
+                        "signal": "BLOCKED", "score": _signal_score,
+                        "breakdown": res.get("breakdown", {}),
+                        "side": res.get("side"), "market_regime": self.global_regime,
+                    }
+
         self.last_breakdown = res.get("breakdown", {})
-        self.last_score = res.get("score", 0.0)
-        self.market_grade = res.get("grade", "-")
-        self.signal_type = res.get("signal_type", "NORMAL")
+        self.last_score     = res.get("score", 0.0)
+        self.market_grade   = res.get("grade", "-")
+        self.signal_type    = res.get("signal_type", "NORMAL")
         self.sl_atr_override = res.get("sl_atr_override")
         self.tp_atr_override = res.get("tp_atr_override")
-        if res.get("signal_type") == "REVERSAL" and res.get("reversal_log"):
+        if res.get("signal_type") in ("REVERSAL", "MEAN_REVERSION") and res.get("reversal_log"):
             self.log(res["reversal_log"])
         if res.get("market_regime"):
             self.market_regime = res["market_regime"]
         if res.get("atr_pct"):
             self.last_atr_pct = res["atr_pct"]
-        slope_pct = res.get("htf_bear_slope_pct")
+        # Attach regime info for the caller
+        res["global_regime"]  = self.global_regime
+        res["weekly_trend"]   = _weekly_trend
         return res
 
     def _secs_until_dubai_midnight(self) -> int:
@@ -4462,19 +2927,45 @@ class AutoRunner:
             secs -= chunk
         if not self.stop_event.is_set():
             # New day — apply strictness step-down (same logic as _reset_if_new_day)
+            _cp = get_coin_params(self.symbol)
+            _mode_base = {"ULTRA_SAFE": 0.75, "SAFE": 0.68, "NORMAL": 0.62,
+                          "MINI_ASYM": 0.63, "AGGRESSIVE": 0.58}.get(self.mode, 0.63)
+            _style_add = {"DAY_TRADE": 0.02, "SCALP": 0.02, "SWING": 0.0}.get(self.trade_style, 0.02)
+            _base_thresh = round(max(_mode_base, _cp["score_threshold"]) + _style_add, 3)
+            _old_strict  = self.adaptive_strictness
+            _thresh_was  = round(
+                _base_thresh + max(0.0, (_old_strict - 1) * 0.12), 3
+            ) if self.mode == "MINI_ASYM" and _old_strict > 1.0 else _base_thresh
             STEP_DOWN = {2.50: 1.50, 1.50: 1.25}
             if self.adaptive_strictness <= 1.25:
                 self.adaptive_strictness = 1.0
                 self.consecutive_wins = 0
-                self.log("Midnight reset (sleep path) — strictness cleared to 1.0x. Fresh start.")
+                self.log(
+                    f"Midnight reset (sleep path) — strictness {_old_strict:.2f}x → 1.0x. "
+                    f"Score threshold: was {_thresh_was:.2f} → now {_base_thresh:.2f}. "
+                    f"Vars cleared: bad_trades=0, trades_today=0, consecutive_wins=0. Fresh start."
+                )
             else:
                 self.adaptive_strictness = STEP_DOWN.get(
                     round(self.adaptive_strictness, 2), 1.25
                 )
-                self.log(f"Midnight reset (sleep path) — strictness stepped down to {self.adaptive_strictness:.2f}x")
+                _thresh_now = round(
+                    _base_thresh + max(0.0, (self.adaptive_strictness - 1) * 0.12), 3
+                ) if self.mode == "MINI_ASYM" else _base_thresh
+                self.log(
+                    f"Midnight reset (sleep path) — strictness {_old_strict:.2f}x → {self.adaptive_strictness:.2f}x (stepped down). "
+                    f"Score threshold: was {_thresh_was:.2f} → now {_thresh_now:.2f}."
+                )
             self.strictness_day_key = dubai_day_key()
-            # Reload counters from DB and resume
-            self.trades_today, self.bad_trades_today = self._load_today_stats()
+            # Reset counters unconditionally — we just slept through midnight so
+            # no new-day trades exist yet.  Do NOT call _load_today_stats() here:
+            # the sleep loop can exit a split-second before midnight flips, making
+            # now_dubai() still return the old day and counting yesterday's trades
+            # as today's.  That stale count then prevents _reset_if_new_day() from
+            # correcting it (keys match), so the daily limit fires on the first
+            # candle of the new day even though zero trades have been placed.
+            self.trades_today = 0
+            self.bad_trades_today = 0
             self.day_key = dubai_day_key()
             self._last_trade_bad = False
             self.last_trade_ts = time.time()
@@ -4519,7 +3010,7 @@ class AutoRunner:
 
                     if _daily_bad_ok and _daily_trade_ok and _cooldown_ok:
                         # ── Fetch current candle open and live price ───────────────
-                        klines = _fetch_klines_sync(self.symbol, self.tf, limit=3)
+                        klines = _fetch_klines_sync(self.symbol, self.tf, limit=3, exchange=self._exchange_id)
                         if klines:
                             candle_open  = float(klines[-1]["open"])
                             current_px   = self._fetch_price_sync(self.symbol)
@@ -4604,7 +3095,7 @@ class AutoRunner:
                                                     f"× vol={_vol_sm_mc:.2f} × dd={_dd_sm_mc:.2f} "
                                                     f"= {size_pct*100:.1f}% → ${usdt_size:.2f}"
                                                 )
-                                                if grade == "B":
+                                                if grade == "B" or ENABLE_GRADE_B_ALL:
                                                     real_b_result = place_real_grade_b_order(
                                                         email=self.email, symbol=self.symbol,
                                                         side=signal_side, usdt_size=usdt_size,
@@ -4642,7 +3133,8 @@ class AutoRunner:
                                             "tp_pct_open": tp_pct_open,
                                             "mid_candle":  True,
                                         }
-                                        if grade == "B" and REAL_TRADING:
+                                        if (grade == "B" or ENABLE_GRADE_B_ALL) and REAL_TRADING:
+                                            _mc_gb_lbl = "" if grade == "B" else f" [Option3 sig={grade}]"
                                             self.pending_trades = [
                                                 {**base_trade, "grade": "B", "size_mult": 0.60,
                                                  "tp_mult": 0.80, "is_primary": True, "label": "T1",
@@ -4653,7 +3145,8 @@ class AutoRunner:
                                                  "tp_mult": 1.00, "is_primary": False, "label": "T2",
                                                  "breakeven_after_t1": True, "t2_sl_id": None},
                                             ]
-                                        elif grade == "B":
+                                        elif grade == "B" or ENABLE_GRADE_B_ALL:
+                                            _mc_gb_lbl = "" if grade == "B" else f" [Option3 sig={grade}]"
                                             self.pending_trades = [
                                                 {**base_trade, "grade": "B", "size_mult": 0.60,
                                                  "tp_mult": 0.80, "is_primary": True, "label": "T1"},
@@ -4662,6 +3155,7 @@ class AutoRunner:
                                                  "breakeven_after_t1": True},
                                             ]
                                         else:
+                                            _mc_gb_lbl = ""
                                             self.pending_trades = [
                                                 {**base_trade, "grade": "A", "size_mult": 1.00,
                                                  "tp_mult": 1.00, "is_primary": True,
@@ -4677,12 +3171,12 @@ class AutoRunner:
                                         self.log(
                                             f"MID_CANDLE TRADE OPENED Grade {grade} ({signal_side}) "
                                             f"@ {entry_price:.4f} | score={score:.2f} | "
-                                            f"{abs_move*100:.1f}% price move triggered"
+                                            f"{abs_move*100:.1f}% price move triggered{_mc_gb_lbl}"
                                         )
 
                                         # Place SL — Grade B: two separate stops; Grade A: position SL
                                         if REAL_TRADING:
-                                            if grade == "B":
+                                            if grade == "B" or ENABLE_GRADE_B_ALL:
                                                 _mc_b_ex    = real_b_result["ex"]
                                                 _mc_b_ex_id = real_b_result["ex_id"]
                                                 _mc_b_sl    = real_b_result["sl_price"]
@@ -4737,6 +3231,177 @@ class AutoRunner:
                 if self.stop_event.is_set():
                     return
                 time.sleep(10)
+
+    def _run_trade_watcher(self) -> None:
+        """
+        Active trade watcher — runs for the lifetime of the runner alongside the
+        main loop and mid-candle monitor.
+
+        When a trade is open:
+          - Polls live price every 60 seconds (30s for SCALP).
+          - Tracks the best price seen since entry (ratchet — can only improve).
+          - On every poll, checks which TRAIL_LEVELS threshold has been reached.
+          - If a NEW higher level is crossed: immediately updates the trail SL,
+            pushes it to the real exchange, logs ONE clean line, and sends Telegram.
+          - Silent if no level changes — zero log noise on normal polls.
+
+        When no trade is open: sleeps and does nothing.
+        Stops cleanly when stop_event is set.
+        """
+        poll_sec = 30 if self.trade_style == "SCALP" else 60
+
+        while not self.stop_event.is_set():
+            # Sleep in 1-second chunks so stop_event wakes us up quickly
+            for _ in range(poll_sec):
+                if self.stop_event.is_set():
+                    return
+                time.sleep(1)
+
+            # Fetch live price BEFORE acquiring the lock — network call, can take 1-2 seconds.
+            # Check pending_trades first so we skip the fetch when no trade is open.
+            with self._pt_lock:
+                _has_trade = bool(self.pending_trades)
+            if not _has_trade:
+                continue
+
+            try:
+                current_price = self._fetch_price_sync(self.symbol)
+                if not current_price or current_price <= 0:
+                    continue
+            except Exception:
+                continue
+
+            # ── Phase 1: compute updates under lock (fast — no network calls) ──
+            # Collect all SL moves needed, then release the lock before doing any
+            # exchange or Telegram calls. Holding _pt_lock for exchange calls (up to
+            # 10 seconds) would block the main loop's candle processing.
+            _pending_notifications: list = []
+
+            with self._pt_lock:
+                for pt in self.pending_trades:
+                    # T2 holds its original SL until T1 hits TP — skip until breakeven is set
+                    _t2_waiting = (
+                        pt.get("breakeven_after_t1") and
+                        not pt.get("breakeven") and
+                        not pt.get("breakeven_next")
+                    )
+                    if _t2_waiting:
+                        continue
+
+                    entry  = float(pt.get("entry_price", 0.0))
+                    side   = pt.get("side", "LONG")
+                    tp_pct = float(pt.get("tp_pct_open", 0.02))
+                    if entry <= 0 or tp_pct <= 0:
+                        continue
+
+                    # Ratchet: best price seen since trade opened (only ever improves)
+                    prev_best = float(pt.get("watcher_best_price", entry))
+                    best_price = max(prev_best, current_price) if side == "LONG" else min(prev_best, current_price)
+                    pt["watcher_best_price"] = best_price
+
+                    # Best move as a fraction of entry price
+                    best_move = (
+                        (best_price - entry) / entry if side == "LONG"
+                        else (entry - best_price) / entry
+                    )
+                    if best_move <= 0:
+                        continue
+
+                    # Find the highest TRAIL_LEVELS threshold price has reached
+                    new_locked_pct = None
+                    new_level_name = None
+                    for _tp_frac, _lock_frac, _lname in reversed(TRAIL_LEVELS):
+                        if best_move >= tp_pct * _tp_frac:
+                            new_locked_pct = best_move * _lock_frac
+                            new_level_name = _lname
+                            break
+
+                    if new_locked_pct is None:
+                        continue  # No level reached yet
+
+                    # Ratchet: only move forward — never reduce locked profit
+                    prev_locked = float(pt.get("trail_locked_pct", -1.0))
+                    if new_locked_pct <= prev_locked:
+                        continue  # Same level, no improvement — nothing to do
+
+                    # Compute new SL price
+                    new_sl_price = (
+                        entry * (1.0 + new_locked_pct) if side == "LONG"
+                        else entry * (1.0 - new_locked_pct)
+                    )
+
+                    # Update trail state immediately inside the lock (fast dict writes)
+                    pt["trail_locked_pct"] = new_locked_pct
+                    pt["trail_best_move"]  = max(float(pt.get("trail_best_move", 0.0)), best_move)
+
+                    reach_pct  = int(best_move / tp_pct * 100) if tp_pct > 0 else 0
+                    lock_label = (
+                        "breakeven" if new_locked_pct == 0.0
+                        else f"+{new_locked_pct * 100:.2f}% profit locked"
+                    )
+
+                    # AI log fires inside the lock — self.log() just queues a string (fast)
+                    self.log(
+                        f"🔒 TRAIL {new_level_name} — {self.symbol} {side} | "
+                        f"price reached {reach_pct}% of TP | "
+                        f"SL → {new_sl_price:.4f} ({lock_label})"
+                    )
+
+                    # Queue exchange push + Telegram for after the lock is released
+                    _prev_ex_sl = float(pt.get("trail_sl_on_exchange", 0.0))
+                    _wt_grade   = pt.get("grade", "A")
+                    _wt_is_t2   = (pt.get("label") == "T2")
+                    _pending_notifications.append({
+                        "side":          side,
+                        "entry":         entry,
+                        "new_sl_price":  new_sl_price,
+                        "new_locked_pct": new_locked_pct,
+                        "new_level_name": new_level_name,
+                        "reach_pct":     reach_pct,
+                        "lock_label":    lock_label,
+                        "eligible":      (_wt_grade == "A") or (_wt_is_t2 and pt.get("breakeven")),
+                        "prev_ex_sl":    _prev_ex_sl,
+                        "open_ts":       pt.get("open_ts", 0.0),  # used to re-identify pt after lock
+                    })
+
+            # ── Phase 2: exchange push + Telegram — outside the lock ──────────
+            # Exchange API can take up to 10 seconds; Telegram ~1 second.
+            # Doing these outside _pt_lock means the main loop is never blocked.
+            for _n in _pending_notifications:
+                _side        = _n["side"]
+                _new_sl      = _n["new_sl_price"]
+                _lock_label  = _n["lock_label"]
+                _level_name  = _n["new_level_name"]
+                _reach_pct   = _n["reach_pct"]
+                _prev_ex_sl  = _n["prev_ex_sl"]
+
+                if REAL_TRADING and _n["eligible"]:
+                    _sl_moved = (
+                        (_side == "LONG"  and _new_sl > _prev_ex_sl + 0.0001) or
+                        (_side == "SHORT" and (_prev_ex_sl == 0.0 or _new_sl < _prev_ex_sl - 0.0001))
+                    )
+                    if _sl_moved:
+                        try:
+                            _wt_row = get_exchange(self.email)
+                            if _wt_row:
+                                _wt_ex    = _make_ccxt_exchange(_wt_row)
+                                _wt_ex_id = (_wt_row.get("exchange") or "bybit").lower()
+                                _set_position_sl(_wt_ex, _wt_ex_id, self.symbol, _side, _new_sl)
+                                # Re-acquire lock briefly to write the confirmed SL back to pt
+                                with self._pt_lock:
+                                    for _pt2 in self.pending_trades:
+                                        if _pt2.get("open_ts") == _n["open_ts"] and _pt2.get("side") == _side:
+                                            _pt2["trail_sl_on_exchange"] = _new_sl
+                                            break
+                        except Exception as _wt_err:
+                            self.log(f"⚠️ TRAIL WATCHER: exchange SL push failed — {_wt_err}")
+
+                _tg_alert(
+                    f"🔒 <b>Trail stop updated</b> [{_level_name}]\n"
+                    f"{self.symbol} {_side} | {self.email}\n"
+                    f"Price reached <b>{_reach_pct}%</b> of TP target\n"
+                    f"SL → <b>{_new_sl:.4f}</b> ({_lock_label})"
+                )
 
     def _reconcile_exchange_positions(self) -> None:
         """
@@ -4847,7 +3512,22 @@ class AutoRunner:
                 _save_runner_state(self)
 
         except Exception as e:
-            self.log(f"RECONCILE error (non-fatal): {e}")
+            _err_str = str(e)
+            if "EXCHANGE_AUTH_ERROR" in _err_str:
+                self.log(
+                    "⚠️ API KEY EXPIRED — Bybit rejected your API key. "
+                    "Check your email for steps to reconnect."
+                )
+                email_api_key_expired(self.email, self.symbol)
+                _tg_alert(
+                    f"🔑 <b>API Key Expired — AI Stopped</b>\n"
+                    f"{self.email} | {self.symbol}\n"
+                    f"Email sent to user. Engine stopped."
+                )
+                self.blocked_reason = "API_KEY_EXPIRED"
+                self.stop_event.set()
+            else:
+                self.log(f"RECONCILE error (non-fatal): {e}")
 
     def _run_loop(self):
         cooldown_sec = max(60, self.interval_sec)
@@ -4862,31 +3542,80 @@ class AutoRunner:
                         f"{self.email} | {self.symbol}\n"
                         f"<code>{str(_mrf_err)[:200]}</code>"
                     )
-                self.last_run_ts = time.time()
+                _tick_start = time.time()
+                self.last_run_ts = _tick_start
+
+                # Periodic 15-min log when deferring stop for an open trade
+                if self.waiting_for_trade_close and time.time() - self._last_waiting_log_ts >= 900:
+                    waited_min = (time.time() - self._waiting_since_ts) / 60
+                    self.log(f"⏳ Waiting for open trade to close before stopping ({waited_min:.1f} min elapsed). Reason: {self._delayed_stop_reason}")
+                    self._last_waiting_log_ts = time.time()
 
                 # FIX 3: Reconcile exchange positions every hour
                 if REAL_TRADING and (time.time() - _last_reconcile_ts) >= 3600:
                     self._reconcile_exchange_positions()
                     _last_reconcile_ts = time.time()
 
-                if self.end_at_ts and time.time() >= self.end_at_ts:
+                if self.end_at_ts and time.time() >= self.end_at_ts and not self.waiting_for_trade_close:
                     self.blocked_reason = "DURATION_ENDED"
                     if self.pending_trades:
-                        self._close_pending_trades()
-                    self.log("Session complete — duration ended. AI stopped.")
-                    self.stop_event.set()
-                    email_ai_stopped(self.email, self.symbol, "DURATION_END", get_equity(self.email))
-                    break
+                        self.waiting_for_trade_close = True
+                        self._delayed_stop_reason = "DURATION_END"
+                        self._waiting_since_ts = time.time()
+                        self._last_waiting_log_ts = 0.0
+                        self.log("Session duration ended — open trade detected. Waiting for trade to close before stopping.")
+                        _tg_alert(
+                            f"⏳ <b>Duration ended — waiting for trade</b>\n"
+                            f"{self.email} | {self.symbol}\n"
+                            f"AI has an open trade. Will stop once it closes naturally."
+                        )
+                    else:
+                        self.log("Session complete — duration ended. AI stopped.")
+                        self.stop_event.set()
+                        email_ai_stopped(self.email, self.symbol, "DURATION_END", get_equity(self.email))
+                        break
 
                 if not get_exchange(self.email):
                     self.blocked_reason = "EXCHANGE_NOT_CONNECTED"
                     self.last_signal = "BLOCKED: EXCHANGE_NOT_CONNECTED"
-                    self.log("Blocked: exchange not connected.")
-                    continue
+                    if self.pending_trades:
+                        _n = len(self.pending_trades)
+                        self.log(
+                            f"⚠️ Exchange disconnected — {_n} trade(s) still open on Bybit. "
+                            f"AI is paused. Reconnect your exchange to resume."
+                        )
+                        email_exchange_disconnected_open_trade(self.email, self.symbol, _n)
+                        _tg_alert(
+                            f"🔌 <b>Exchange Disconnected — Open Trade</b>\n"
+                            f"{self.email} | {self.symbol}\n"
+                            f"{_n} trade(s) open. Email sent to user. AI waiting for reconnection."
+                        )
+                        continue  # keep looping — auto-resumes when exchange reconnects
+                    else:
+                        self.log("⚠️ Exchange disconnected — AI stopping now.")
+                        _tg_alert(
+                            f"🔌 <b>Exchange Disconnected — AI Stopped</b>\n"
+                            f"{self.email} | {self.symbol}"
+                        )
+                        self.stop_event.set()
+                        break
 
                 # ── Step 1: Close any pending trades first (real exit after one interval) ──
                 if self.pending_trades:
                     self._close_pending_trades()
+                    if not self.pending_trades and self.waiting_for_trade_close:
+                        waited_min = (time.time() - self._waiting_since_ts) / 60
+                        stop_reason = self._delayed_stop_reason or "Session ended"
+                        self.log(f"Trade closed. Delayed stop executing now (waited {waited_min:.1f} min). Reason: {stop_reason}")
+                        _tg_alert(
+                            f"✅ <b>Delayed stop — trade closed</b>\n"
+                            f"{self.email} | {self.symbol}\n"
+                            f"Trade closed after {waited_min:.1f} min delay. AI stopping now.\n"
+                            f"Reason: {stop_reason}"
+                        )
+                        self.waiting_for_trade_close = False
+                        self.stop(stop_reason)
+                        break
                     continue
 
                 # ── Step 2a: Hard floor + max drawdown guard ─────────────────────────────
@@ -4927,6 +3656,15 @@ class AutoRunner:
                             f"{self.email} | {self.symbol}\n"
                             f"<code>{str(_hfl_db_err)[:200]}</code>"
                         )
+                    # Close open trade at market — hard floor is an emergency, no waiting
+                    if REAL_TRADING and self.pending_trades:
+                        try:
+                            _pt = self.pending_trades[0]
+                            close_real_order(self.email, self.symbol, _pt.get("side", "LONG"))
+                            self.log("HARD_FLOOR: emergency market close executed for open trade.")
+                        except Exception as _hf_ce:
+                            self.log(f"HARD_FLOOR: market close failed — {_hf_ce}. Trade may still be open on exchange.")
+                        self.pending_trades = []
                     break
 
                 if self.peak_equity > 0:
@@ -4947,10 +3685,22 @@ class AutoRunner:
                     self.last_signal = "BLOCKED: MAX_TRADES_DAY"
                     if self.duration_days > 0:
                         self._sleep_until_dubai_midnight()
-                    else:
-                        self.log(f"Max trades/day reached ({self.trades_today}/{self.max_trades_per_day}). Stopping.")
-                        self.stop_event.set()
-                        break
+                    elif not self.waiting_for_trade_close:
+                        if self.pending_trades:
+                            self.waiting_for_trade_close = True
+                            self._delayed_stop_reason = "MAX_TRADES_DAY"
+                            self._waiting_since_ts = time.time()
+                            self._last_waiting_log_ts = 0.0
+                            self.log(f"Max trades/day reached ({self.trades_today}/{self.max_trades_per_day}) — open trade detected. Waiting to close before stopping.")
+                            _tg_alert(
+                                f"⏳ <b>Max trades reached — waiting for trade</b>\n"
+                                f"{self.email} | {self.symbol}\n"
+                                f"Trades: {self.trades_today}/{self.max_trades_per_day}. Will stop once trade closes."
+                            )
+                        else:
+                            self.log(f"Max trades/day reached ({self.trades_today}/{self.max_trades_per_day}). Stopping.")
+                            self.stop_event.set()
+                            break
                     continue
 
                 if self.stop_after_bad_trades > 0 and self.bad_trades_today >= self.stop_after_bad_trades:
@@ -4958,11 +3708,23 @@ class AutoRunner:
                     self.last_signal = "BLOCKED: MAX_BAD_TRADES"
                     if self.duration_days > 0:
                         self._sleep_until_dubai_midnight()
-                    else:
-                        self.log(f"Bad trade limit reached ({self.bad_trades_today}/{self.stop_after_bad_trades}). Stopping.")
-                        self.stop_event.set()
-                        email_ai_stopped(self.email, self.symbol, "MAX_BAD_TRADES", get_equity(self.email))
-                        break
+                    elif not self.waiting_for_trade_close:
+                        if self.pending_trades:
+                            self.waiting_for_trade_close = True
+                            self._delayed_stop_reason = "MAX_BAD_TRADES"
+                            self._waiting_since_ts = time.time()
+                            self._last_waiting_log_ts = 0.0
+                            self.log(f"Bad trade limit reached ({self.bad_trades_today}/{self.stop_after_bad_trades}) — open trade detected. Waiting to close before stopping.")
+                            _tg_alert(
+                                f"⏳ <b>Bad trade limit — waiting for trade</b>\n"
+                                f"{self.email} | {self.symbol}\n"
+                                f"Bad trades: {self.bad_trades_today}/{self.stop_after_bad_trades}. Will stop once trade closes."
+                            )
+                        else:
+                            self.log(f"Bad trade limit reached ({self.bad_trades_today}/{self.stop_after_bad_trades}). Stopping.")
+                            self.stop_event.set()
+                            email_ai_stopped(self.email, self.symbol, "MAX_BAD_TRADES", get_equity(self.email))
+                            break
                     continue
 
                 # ── Step 3: 4-layer signal analysis ─────────────────────────────────────
@@ -4996,11 +3758,129 @@ class AutoRunner:
                 if res.get("side"):
                     self.last_side = res["side"]
                 if not res.get("ok"):
+                    # Cancel any pending pullback signal — conditions changed
+                    if self.signal_pending:
+                        self.log(f"Pending {self.pending_signal_side} signal cancelled — conditions no longer met.")
+                        self.signal_pending = False
+                        self.pending_signal_side = ""
+                        self.pending_signal_score = 0.0
+                        self.candles_since_signal = 0
                     self.blocked_reason = res.get("blocked") or "BLOCKED"
+                    _side_lbl  = res.get("side", "?")
+                    _score_lbl = f"{res.get('score', 0.0):.2f}"
+                    _raw       = res.get("blocked") or "signal not ready"
+                    _reason_lbl = _raw.split("): ", 1)[-1] if "): " in _raw else _raw
+
+                    # Threshold source — always visible in every market check log line
+                    _sess_bd    = res.get("breakdown", {}).get("session", {})
+                    _eff_thresh = _sess_bd.get("effective_min_score", "?")
+                    _thresh_src = _sess_bd.get("threshold_source", "?")
+                    self.log(
+                        f"Market check — {_side_lbl} score={_score_lbl} "
+                        f"threshold={_eff_thresh} source={_thresh_src} | {_reason_lbl}"
+                    )
+
+                    # ── HTF timeout: track consecutive hours blocked by weak HTF ──
+                    # Log ONCE at 12h and ONCE at 24h — not every hour.
+                    _is_htf_block = "HTF trend weak" in _raw or "direction" in _raw.lower()
+                    if _is_htf_block:
+                        if self._htf_block_start is None:
+                            self._htf_block_start = time.time()
+                        _htf_blocked_hours = (time.time() - self._htf_block_start) / 3600
+                        if _htf_blocked_hours >= 24 and not self._htf_timeout_24h_logged:
+                            self._htf_timeout_24h_logged = True
+                            self.log(
+                                f"HTF timeout: {_htf_blocked_hours:.1f}h blocked — "
+                                f"HTF filter suspended. Other layers decide."
+                            )
+                        elif _htf_blocked_hours >= 12 and not self._htf_timeout_12h_logged:
+                            self._htf_timeout_12h_logged = True
+                            self.log(
+                                f"HTF timeout: {_htf_blocked_hours:.1f}h blocked — "
+                                f"EMA separation requirement reduced 30%."
+                            )
+                    else:
+                        # Reset all HTF timeout state when block clears
+                        self._htf_block_start = None
+                        self._htf_timeout_12h_logged = False
+                        self._htf_timeout_24h_logged = False
+
                     continue
 
                 self.blocked_reason = None
                 desired_side: Side = res["side"]
+
+                # ── Step 3b: Pullback entry gate (Change 2) ──────────────────
+                _style_cfg_pb = get_style_config(self.trade_style)
+
+                if not self.signal_pending:
+                    # First candle where signal is valid — arm pending state
+                    self.signal_pending = True
+                    self.pending_signal_side = desired_side
+                    self.pending_signal_score = res.get("score", 0.0)
+                    self.pending_strong_trend_override = res.get("strong_trend_override", False)
+                    self.candles_since_signal = 0
+                    _sto_label = " | STRONG TREND override (6-candle window)" if self.pending_strong_trend_override else ""
+                    self.log(
+                        f"Signal armed — {desired_side} score={self.pending_signal_score:.2f} pattern={res.get('candle_pattern','?')}{_sto_label}"
+                        + (" | entering immediately (pullback disabled)" if not _style_cfg_pb.get("pullback_required") else " | awaiting pullback")
+                    )
+                elif self.pending_signal_side != desired_side:
+                    # Direction flipped — re-arm from this candle
+                    self.log(f"Direction changed {self.pending_signal_side}→{desired_side} — re-arming signal.")
+                    self.pending_signal_side = desired_side
+                    self.pending_signal_score = res.get("score", 0.0)
+                    self.pending_strong_trend_override = res.get("strong_trend_override", False)
+                    self.candles_since_signal = 0
+
+                self.candles_since_signal += 1
+
+                _strong_trend_entry = False
+                _pb_klines = None
+                if _style_cfg_pb.get("pullback_required", True):
+                    _pb_klines = _fetch_klines_sync(self.symbol, self.tf, limit=50, exchange=self._exchange_id)
+                    _cp_pb = get_coin_params(self.symbol)
+                    _pb_result = check_pullback_entry(
+                        _pb_klines, self.pending_signal_side, _cp_pb,
+                        self.global_regime, self.candles_since_signal,
+                        trade_style=self.trade_style,
+                        strong_trend_override=self.pending_strong_trend_override,
+                    )
+
+                    if _pb_result == "TIMEOUT":
+                        _max_c = _style_cfg_pb.get("pullback_timeout", 3)
+                        self.log(
+                            f"Signal expired — no pullback after {self.candles_since_signal}/{_max_c} candles "
+                            f"({self.pending_signal_side}). Waiting for next setup."
+                        )
+                        self.signal_pending = False
+                        self.pending_signal_side = ""
+                        self.pending_signal_score = 0.0
+                        self.pending_strong_trend_override = False
+                        self.candles_since_signal = 0
+                        continue
+
+                    if _pb_result == "WAIT":
+                        _max_c = 6 if self.candles_since_signal >= 3 else _style_cfg_pb.get("pullback_timeout", 3)
+                        self.log(f"Pullback wait [{self.candles_since_signal}/{_max_c}] — {self.pending_signal_side} | price not yet at EMA")
+                        continue
+
+                    # ENTER, IMMEDIATE, or ENTER_STRONG_TREND — proceed to trade
+                    if _pb_result == "ENTER":
+                        self.log(f"Pullback confirmed — entering {self.pending_signal_side} (score={self.pending_signal_score:.2f})")
+                    elif _pb_result == "ENTER_STRONG_TREND":
+                        self.log(
+                            f"STRONG TREND ENTRY — no pullback after {self.candles_since_signal} candles "
+                            f"({self.pending_signal_side}). Using 2×ATR SL for extra room."
+                        )
+                        _strong_trend_entry = True
+
+                # Confirmed entry — clear pending state and lock in direction
+                desired_side = self.pending_signal_side
+                self.signal_pending = False
+                self.pending_signal_side = ""
+                self.pending_signal_score = 0.0
+                self.candles_since_signal = 0
 
                 now_ts = time.time()
                 # After a bad trade wait 2× the normal cooldown before entering again
@@ -5017,8 +3897,35 @@ class AutoRunner:
                     # T16 reversal overrides SL/TP multipliers (1.5×ATR SL, 3×ATR TP)
                     _sl_atr = self.sl_atr_override if self.sl_atr_override else st["sl_atr"]
                     _tp_atr = self.tp_atr_override if self.tp_atr_override else st["tp_atr"]
+                    if _strong_trend_entry:
+                        _sl_atr = max(_sl_atr, 2.0)  # wider SL — strong trend candles are large
+
+                    # ── BTC Correlation filter (all symbols except BTC itself) ───────
+                    _btc_mult = 1.0
+                    if "BTC" not in self.symbol.upper():
+                        _btc_move = _get_btc_momentum(self.tf)
+                        if _btc_move is not None:
+                            _btc_against = ((desired_side == "LONG"  and _btc_move < -0.02) or
+                                            (desired_side == "SHORT" and _btc_move >  0.02))
+                            if _btc_against:
+                                _btc_dir = f"BTC {_btc_move*100:.1f}% vs {desired_side}"
+                                if abs(_btc_move) >= 0.04:
+                                    self.log(f"BTC macro conflict: {_btc_dir} — strong headwind, trade skipped")
+                                    self.last_trade_ts = now_ts  # apply cooldown so we re-check next interval
+                                    continue
+                                _btc_mult = 0.60
+                                self.log(f"BTC macro conflict: {_btc_dir} — size reduced to 60%")
                     sl_pct_open = min(self.last_atr_pct * _sl_atr, st["sl_max"] / 100.0)
                     tp_pct_open = min(self.last_atr_pct * _tp_atr, st["tp_max"] / 100.0)
+
+                    _pat_size_mult, _pat_trail_mult, _pat_nm = 1.0, 0.0, "none"
+                    if ENABLE_PAT_EXEC and _pb_klines is not None and self.last_atr_pct:
+                        _psm, _ptm, _adj_sl, _pat_nm = get_pattern_exec_params(
+                            _pb_klines, desired_side, sl_pct_open, self.last_atr_pct
+                        )
+                        _pat_size_mult  = _psm
+                        _pat_trail_mult = _ptm
+                        sl_pct_open     = _adj_sl
 
                     if REAL_TRADING:
                         real_bal = get_real_usdt_balance(self.email, force=True)
@@ -5064,20 +3971,31 @@ class AutoRunner:
                             _dd_sm  = (0.25 if _dd_now >= 0.10 else
                                        0.40 if _dd_now >= 0.07 else
                                        0.65 if _dd_now >= 0.04 else 1.0)
-                            size_pct  = float(c["size"]) * _mtf_sm * _vol_sm * _dd_sm
+                            # Funding rate check — reduce size if rate works against direction
+                            _fund_mult = 1.0
+                            _fr = _get_funding_rate(self.email, self.symbol)
+                            if _fr is not None:
+                                _fr_against = ((desired_side == "LONG"  and _fr >  0.001) or
+                                               (desired_side == "SHORT" and _fr < -0.001))
+                                if _fr_against:
+                                    _fr_abs   = abs(_fr)
+                                    _fund_mult = 0.50 if _fr_abs >= 0.003 else 0.70
+                                    self.log(f"Funding rate {_fr*100:.4f}%/8h against {desired_side} — size × {_fund_mult:.2f}")
+                            size_pct  = float(c["size"]) * _mtf_sm * _vol_sm * _dd_sm * _btc_mult * _fund_mult
                             usdt_size = equity_now * size_pct
                             self.log(
                                 f"REAL ORDER SIZE: base={float(c['size'])*100:.0f}% "
                                 f"× mtf={_mtf_sm:.2f} × vol={_vol_sm:.2f} × dd={_dd_sm:.2f} "
+                                f"× btc={_btc_mult:.2f} × fund={_fund_mult:.2f} "
                                 f"= {size_pct*100:.1f}% → ${usdt_size:.2f}"
                             )
-                            if grade == "B":
+                            if grade == "B" or ENABLE_GRADE_B_ALL:
                                 # Real Grade B: entry + two partial reduceOnly TP limit orders
                                 real_b_result = place_real_grade_b_order(
                                     email=self.email, symbol=self.symbol, side=desired_side,
                                     usdt_size=usdt_size, leverage=int(c["leverage"]),
                                     sl_pct=sl_pct_open,
-                                    t1_tp_pct=tp_pct_open * 0.80,
+                                    t1_tp_pct=tp_pct_open * 1.00,
                                     t2_tp_pct=tp_pct_open * 1.00,
                                 )
                                 self.log(
@@ -5087,22 +4005,37 @@ class AutoRunner:
                                     f"T1@{real_b_result['t1_tp_price']:.4f} T2@{real_b_result['t2_tp_price']:.4f}"
                                 )
                             else:
+                                # T18: open at 70% so we can scale into winners (MR/REVERSAL enter at 100%)
+                                _t18_active = self._scaling_enabled and self.signal_type not in ("MEAN_REVERSION", "REVERSAL")
+                                _open_usdt  = usdt_size * (0.70 if _t18_active else 1.00)
                                 _real_result = place_real_order(
                                     email=self.email, symbol=self.symbol, side=desired_side,
-                                    usdt_size=usdt_size, leverage=int(c["leverage"]),
+                                    usdt_size=_open_usdt, leverage=int(c["leverage"]),
                                     sl_pct=sl_pct_open, tp_pct=tp_pct_open,
                                 )
                                 real_order_id = _real_result.get("order_id")
-                                self.log(f"REAL ORDER PLACED | id={real_order_id} | {desired_side} {self.symbol} size=${usdt_size:.2f} lev={c['leverage']}×")
+                                _t18_lbl = f" (T18: 70% of ${usdt_size:.2f})" if _t18_active else ""
+                                self.log(f"REAL ORDER PLACED | id={real_order_id} | {desired_side} {self.symbol} size=${_open_usdt:.2f} lev={c['leverage']}×{_t18_lbl}")
                         except Exception as _re:
                             with self._pt_lock:
                                 self._opening_trade = False
                             self.log(f"REAL ORDER FAILED — trade skipped: {_re}")
-                            _tg_alert(
-                                f"❌ <b>Real order failed</b>\n"
-                                f"{self.email} | {self.symbol} {desired_side}\n"
-                                f"<code>{str(_re)[:250]}</code>"
-                            )
+                            _re_str = str(_re)
+                            if "SKIP_LOW_MARGIN" in _re_str:
+                                _avail_str = _re_str.split("$")[1].split(" ")[0] if "$" in _re_str else "0"
+                                try:
+                                    _avail_val = float(_avail_str)
+                                except ValueError:
+                                    _avail_val = 0.0
+                                if time.time() - self._last_margin_email_ts > 86400:
+                                    email_low_margin(self.email, self.symbol, self._exchange_id, _avail_val, self.mode)
+                                    self._last_margin_email_ts = time.time()
+                            else:
+                                _tg_alert(
+                                    f"❌ <b>Real order failed</b>\n"
+                                    f"{self.email} | {self.symbol} {desired_side}\n"
+                                    f"<code>{_re_str[:250]}</code>"
+                                )
                             continue
 
                         # ── FIX 1: Entry succeeded — log position to DB BEFORE SL ──
@@ -5115,27 +4048,51 @@ class AutoRunner:
                             "open_ts": time.time(),
                             "sl_pct_open": sl_pct_open,
                             "tp_pct_open": tp_pct_open,
+                            "usdt_size_base": usdt_size,
+                            "leverage_used":  int(c["leverage"]),
+                            "score_open":     self.last_score,
+                            "regime_open":    self.market_regime,
+                            "atr_pct_open":   self.last_atr_pct,
+                            "adx_at_open":    self.last_adx,
+                            "pat_trail_mult": _pat_trail_mult,
                         }
-                        if grade == "B":
-                            # t1_sl_id / t2_sl_id start as None; filled in after SL placement below.
-                            # Stored here so _save_runner_state persists them before SL attempt.
+                        if grade == "B" or ENABLE_GRADE_B_ALL:
+                            _gb_sig_lbl = "" if grade == "B" else f" [Option3 sig={grade}]"
                             self.pending_trades = [
-                                {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 0.80,
+                                {**base_trade, "grade": "B", "size_mult": 0.60, "tp_mult": 1.00,
                                  "is_primary": True,  "label": "T1",
                                  "order_id": real_b_result.get("order_id"),
                                  "t1_tp_id": real_b_result.get("t1_tp_id"),
-                                 "t1_sl_id": None},   # filled after _place_grade_b_stop_order
+                                 "t1_sl_id": None},
                                 {**base_trade, "grade": "B", "size_mult": 0.40, "tp_mult": 1.00,
                                  "is_primary": False, "label": "T2", "breakeven_after_t1": True,
-                                 "t2_sl_id": None},   # filled after _place_grade_b_stop_order
+                                 "t2_sl_id": None,
+                                 "t2_qty": real_b_result.get("t2_qty")},
                             ]
-                            self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP T2 40%+100%TP+BE | score={self.last_score:.2f}")
+                            self.log(f"TRADE OPENED Grade B REAL ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP T2 40%+100%TP+BE | score={self.last_score:.2f}{_gb_sig_lbl}")
                         else:
+                            _real_t18   = self._scaling_enabled and self.signal_type not in ("MEAN_REVERSION", "REVERSAL")
+                            _real_init_sm = round(0.70 * _mtf_sm if _real_t18 else 1.00 * _mtf_sm, 4)
+                            _scale_lbl  = " | T18: entry 70%" if _real_t18 else ""
                             self.pending_trades = [
-                                {**base_trade, "grade": "A", "size_mult": 1.00, "tp_mult": 1.00,
-                                 "is_primary": True, "order_id": real_order_id},
+                                {**base_trade, "grade": "A", "size_mult": _real_init_sm, "tp_mult": 1.00,
+                                 "is_primary": True, "order_id": real_order_id,
+                                 "scale1_done": False, "scale2_done": False,
+                                 "scaling_enabled": _real_t18},
                             ]
-                            self.log(f"TRADE OPENED Grade A REAL ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}")
+                            _pat_lbl_r = f" | pat={_pat_nm}(×{_pat_size_mult:.2f})" if _pat_nm != "none" else ""
+                            self.log(f"TRADE OPENED Grade A REAL ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f}{_scale_lbl}{_pat_lbl_r}")
+                        _sl_px = entry_price * (1 + sl_pct_open) if desired_side == "SHORT" else entry_price * (1 - sl_pct_open)
+                        _tp_px = entry_price * (1 - tp_pct_open) if desired_side == "SHORT" else entry_price * (1 + tp_pct_open)
+                        try:
+                            email_trade_opened(
+                                to=self.email, symbol=self.symbol, side=desired_side, mode=self.mode,
+                                grade=grade, entry=entry_price, sl=_sl_px, tp=_tp_px,
+                                score=self.last_score, equity=equity_now,
+                            )
+                            _check_first_trade_email(self.email, self.symbol, desired_side, grade, equity_now)
+                        except Exception:
+                            pass
                         self.last_trade_ts = now_ts
                         with self._pt_lock:
                             self._opening_trade = False   # slot claimed — pending_trades is set
@@ -5143,25 +4100,24 @@ class AutoRunner:
 
                         # ── Place SL — Grade B: two separate stops (T1+T2 independent)
                         #              Grade A: single position-level SL ──────────────
-                        if grade == "B":
+                        if grade == "B" or ENABLE_GRADE_B_ALL:
                             _b_ex    = real_b_result["ex"]
                             _b_ex_id = real_b_result["ex_id"]
                             _b_sl    = real_b_result["sl_price"]
-                            if _b_ex_id == "bybit":
-                                # Each stop covers only its own portion.
-                                # When T1 SL fires (60% closes), T2 SL stays active.
-                                _t1_sl_id = _place_grade_b_stop_order(
-                                    self, _b_ex, _b_ex_id, self.symbol, desired_side,
-                                    _b_sl, real_b_result["t1_qty"], "T1_SL",
-                                )
-                                _t2_sl_id = _place_grade_b_stop_order(
-                                    self, _b_ex, _b_ex_id, self.symbol, desired_side,
-                                    _b_sl, real_b_result["t2_qty"], "T2_SL",
-                                )
-                                self.pending_trades[0]["t1_sl_id"] = _t1_sl_id
-                                self.pending_trades[1]["t2_sl_id"] = _t2_sl_id
-                                _save_runner_state(self)
-                                if not _t1_sl_id or not _t2_sl_id:
+                            # Place independent T1 and T2 stops on all exchanges.
+                            # Each stop covers only its own tranche — T1 SL firing does NOT cancel T2 SL.
+                            _t1_sl_id = _place_grade_b_stop_order(
+                                self, _b_ex, _b_ex_id, self.symbol, desired_side,
+                                _b_sl, real_b_result["t1_qty"], "T1_SL",
+                            )
+                            _t2_sl_id = _place_grade_b_stop_order(
+                                self, _b_ex, _b_ex_id, self.symbol, desired_side,
+                                _b_sl, real_b_result["t2_qty"], "T2_SL",
+                            )
+                            self.pending_trades[0]["t1_sl_id"] = _t1_sl_id
+                            self.pending_trades[1]["t2_sl_id"] = _t2_sl_id
+                            _save_runner_state(self)
+                            if not _t1_sl_id or not _t2_sl_id:
                                     # Partial failure — apply position SL as fallback
                                     self.log(f"Grade B partial stop failed (T1={_t1_sl_id} T2={_t2_sl_id}) — applying position SL as fallback")
                                     _sl_ok = _ensure_sl_or_close(self, _b_ex, _b_ex_id, self.symbol, desired_side, _b_sl)
@@ -5250,27 +4206,46 @@ class AutoRunner:
                             "open_ts": time.time(),
                             "sl_pct_open": sl_pct_open,
                             "tp_pct_open": tp_pct_open,
+                            "score_open":  self.last_score,
+                            "regime_open": self.market_regime,
+                            "atr_pct_open": self.last_atr_pct,
+                            "adx_at_open":  self.last_adx,
+                            "pat_trail_mult": _pat_trail_mult,
                         }
                         _mtf_label = "" if res.get("mtf_confirmed", True) else f" | 15m unconfirmed→size {_mtf_sm*100:.0f}%"
-                        if grade == "B":
+                        if grade == "B" or ENABLE_GRADE_B_ALL:
+                            _gb_sig_lbl = "" if grade == "B" else f" [Option3 sig={grade}]"
                             self.pending_trades = [
-                                {**base_trade, "grade": "B", "size_mult": round(0.60 * _mtf_sm, 4), "tp_mult": 0.80,
+                                {**base_trade, "grade": "B", "size_mult": round(0.60 * _mtf_sm, 4), "tp_mult": 1.00,
                                  "is_primary": True,  "label": "T1"},
                                 {**base_trade, "grade": "B", "size_mult": round(0.40 * _mtf_sm, 4), "tp_mult": 1.00,
                                  "is_primary": False, "label": "T2", "breakeven_after_t1": True},
                             ]
-                            self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+80%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}{_mtf_label}")
+                            self.log(f"TRADE OPENED Grade B ({desired_side}) @ {entry_price:.4f} | T1 60%+100%TP, T2 40%+100%TP+BE | score={self.last_score:.2f}{_mtf_label}{_gb_sig_lbl}")
                         else:
                             # Scaling enabled: open at 70% to allow scale-ins. Builds to 100% on winners.
-                            _grade_a_sm = round((0.70 if self._scaling_enabled else 1.00) * _mtf_sm, 4)
-                            _scale_label = " | scaling: entry 70%" if self._scaling_enabled else ""
+                            # MR/REVERSAL skip T18 — they enter at 100% (no scale-in needed).
+                            _t18_demo = self._scaling_enabled and self.signal_type not in ("MEAN_REVERSION", "REVERSAL")
+                            _grade_a_sm = round((0.70 if _t18_demo else 1.00) * _mtf_sm, 4)
+                            _scale_label = " | scaling: entry 70%" if _t18_demo else ""
                             self.pending_trades = [
                                 {**base_trade, "grade": "A", "size_mult": _grade_a_sm, "tp_mult": 1.00,
                                  "is_primary": True,
                                  "scale1_done": False, "scale2_done": False,
-                                 "scaling_enabled": self._scaling_enabled},
+                                 "scaling_enabled": _t18_demo},
                             ]
-                            self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}{_mtf_label}{_scale_label}")
+                            _pat_label = f" | pat={_pat_nm}(×{_pat_size_mult:.2f})" if _pat_nm != "none" else ""
+                            self.log(f"TRADE OPENED Grade A ({desired_side}) @ {entry_price:.4f} | score={self.last_score:.2f} | signal={self.last_signal}{_mtf_label}{_scale_label}{_pat_label}")
+                        _sl_px = entry_price * (1 + sl_pct_open) if desired_side == "SHORT" else entry_price * (1 - sl_pct_open)
+                        _tp_px = entry_price * (1 - tp_pct_open) if desired_side == "SHORT" else entry_price * (1 + tp_pct_open)
+                        try:
+                            email_trade_opened(
+                                to=self.email, symbol=self.symbol, side=desired_side, mode=self.mode,
+                                grade=grade, entry=entry_price, sl=_sl_px, tp=_tp_px,
+                                score=self.last_score, equity=equity_now,
+                            )
+                        except Exception:
+                            pass
                         self.last_trade_ts = now_ts
                         with self._pt_lock:
                             self._opening_trade = False   # slot claimed — pending_trades is set
@@ -5291,9 +4266,17 @@ class AutoRunner:
                         f"{self.email} | {self.symbol}\n"
                         f"<code>{_err_str[:300]}</code>"
                     )
+                elif any(x in _err_str for x in ("SSL", "consuming input", "connection", "OperationalError")):
+                    # DB/network blip — engine auto-retries next interval, no action needed
+                    _tg_alert(
+                        f"⚠️ <b>DB connection blip — auto-retrying</b>\n"
+                        f"{self.email} | {self.symbol}\n"
+                        f"Engine continues normally next interval.\n"
+                        f"<code>{_err_str[:200]}</code>"
+                    )
                 else:
                     _tg_alert(
-                        f"🔴 <b>Engine crash</b>\n"
+                        f"🔴 <b>Engine error — auto-retrying</b>\n"
                         f"{self.email} | {self.symbol}\n"
                         f"<code>{_err_str[:300]}</code>"
                     )
@@ -5304,6 +4287,26 @@ class AutoRunner:
                         scope.set_tag("mode", self.mode)
                         sentry_sdk.capture_exception(e)
             finally:
+                # Force Python to release kline/candle memory fetched this iteration.
+                # Each signal check fetches ~620 candle objects — without this, CPython
+                # keeps them in its internal free-list and Render's 512MB limit is hit
+                # within a few hours of multiple runners being active.
+                gc.collect()
+                # Log tick time + RSS memory once per hour (not every 10 cycles)
+                _tick_ms = int((time.time() - _tick_start) * 1000)
+                _now_perf = time.time()
+                if _now_perf - self._last_perf_log_ts >= 3600:
+                    self._last_perf_log_ts = _now_perf
+                    try:
+                        import psutil as _psutil
+                        _rss_mb = _psutil.Process().memory_info().rss / 1024 / 1024
+                        _n_runners = len(AUTO_RUNNERS)
+                        self.log(
+                            f"[PERF] tick={_tick_ms}ms | mem={_rss_mb:.0f}MB RSS | "
+                            f"runners={_n_runners} | symbol={self.symbol}"
+                        )
+                    except (ImportError, Exception):
+                        pass  # skip PERF log if psutil unavailable
                 # Sleep in 30-second chunks so the loop wakes up quickly when
                 # the mid-candle monitor opens a trade and sets pending_trades.
                 _rem = self.interval_sec
@@ -5384,6 +4387,13 @@ def _resume_runners_on_startup() -> None:
                     runner.start()
                     resumed += 1
                     print(f"[startup-resume] {email} — resumed {row['symbol']} {row['mode']} {row['trade_style']}")
+
+            # Pre-warm the balance cache so the first /balance request after
+            # a cold start returns instantly instead of blocking on Bybit API.
+            if REAL_TRADING:
+                from exchange_utils import _do_balance_refresh
+                import threading as _thr2
+                _thr2.Thread(target=_do_balance_refresh, args=(email,), daemon=True).start()
 
         except Exception as e:
             # Log but do NOT clear state — preserve it so the next redeploy can retry
@@ -5474,6 +4484,99 @@ def _resume_watchdog() -> None:
 
 
 # =========================
+# TRADING QUALITY HELPERS
+# =========================
+# _fetch_btc_weekly_candles and _fetch_economic_calendar live in data_feeds.py
+# (imported at top). Kept here: momentum + funding helpers used by AutoRunner.
+
+def _get_btc_momentum(tf: str) -> Optional[float]:
+    """BTC % change over last 3 closed candles on given timeframe.
+    Positive = rising, negative = falling. Returns None on error."""
+    try:
+        klines = _fetch_klines_sync("BTCUSDT", tf, limit=6, exchange="bybit")
+        if not klines or len(klines) < 3:
+            return None
+        old_close = float(klines[-3]["close"])
+        new_close = float(klines[-1]["close"])
+        return (new_close - old_close) / old_close
+    except Exception:
+        return None
+
+
+def _get_funding_rate(email: str, symbol: str) -> Optional[float]:
+    """Current funding rate for a perp future as a decimal (e.g. 0.0001 = 0.01%).
+    Positive = longs pay (costly for LONG). Negative = shorts pay (costly for SHORT).
+    Returns None on any error."""
+    try:
+        row = get_exchange(email)
+        if not row:
+            return None
+        ex = _make_ccxt_exchange(row)
+        if not ex.markets:
+            ex.load_markets()
+        result = _ccxt_call(ex.fetch_funding_rate, symbol, label=f"funding_{symbol}", retries=0)
+        if result:
+            return float(result.get("fundingRate") or 0.0)
+        return None
+    except Exception:
+        return None
+
+
+def _place_real_scalein(runner, symbol: str, side: str, add_usdt: float, leverage: int) -> bool:
+    """Add to an existing real position (T18 scale-in).
+    Places a market order in same direction — no TP/SL since position already has them.
+    Returns True on success."""
+    try:
+        row = get_exchange(runner.email)
+        if not row:
+            return False
+        ex = _make_ccxt_exchange(row)
+        if not ex.markets:
+            ex.load_markets()
+        ex_id  = (row.get("exchange") or "bybit").lower()
+        mkt    = ex.market(symbol)
+        _prec  = mkt.get("precision", {})
+        _lims  = mkt.get("limits", {})
+        qty_step = float(_prec.get("amount") or 0)
+        min_qty  = float((_lims.get("amount") or {}).get("min") or 0)
+
+        current_px = runner._fetch_price_sync(symbol)
+        qty_raw    = (add_usdt * leverage) / max(current_px, 1e-9)
+        qty = (round(int(qty_raw / qty_step) * qty_step, 8)
+               if qty_step > 0 else round(qty_raw, 3))
+        if qty < max(min_qty, 1e-9):
+            runner.log(f"SCALE-IN skipped — qty {qty:.4f} below exchange minimum {min_qty}")
+            return False
+
+        if ex_id == "bybit":
+            bybit_sym = mkt["id"]
+            _ccxt_call(
+                ex.privatePostV5OrderCreate,
+                {
+                    "category":    "linear",
+                    "symbol":      bybit_sym,
+                    "side":        "Buy" if side == "LONG" else "Sell",
+                    "orderType":   "Market",
+                    "qty":         str(qty),
+                    "positionIdx": 0,
+                },
+                label=f"scalein_{symbol}", retries=1,
+            )
+        else:
+            ccxt_side = "buy" if side == "LONG" else "sell"
+            _ccxt_call(
+                ex.create_order, symbol, "market", ccxt_side, qty, None,
+                {"reduceOnly": False},
+                label=f"scalein_{symbol}", retries=1,
+            )
+        runner.log(f"REAL SCALE-IN placed: {side} {symbol} +${add_usdt:.2f} qty={qty:.4f} lev={leverage}×")
+        return True
+    except Exception as e:
+        runner.log(f"REAL SCALE-IN failed — {e}")
+        return False
+
+
+# =========================
 # REAL ORDER PLACEMENT (Bybit/OKX via ccxt)
 # =========================
 
@@ -5500,6 +4603,18 @@ def place_real_order(
 
     ex = _make_ccxt_exchange(row)
     ex_id = (row.get("exchange") or "bybit").lower()
+
+    # Pre-trade API key validation — catch IP whitelist / expired key BEFORE entering
+    # a position. An auth error here means SL placement will also fail, which would
+    # leave the user with a naked position and no way to close it programmatically.
+    try:
+        _ccxt_call(ex.fetch_balance, label=f"api_key_check {ex_id}", retries=0)
+    except Exception as _auth_check_err:
+        if "EXCHANGE_AUTH_ERROR" in str(_auth_check_err):
+            raise ValueError(
+                f"EXCHANGE_AUTH_ERROR: API key rejected by {ex_id} before trade entry. "
+                f"Check your API key IP whitelist or key permissions. Trade blocked."
+            )
 
     # Convert LONG/SHORT to buy/sell
     order_side = "buy" if side == "LONG" else "sell"
@@ -5724,16 +4839,43 @@ def _ensure_sl_or_close(runner: "AutoRunner", ex, ex_id: str,
             return True
         except Exception as sl_err:
             runner.log(f"SL attempt {attempt}/3 failed: {sl_err}")
+
+            # Auth error = the API key itself is rejected (IP whitelist / expired key).
+            # Retrying and closing will both fail for the same reason — stop immediately
+            # so we don't waste time and send a clear alert to the user.
+            if "EXCHANGE_AUTH_ERROR" in str(sl_err):
+                runner.log(
+                    f"⚠️ API KEY REJECTED — SL cannot be placed on {ex_id}. "
+                    f"Your API key is blocked (wrong IP or key expired). "
+                    f"AI stopped. Go to your exchange and MANUALLY close the open "
+                    f"{side} {symbol} position, then reconnect your API key."
+                )
+                _tg_alert(
+                    f"🚨 <b>API Key Rejected — Naked Position</b>\n"
+                    f"{runner.email} | {symbol} {side}\n"
+                    f"SL placement blocked: IP not whitelisted or key expired.\n"
+                    f"<b>Open {side} {symbol} position has NO stop-loss.</b>\n"
+                    f"User must manually close on {ex_id}. Email sent."
+                )
+                try:
+                    email_api_key_expired(runner.email, symbol)
+                except Exception:
+                    pass
+                runner.blocked_reason = "API_KEY_REJECTED"
+                runner.stop_event.set()
+                return None   # keep pending_trades — engine stopped, user must close manually
+
             if attempt < 3:
                 time.sleep(2)
 
-    # All 3 attempts failed — close position immediately, never leave naked
+    # All 3 attempts failed (non-auth error) — close position immediately, never leave naked
     runner.log("SL PLACEMENT FAILED AFTER 3 ATTEMPTS — closing position immediately for safety.")
     try:
         result = close_real_order(runner.email, symbol, side)
         runner.log(f"Position closed for safety: {result}")
         return False   # closed safely — caller should clear pending_trades
     except Exception as close_err:
+        _close_err_str = str(close_err)
         runner.log(
             f"CRITICAL: SL failed AND close failed: {close_err}. "
             f"MANUAL ACTION REQUIRED on {ex_id} — open {side} {symbol} with NO stop-loss."
@@ -5744,6 +4886,10 @@ def _ensure_sl_or_close(runner: "AutoRunner", ex, ex_id: str,
             f"SL placement failed (3 attempts) AND emergency close failed.\n"
             f"<b>MANUAL ACTION REQUIRED on {ex_id}.</b>"
         )
+        if "EXCHANGE_AUTH_ERROR" in _close_err_str:
+            # Auth error on close too — same root cause, stop the engine
+            runner.blocked_reason = "API_KEY_REJECTED"
+            runner.stop_event.set()
         return None   # position may still be open — caller must keep pending_trades
 
 
@@ -5758,29 +4904,56 @@ def _place_grade_b_stop_order(
     label: str,
 ) -> Optional[str]:
     """
-    Place a qty-specific conditional stop-market order on Bybit for Grade B T1 or T2.
+    Place a qty-specific independent stop-market order for Grade B T1 or T2.
+    Supported on Bybit, OKX, and Binance — each uses their native stop order API.
 
-    Why this is needed (Grade B T2 SL bug — confirmed May 23 NEAR trade):
-    ─────────────────────────────────────────────────────────────────────
-    The old approach used a single position-level SL via tradingStop (covers the
-    full remaining position at trigger time). When T1 closes at SL, that single
-    SL order is consumed. T2 continues running but has NO stop protection.
-    Result: T2 loss was $2.00 instead of the expected $0.36.
-
-    This function places ONE partial stop order for the given qty (T1=60% or T2=40%).
-    The two stops are independent — T1's stop firing does NOT cancel T2's stop.
-
-    Bybit-only: OKX and Binance do not support reduceOnly conditional orders with
-    specific quantities easily. Callers fall back to _ensure_sl_or_close on those.
+    Why independent stops matter (confirmed May 23 NEAR trade):
+    When T1 closes at SL, a single position-level SL is consumed — T2 runs unprotected.
+    This function places ONE stop per tranche. T1's stop firing does NOT cancel T2's stop.
 
     Parameters:
         label: "T1_SL" or "T2_SL" — used in log messages for traceability.
     Returns:
-        Bybit orderId string on success, None on failure.
+        Order ID string on success, None on failure (caller falls back to position SL).
     """
-    if ex_id != "bybit":
-        # Only Bybit supports this pattern cleanly — caller uses position-level SL fallback
-        return None
+    close_side_str_lower = "sell" if side == "LONG" else "buy"
+
+    if ex_id == "okx":
+        try:
+            order = _ccxt_call(
+                ex.create_order, symbol, "market", close_side_str_lower, qty, None,
+                params={
+                    "tdMode":       "cross",
+                    "slTriggerPx":  str(round(sl_price, 4)),
+                    "slOrdPx":      "-1",   # market fill on trigger
+                    "reduceOnly":   True,
+                },
+                label=f"grade_b {label} okx",
+            )
+            order_id = (order or {}).get("id")
+            runner.log(f"Grade B {label} stop placed (OKX): order={order_id} @ {sl_price:.4f} qty={qty}")
+            return order_id
+        except Exception as e:
+            runner.log(f"WARN: Grade B {label} OKX stop failed: {e}")
+            return None
+
+    if ex_id == "binance":
+        try:
+            order = _ccxt_call(
+                ex.create_order, symbol, "STOP_MARKET", close_side_str_lower, qty, None,
+                params={
+                    "stopPrice":     round(sl_price, 4),
+                    "reduceOnly":    True,
+                    "closePosition": False,   # specific qty, not full position
+                },
+                label=f"grade_b {label} binance",
+            )
+            order_id = (order or {}).get("id")
+            runner.log(f"Grade B {label} stop placed (Binance): order={order_id} @ {sl_price:.4f} qty={qty}")
+            return order_id
+        except Exception as e:
+            runner.log(f"WARN: Grade B {label} Binance stop failed: {e}")
+            return None
 
     close_side_str = "Sell" if side == "LONG" else "Buy"
     # triggerDirection: 2 = fire when price falls BELOW trigger (LONG stop-loss)
@@ -5852,7 +5025,7 @@ def _verify_and_restore_t2_sl(
     t2_sl_price: float,
 ) -> None:
     """
-    After T1 exits at SL (not TP), verify T2's stop order is still active on Bybit.
+    After T1 exits at SL (not TP), verify T2's stop order is still active.
     Re-places the SL immediately if the stop order is missing or was consumed.
 
     Why this is needed:
@@ -5862,19 +5035,37 @@ def _verify_and_restore_t2_sl(
     - The stop order gets cancelled by the exchange for any reason.
     This verification ensures T2 always has protection within one engine cycle.
 
+    Exchange behaviour:
+    - Bybit:   stop-limit orders appear in fetch_open_orders → full verification possible.
+    - Binance: STOP_MARKET conditional orders appear in fetch_open_orders → full verification.
+    - OKX:     algo stop orders live at /trade/orders-algo-pending, NOT the regular open
+               orders endpoint. fetch_open_orders returns [] for algo orders → always looks
+               missing even when active → would cause a spurious second position-level SL.
+               For OKX we skip the check and assume the algo stop is still active. If it
+               was genuinely consumed (price gap), OKX will auto-liquidate or the next
+               engine cycle picks it up via position monitoring.
+
     Logs: "T2 SL verified after T1 exit" OR "T2 SL missing — placed new SL"
     """
+    # OKX algo orders are not visible via fetch_open_orders — assume active to avoid
+    # placing a duplicate position-level SL on top of the existing algo stop.
+    if ex_id == "okx":
+        runner.log(
+            f"T2 SL assumed active (OKX algo order {t2_sl_id}) — "
+            "skipping fetch_open_orders (algo endpoint not queried)"
+        )
+        return
+
     t2_active = False
 
     if t2_sl_id:
-        # Check if the T2 stop order is still in Bybit's open/untriggered orders
         try:
             open_orders = _ccxt_call(
                 ex.fetch_open_orders, symbol,
                 label=f"verify_t2_sl open_orders {ex_id}", retries=0,
             )
             for o in open_orders:
-                # Match by ccxt id or by native Bybit orderId in info dict
+                # Match by ccxt unified id or by native exchange orderId in info dict
                 if (o.get("id") == t2_sl_id or
                         (o.get("info") or {}).get("orderId") == t2_sl_id):
                     t2_active = True
@@ -5970,63 +5161,103 @@ def _cancel_all_real_orders(email: str, symbol: str) -> None:
         pass
 
 
-def _move_real_sl_to_breakeven(email: str, symbol: str, entry_price: float) -> bool:
+def _move_real_sl_to_breakeven(
+    email: str,
+    symbol: str,
+    entry_price: float,
+    t2_sl_id: Optional[str] = None,
+    t2_qty: Optional[float] = None,
+    side: Optional[str] = None,
+) -> tuple:
     """
-    Move position-level SL to entry price (breakeven) when T1 hits TP.
-    Uses Bybit's /v5/position/trading-stop — one atomic call, zero gap.
-    Safer than cancel+replace because the position is never unprotected.
-    Returns True on success.
+    Move T2 stop-loss to entry price (breakeven) when T1 hits TP.
+    Returns (success: bool, new_t2_sl_id: Optional[str]).
+
+    Bybit:   atomic position trading-stop API — zero gap, no cancel needed.
+    OKX:     cancel existing T2 SL order + place new qty-specific stop at entry.
+    Binance: cancel existing T2 STOP_MARKET + place new qty-specific stop at entry.
+
+    new_t2_sl_id is set for OKX/Binance so caller can update pending_trades[T2]["t2_sl_id"].
     """
     try:
         row = get_exchange(email)
         if not row:
-            return False
+            return False, None
         ex = _make_ccxt_exchange(row)
-        mkt = ex.market(symbol)
-        bybit_sym = mkt["id"]   # "BTC/USDT:USDT" → "BTCUSDT"
-        _ccxt_call(
-            ex.privatePostV5PositionTradingStop,
-            {
-                "category":    "linear",
-                "symbol":      bybit_sym,
-                "stopLoss":    str(round(entry_price, 4)),
-                "slTriggerBy": "MarkPrice",
-                "positionIdx": 0,
-            },
-            label="move_sl_breakeven", retries=1,
+        ex_id = (row.get("exchange") or "bybit").lower()
+
+        if ex_id == "bybit":
+            mkt = ex.market(symbol)
+            bybit_sym = mkt["id"]
+            _ccxt_call(
+                ex.privatePostV5PositionTradingStop,
+                {
+                    "category":    "linear",
+                    "symbol":      bybit_sym,
+                    "stopLoss":    str(round(entry_price, 4)),
+                    "slTriggerBy": "MarkPrice",
+                    "positionIdx": 0,
+                },
+                label="move_sl_breakeven_bybit", retries=1,
+            )
+            return True, None
+
+        # OKX / Binance — cancel old T2 SL, place new one at entry_price
+        if t2_sl_id:
+            try:
+                _ccxt_call(ex.cancel_order, t2_sl_id, symbol,
+                           label=f"cancel_t2_sl_breakeven {ex_id}", retries=0)
+            except Exception as _ce:
+                pass  # already filled or expired — safe to continue placing new stop
+
+        if not t2_qty or not side:
+            # Fallback: use position-level SL if we don't have qty/side info
+            _set_position_sl(ex, ex_id, symbol, side or "LONG", entry_price)
+            return True, None
+
+        # Place new qty-specific stop at entry_price
+        runner_stub = type("_R", (), {"log": lambda self, m: print(f"[breakeven] {m}")})()
+        new_id = _place_grade_b_stop_order(
+            runner_stub, ex, ex_id, symbol, side, entry_price, t2_qty, "T2_SL_BE"
         )
-        return True
+        if new_id:
+            return True, new_id
+        # Fallback if stop placement failed
+        try:
+            _set_position_sl(ex, ex_id, symbol, side, entry_price)
+            return True, None
+        except Exception:
+            return False, None
+
     except Exception:
-        return False
+        return False, None
 
 
-def _check_bybit_order_filled(email: str, order_id: str, symbol: str) -> bool:
+def _check_order_filled(email: str, order_id: str, symbol: str) -> bool:
     """
-    Return True if the Bybit order is confirmed fully filled.
+    Return True if an exchange order is confirmed fully filled.
+    Works on Bybit, OKX, and Binance via ccxt unified fetch_order.
     Returns False on any error or if order is still open / canceled / unknown.
     Used to verify T1 TP hit on real Grade B trades before moving T2 SL to breakeven.
-
-    Bug 3 fix: previous version created a fresh exchange with no markets loaded.
-    ccxt Bybit's fetch_order requires markets to resolve the symbol category (linear/spot),
-    so it silently failed and returned False even when T1_TP was actually filled.
-    Fix: load markets before fetch_order, and accept both "closed" and "filled" statuses.
     """
     try:
         row = get_exchange(email)
         if not row:
             return False
         ex = _make_ccxt_exchange(row)
-        # Load markets if this is a fresh exchange instance — required for symbol resolution
         if not ex.markets:
             try:
                 ex.load_markets()
             except Exception:
-                pass  # non-fatal: fetch_order may still work without full market map
+                pass
         order = _ccxt_call(ex.fetch_order, order_id, symbol, label="fetch_order T1_check", retries=1)
-        # ccxt normalises Bybit "Filled" → "closed"; accept both defensively
+        # ccxt normalises all exchange statuses → "closed" or "filled"
         return order.get("status") in ("closed", "filled")
     except Exception:
         return False
+
+# backward-compat alias — remove after confirming all call sites updated
+_check_bybit_order_filled = _check_order_filled
 
 
 def place_real_grade_b_order(
@@ -6107,11 +5338,50 @@ def place_real_grade_b_order(
             f"Deposit more USDT to your exchange account."
         )
 
+    # ── Enforce exchange minimum qty before touching the exchange ─────────────
+    # Bybit rejects orders below per-coin minimums (e.g. BTC min=0.001).
+    # With heavy drawdown multipliers on small equity this triggers silently.
+    import math as _math
+    _qty_step = 0.0
+    _min_qty  = 0.0
+    try:
+        _mkt      = ex.market(symbol)
+        _prec     = _mkt.get("precision") or {}
+        _lims     = _mkt.get("limits")    or {}
+        _qty_step = float(_prec.get("amount") or 0)
+        _min_qty  = float((_lims.get("amount") or {}).get("min") or 0)
+        if _qty_step > 0:
+            qty = _math.floor(qty / _qty_step) * _qty_step
+            qty = round(qty, 8)
+        if _min_qty > 0 and qty < _min_qty:
+            raise ValueError(
+                f"BELOW_MIN_QTY: qty {qty:.6f} {symbol} below exchange minimum {_min_qty} "
+                f"— position ${usdt_size:.2f} too small for {symbol} at ${price:.2f}. "
+                f"Reduce leverage, switch to a lower-priced coin, or deposit more funds."
+            )
+    except ValueError:
+        raise
+    except Exception as _mkt_e:
+        pass  # market info unavailable — let exchange reject if needed
+
     sl_price    = round(price * sl_mult, 4)
     t1_tp_price = round(price * t1_mult, 4)
     t2_tp_price = round(price * t2_mult, 4)
     t1_qty = round(qty * 0.60, 6)
     t2_qty = round(qty * 0.40, 6)
+
+    # Fix: check if T2 qty would be below exchange minimum after step enforcement.
+    # If so, T1 takes the full position (no split) to avoid T2 SL qty=0 bug.
+    if _qty_step > 0 and _min_qty > 0:
+        t2_stepped = _math.floor(t2_qty / _qty_step) * _qty_step
+        if t2_stepped < _min_qty:
+            print(
+                f"[grade-b] T2 qty {t2_stepped:.6f} < min {_min_qty} after step enforcement "
+                f"— T1 takes full position (no T1/T2 split for this trade size)",
+                flush=True,
+            )
+            t1_qty = qty
+            t2_qty = 0.0
 
     # ── Entry order — clean, no SL in params (FIX 1) ──────────────────────────
     # SL is set SEPARATELY after entry via _ensure_sl_or_close() so that:
@@ -6151,14 +5421,15 @@ def place_real_grade_b_order(
     except RuntimeError as e:
         print(f"[WARN] Grade B T1 TP placement failed (entry placed): {e} — SL will protect.", flush=True)
 
-    try:
-        t2_order = _ccxt_call(
-            ex.create_order, symbol, "limit", close_side, t2_qty, t2_tp_price,
-            params=reduce_params, label=f"grade_b T2_TP {ex_id}",
-        )
-        t2_order_id = t2_order.get("id")
-    except RuntimeError as e:
-        print(f"[WARN] Grade B T2 TP placement failed (entry placed): {e} — SL will protect.", flush=True)
+    if t2_qty > 0:
+        try:
+            t2_order = _ccxt_call(
+                ex.create_order, symbol, "limit", close_side, t2_qty, t2_tp_price,
+                params=reduce_params, label=f"grade_b T2_TP {ex_id}",
+            )
+            t2_order_id = t2_order.get("id")
+        except RuntimeError as e:
+            print(f"[WARN] Grade B T2 TP placement failed (entry placed): {e} — SL will protect.", flush=True)
 
     return {
         "order_id":    entry_order.get("id"),
@@ -6177,1349 +5448,7 @@ def place_real_grade_b_order(
     }
 
 
-@app.post("/trade")
-async def place_trade(payload: TradeIn, user=Depends(require_user)):
-    email = user["email"]
-    with AUTO_LOCK:
-        r = AUTO_RUNNERS.get(email)
-        if r and r.is_running():
-            raise HTTPException(status_code=400, detail="Manual trading disabled while AI is running.")
-    return await _place_trade_internal(email, payload.symbol, payload.side, payload.mode, extra_reason="Manual trade request.")
-
-
-@app.post("/reset")
-def reset_sandbox(user=Depends(require_user)):
-    email = user["email"]
-    sid = get_session_id(email)
-    new_sid = sid + 1
-    set_session_id(email, new_sid)
-    set_equity(email, START_EQUITY)
-    # Full demo reset — peak and floor both go back to the starting equity baseline.
-    # floor_equity column must also be reset, otherwise the stored floor from a
-    # previous profitable session would persist and confuse the new session's risk display.
-    _reset_floor = round(float(START_EQUITY) * 0.85, 2)
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "UPDATE user_state SET peak_equity=%s, floor_equity=%s WHERE email=%s",
-            (START_EQUITY, _reset_floor, email),
-        )
-        conn.commit()
-    set_ai_restart_lock(email, 0)
-    return {"ok": True, "equity": START_EQUITY, "new_session_id": new_sid}
-
-
-@app.get("/auto/status")
-def auto_status(user=Depends(require_user)):
-    email = user["email"]
-    now_ts = int(time.time())
-    lock_until = get_ai_restart_lock(email)
-    lock_sec = max(0, lock_until - now_ts)
-    with AUTO_LOCK:
-        r = AUTO_RUNNERS.get(email)
-        if not r:
-            _last_stop = None
-            try:
-                with db_conn() as _sc:
-                    _sc_cur = _sc.cursor()
-                    _sc_cur.execute(
-                        "SELECT last_stop_reason FROM user_state WHERE email=%s", (email,)
-                    )
-                    _sc_row = _sc_cur.fetchone()
-                    _last_stop = (_sc_row or {}).get("last_stop_reason")
-            except Exception:
-                pass
-            return {
-                "ok": True, "running": False,
-                "blocked_reason": _last_stop,
-                "restart_locked": lock_sec > 0,
-                "restart_lock_sec": lock_sec,
-            }
-        st = r.status()
-        return {
-            "ok": True, **asdict(st),
-            "restart_locked": lock_sec > 0,
-            "restart_lock_sec": lock_sec,
-        }
-
-
-@app.get("/auto/history")
-def auto_history(user=Depends(require_user), limit: int = Query(default=40, ge=1, le=200)):
-    email = user["email"]
-    with AUTO_LOCK:
-        r = AUTO_RUNNERS.get(email)
-        if r:
-            return {
-                "ok": True,
-                "session_id": r.ai_session_id,
-                "events": list(r.history)[: int(limit)],
-            }
-    # No runner in memory (after redeploy) — read latest open session from DB
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id FROM ai_sessions WHERE email=%s AND ended_at IS NULL "
-            "ORDER BY id DESC LIMIT 1",
-            (email,),
-        )
-        sess = cur.fetchone()
-        session_id = sess["id"] if sess else None
-        if session_id:
-            cur.execute(
-                "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
-                "ORDER BY id DESC LIMIT %s",
-                (email, session_id, int(limit)),
-            )
-        else:
-            cur.execute(
-                "SELECT t, msg FROM ai_logs WHERE email=%s ORDER BY id DESC LIMIT %s",
-                (email, int(limit)),
-            )
-        rows = cur.fetchall()
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "events": [{"t": r["t"], "msg": r["msg"]} for r in rows],
-    }
-
-
-def _classify_log_type(msg: str) -> str:
-    m = msg.upper()
-    if any(x in m for x in ["TRADE OPENED", "TRADE CLOSED", "MID_CANDLE TRADE", "REAL ORDER"]):
-        return "TRADE"
-    if m.startswith("BLOCKED") or m.startswith("EARLY BEAR"):
-        return "BLOCKED"
-    if "MID_CANDLE" in m:
-        return "MID_CANDLE"
-    if m.startswith("HOLDING"):
-        return "HOLDING"
-    if "ERROR" in m or "FAILED" in m:
-        return "ERROR"
-    if any(x in m for x in ["RESET", "MIDNIGHT", "DAILY COUNTERS", "STRICTNESS"]):
-        return "RESET"
-    return "SYSTEM"
-
-
-@app.get("/auto/sessions")
-def auto_sessions(
-    user=Depends(require_user),
-    limit: int = Query(default=20, ge=1, le=100),
-    log_limit: int = Query(default=500, ge=1, le=2000),
-    symbol: Optional[str] = Query(default=None),
-    search: Optional[str] = Query(default=None, max_length=200),
-    log_type: Optional[str] = Query(default=None, max_length=30),
-):
-    """Return AI sessions for this user, newest first, with classified logs.
-    Supports optional symbol filter, keyword search, and log_type filter."""
-    email = user["email"]
-    with db_conn() as conn:
-        cur = conn.cursor()
-        if symbol:
-            cur.execute(
-                "SELECT id, symbol, mode, trade_style, started_at, ended_at, stop_reason "
-                "FROM ai_sessions WHERE email=%s AND UPPER(symbol)=UPPER(%s) ORDER BY id DESC LIMIT %s",
-                (email, symbol.upper().strip(), int(limit)),
-            )
-        else:
-            cur.execute(
-                "SELECT id, symbol, mode, trade_style, started_at, ended_at, stop_reason "
-                "FROM ai_sessions WHERE email=%s ORDER BY id DESC LIMIT %s",
-                (email, int(limit)),
-            )
-        sessions = [dict(r) for r in cur.fetchall()]
-        for sess in sessions:
-            if search:
-                cur.execute(
-                    "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
-                    "AND LOWER(msg) LIKE LOWER(%s) ORDER BY id ASC LIMIT %s",
-                    (email, sess["id"], f"%{search.strip()}%", int(log_limit)),
-                )
-            else:
-                cur.execute(
-                    "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
-                    "ORDER BY id ASC LIMIT %s",
-                    (email, sess["id"], int(log_limit)),
-                )
-            events = [
-                {"t": r["t"], "msg": r["msg"], "log_type": _classify_log_type(r["msg"])}
-                for r in cur.fetchall()
-            ]
-            _VALID_LOG_TYPES = {"ALL", "TRADE", "SIGNAL", "RISK", "RESET", "SYSTEM", "ERROR"}
-            if log_type and log_type.upper() != "ALL":
-                lt = log_type.upper()
-                if lt not in _VALID_LOG_TYPES:
-                    lt = "SYSTEM"
-                events = [e for e in events if e["log_type"] == lt]
-            sess["events"] = events
-            sess["total_events"] = len(events)
-    return {"ok": True, "sessions": sessions}
-
-
-@app.get("/auto/signal")
-def auto_signal(user=Depends(require_user)):
-    """Live 4-layer signal breakdown for the running AutoRunner."""
-    email = user["email"]
-    with AUTO_LOCK:
-        r = AUTO_RUNNERS.get(email)
-        if not r:
-            return {"ok": False, "running": False}
-        return {
-            "ok": True,
-            "running": r.is_running(),
-            "symbol": r.symbol,
-            "mode": r.mode,
-            "signal": r.last_signal,
-            "side": r.last_side,
-            "blocked": r.blocked_reason,
-            "adaptive_strictness": r.adaptive_strictness,
-            "signal_score": r.last_score,
-            "trade_style": r.trade_style,
-            "market_grade": r.market_grade,
-            "pending_trades": r.pending_trades,
-            "breakdown": r.last_breakdown,
-        }
-
-
-@app.post("/auto/start")
-def auto_start(payload: AutoStartIn, user=Depends(require_user)):
-    email = user["email"]
-    symbol = payload.symbol.upper().strip()
-    if not (symbol.endswith("USDT") or symbol.endswith("-USDT")):
-        raise HTTPException(status_code=400, detail="Use symbol like BTCUSDT / ETHUSDT / SOLUSDT")
-    # Mode ceiling is the maximum allowed — user may reduce but never exceed.
-    _mode_max = default_max_trades_per_day(payload.mode)
-    if payload.max_trades_per_day is not None:
-        max_trades = min(int(payload.max_trades_per_day), _mode_max)
-    else:
-        max_trades = _mode_max
-
-    # ── Check 1: Duration-session restart lock ──────────────────────────────
-    now_ts = int(time.time())
-    lock_until = get_ai_restart_lock(email)
-    if lock_until > now_ts:
-        remaining = lock_until - now_ts
-        h, m = remaining // 3600, (remaining % 3600) // 60
-        raise HTTPException(
-            status_code=400,
-            detail=f"AI restart locked for {h}h {m}m — you stopped a duration session early. "
-                   f"This protects your account from impulsive restarts. "
-                   f"Use Reset Sandbox (demo) to clear, or wait until Dubai midnight.",
-        )
-
-    # ── Check 2: Bad-trade daily limit — use mode minimum, not payload value ─
-    # Always enforce the mode's default minimum so the payload can't bypass it.
-    mode_min_stop_after = {"ULTRA_SAFE": 1, "SAFE": 1, "NORMAL": 2, "MINI_ASYM": 2, "AGGRESSIVE": 3}
-    effective_stop_after = max(int(payload.stop_after_bad_trades), mode_min_stop_after.get(payload.mode, 2))
-    try:
-        dubai_midnight = now_dubai().replace(hour=0, minute=0, second=0, microsecond=0)
-        utc_midnight_str = dubai_midnight.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        sid = get_session_id(email)
-        with db_conn() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT SUM(CASE WHEN unreal_pnl_percent < 0 THEN 1 ELSE 0 END) as bad "
-                "FROM trades WHERE email = %s AND time >= %s AND session_id = %s",
-                (email, utc_midnight_str, sid),
-            )
-            row = cur.fetchone()
-        bad_today = int((row or {}).get("bad") or 0)
-        if bad_today >= effective_stop_after:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Daily risk limit reached — {bad_today} bad trades today "
-                       f"(limit: {effective_stop_after} for {payload.mode}). "
-                       f"AI is locked until Dubai midnight to protect your account.",
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        pass  # DB error — allow start, runner will recount
-
-    # Sync real exchange balance into DB before creating runner.
-    # Without this, runner reads DB default ($1,000) for session_start_equity
-    # and floor_equity, even if the real account has a different balance.
-    if REAL_TRADING:
-        try:
-            _pre_bal = get_real_usdt_balance(email, force=True)
-            if _pre_bal is not None:
-                set_equity(email, _pre_bal)
-                # ── Guard: stale demo peak causes instant hard floor on real accounts ──
-                # Problem: user registers on demo branch (START_EQUITY=$1,000), gets
-                # user_state.peak_equity=$1,000. Switches to real branch with $25.
-                # Runner reads peak=$1,000 → floor=$850 → real equity $25 < $850 → instant hard floor.
-                # Fix: if stored peak is 5× or more above the real balance (clearly a different
-                # scale — demo default vs small real account), reset it to the real balance.
-                # We do NOT reset if the peak is close to real balance (might be a legitimate
-                # real-account peak that the user should respect for drawdown protection).
-                try:
-                    with db_conn() as conn:
-                        _gpk_cur = conn.cursor()
-                        _gpk_cur.execute(
-                            "SELECT peak_equity, floor_equity FROM user_state WHERE email=%s", (email,)
-                        )
-                        _gpk_row = _gpk_cur.fetchone()
-                        _gpk_peak = float((_gpk_row or {}).get("peak_equity") or 0)
-                        _gpk_floor = float((_gpk_row or {}).get("floor_equity") or 0)
-                        # 5× threshold: $1,000 peak vs $25 real = 40× → stale demo value.
-                        # Real account that grew from $25 to $30 then fell to $25 = 1.2× → preserved.
-                        _is_stale_demo_peak = _gpk_peak > _pre_bal * 5 and _gpk_peak > 50
-                        if _is_stale_demo_peak:
-                            _corrected_floor = round(_pre_bal * 0.85, 2)
-                            _gpk_cur.execute(
-                                "UPDATE user_state SET peak_equity=%s, floor_equity=%s WHERE email=%s",
-                                (_pre_bal, _corrected_floor, email),
-                            )
-                            conn.commit()
-                            print(
-                                f"[auto-start] REAL peak corrected: demo peak ${_gpk_peak:.2f} "
-                                f"→ real balance ${_pre_bal:.2f} (was causing instant hard floor)"
-                            )
-                except Exception as _gpke:
-                    print(f"[auto-start] real peak guard failed: {_gpke}")
-        except Exception as _bal_err:
-            print(f"[auto-start] real balance pre-sync failed (non-fatal): {_bal_err}")
-
-    # Record starting_capital on the very first AI start — never overwritten after initial set.
-    # This anchors the Situation 1/2/3 logic in the floor-reset endpoint:
-    #   Situation 1 = equity >= starting_capital (profitable overall — easy reset)
-    #   Situation 2 = equity in [50%, 100%) of starting_capital (losses — must type CONFIRM)
-    #   Situation 3 = equity < 50% of starting_capital (heavy loss — contact support)
-    try:
-        with db_conn() as conn:
-            _sc_cur = conn.cursor()
-            _sc_cur.execute("SELECT starting_capital FROM user_state WHERE email=%s", (email,))
-            _sc_row = _sc_cur.fetchone()
-            if _sc_row and float(_sc_row.get("starting_capital") or 0) == 0:
-                _sc_equity = get_equity(email)
-                _sc_cur.execute(
-                    "UPDATE user_state SET starting_capital=%s WHERE email=%s",
-                    (_sc_equity, email),
-                )
-                conn.commit()
-    except Exception as _sce:
-        print(f"[auto-start] starting_capital set failed: {_sce}")
-
-    # ── Engine start queue ────────────────────────────────────────────────────
-    with _ENGINE_START_LOCK:
-        global _last_engine_start_ts
-        _now = time.time()
-        _engine_start_times[:] = [t for t in _engine_start_times if _now - t < 60]
-        _count = len(_engine_start_times)
-        _gap   = _now - _last_engine_start_ts
-
-        if _count >= _MAX_STARTS_PER_MIN:
-            _oldest   = min(_engine_start_times)
-            _retry_in = int(60 - (_now - _oldest)) + 1
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"Engine start queued — {_MAX_STARTS_PER_MIN} engines are starting this minute. "
-                    f"You are position {_count - _MAX_STARTS_PER_MIN + 1} in queue. "
-                    f"Retry in {_retry_in}s."
-                ),
-            )
-        if _gap < _ENGINE_START_GAP:
-            _retry_in = int(_ENGINE_START_GAP - _gap) + 1
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"Engine start queued — system staggers starts to protect stability. "
-                    f"Retry in {_retry_in}s."
-                ),
-            )
-        _engine_start_times.append(_now)
-        _last_engine_start_ts = _now
-
-    try:
-        with AUTO_LOCK:
-            old = AUTO_RUNNERS.get(email)
-            if old:
-                old.stop("Stopped: restarted with new settings.")
-                del AUTO_RUNNERS[email]
-
-            runner = AutoRunner(
-                email=email, symbol=symbol, trade_style=payload.trade_style,
-                mode=payload.mode,
-                max_trades_per_day=int(max_trades),
-                stop_after_bad_trades=int(payload.stop_after_bad_trades),
-                duration_days=int(payload.duration_days),
-                trend_filter=bool(payload.trend_filter),
-                chop_min_sep_pct=float(payload.chop_min_sep_pct),
-            )
-            AUTO_RUNNERS[email] = runner
-            runner.start()
-            _save_runner_state(runner)   # persist so deploy/restart auto-resumes this runner
-    except Exception as _start_err:
-        import traceback as _tb
-        _err_detail = f"Engine start failed for {email} ({symbol}): {_start_err}\n{_tb.format_exc()}"
-        print(f"[auto-start] CRITICAL: {_err_detail}")
-        _tg_alert(
-            f"🚨 *Engine start FAILED* ({symbol})\n"
-            f"User: `{email}`\n"
-            f"Error: `{_start_err}`\n"
-            f"This caused a 500 on /auto/start — engine NOT running."
-        )
-        raise HTTPException(status_code=500, detail=f"Engine failed to start: {_start_err}")
-
-    try:
-        with db_conn() as _clr_conn:
-            _clr_conn.cursor().execute(
-                "UPDATE user_state SET last_stop_reason=NULL WHERE email=%s", (email,)
-            )
-            _clr_conn.commit()
-    except Exception:
-        pass
-
-    email_ai_started(
-        to=email, symbol=symbol, mode=payload.mode, trade_style=payload.trade_style,
-        duration_days=int(payload.duration_days),
-        max_trades=int(max_trades), stop_after_bad=int(payload.stop_after_bad_trades),
-    )
-
-    sp = TRADE_STYLE_PARAMS.get(payload.trade_style, TRADE_STYLE_PARAMS["DAY_TRADE"])
-    return {"ok": True, "running": True, "symbol": symbol,
-            "trade_style": payload.trade_style, "tf": sp["tf"],
-            "interval_sec": sp["interval"], "mode": payload.mode,
-            "max_trades_per_day": int(max_trades)}
-
-
-@app.post("/auto/stop")
-def auto_stop(user=Depends(require_user)):
-    email = user["email"]
-    restart_locked = False
-    lock_sec = 0
-    with AUTO_LOCK:
-        r = AUTO_RUNNERS.get(email)
-        if r:
-            was_duration = r.duration_days > 0
-            r.stop("Stopped by user.")
-            del AUTO_RUNNERS[email]
-            # Duration sessions: lock restarts until Dubai midnight to prevent bypass
-            if was_duration:
-                now_dt = now_dubai()
-                next_midnight = (now_dt + timedelta(days=1)).replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                )
-                lock_until = int(next_midnight.timestamp())
-                set_ai_restart_lock(email, lock_until)
-                lock_sec = max(0, lock_until - int(time.time()))
-                restart_locked = True
-    # Clear persisted state — user intentionally stopped, do NOT resume on next deploy
-    _clear_runner_state(email)
-    return {"ok": True, "running": False, "restart_locked": restart_locked, "restart_lock_sec": lock_sec}
-
-
-@app.post("/auto/reset-strictness")
-def auto_reset_strictness(user=Depends(require_user)):
-    """Reset adaptive_strictness to 1.0x — clears stuck/legacy values from DB and live runner."""
-    email = user["email"]
-    with AUTO_LOCK:
-        r = AUTO_RUNNERS.get(email)
-        if r:
-            r.adaptive_strictness = 1.0
-            r.consecutive_wins = 0
-            r.log("Strictness manually reset to 1.0x by user.")
-            _save_runner_state(r)
-    # Also patch DB directly so it survives restarts
-    try:
-        with db_conn() as conn:
-            cur = conn.cursor()
-            if USING_PG:
-                cur.execute(
-                    "UPDATE ai_runner_state SET adaptive_strictness = 1.0, consecutive_wins = 0 WHERE email = %s",
-                    (email,),
-                )
-            else:
-                cur.execute(
-                    "UPDATE ai_runner_state SET adaptive_strictness = 1.0, consecutive_wins = 0 WHERE email = ?",
-                    (email,),
-                )
-            conn.commit()
-    except Exception as e:
-        print(f"[reset-strictness] DB patch failed: {e}")
-    return {"ok": True, "adaptive_strictness": 1.0, "message": "Strictness reset to 1.0x"}
-
-
-@app.post("/auto/correct-real-trade")
-def auto_correct_real_trade(payload: CorrectTradeIn, user=Depends(require_user)):
-    """
-    Correct trade records when paper simulation diverges from real Bybit P&L.
-
-    Use this when a trade is recorded as SL_HIT / loss but the exchange shows a profit
-    (or vice versa). Finds the N most recent trades for the symbol in the current session,
-    splits real_pnl proportionally by position size, and patches DB + live runner state.
-
-    Also resets bad_trades_today=0 and adaptive_strictness=1.0 when real_pnl > 0.
-
-    Body:
-      symbol      — trading symbol, e.g. "NEAR/USDT:USDT"
-      real_pnl    — total real P&L from exchange for all legs combined ($, positive = profit)
-      num_trades  — 2 for Grade B (T1+T2), 1 for Grade A (default 2)
-      new_outcome — "TP_HIT" or "SL_HIT" (default "TP_HIT")
-    """
-    email = user["email"]
-    symbol = payload.symbol.strip()
-    real_pnl = payload.real_pnl
-    num_trades = max(1, min(payload.num_trades, 5))
-    new_outcome = payload.new_outcome.upper()
-    if new_outcome not in ("TP_HIT", "SL_HIT", "TRAIL_STOP"):
-        raise HTTPException(status_code=400, detail="new_outcome must be TP_HIT, SL_HIT, or TRAIL_STOP")
-
-    # ── Find the N most recent trade records for this symbol in current session ──
-    sid = get_session_id(email)
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, size, unreal_pnl_value, unreal_pnl_percent, reason "
-            "FROM trades WHERE email=%s AND symbol=%s AND session_id=%s "
-            "ORDER BY id DESC LIMIT %s",
-            (email, symbol, int(sid), num_trades),
-        )
-        rows = cur.fetchall()
-
-    if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No recent trades found for {symbol} in current session (session_id={sid})."
-        )
-
-    # ── Split real_pnl proportionally by size across all legs ─────────────────
-    total_size = sum(float(r["size"]) for r in rows)
-    corrections = []
-    for r in rows:
-        frac = float(r["size"]) / total_size if total_size > 0 else 1.0 / len(rows)
-        leg_pnl = round(real_pnl * frac, 4)
-        # For percent: pnl / (size * equity_before) — we don't have equity_before stored
-        # so use the existing percent field's magnitude scaled to the new pnl sign/size
-        # as an approximation; the dollar value is what the frontend displays.
-        old_pct = float(r["unreal_pnl_percent"])
-        new_pct = round(leg_pnl / float(r["size"]) * 100, 4) if float(r["size"]) > 0 else old_pct
-        corrections.append({"id": r["id"], "leg_pnl": leg_pnl, "new_pct": new_pct,
-                             "old_pnl": float(r["unreal_pnl_value"]), "reason": r["reason"]})
-
-    # ── Apply DB corrections ──────────────────────────────────────────────────
-    now_str = now_dubai().strftime("%Y-%m-%d %H:%M:%S")
-    with db_conn() as conn:
-        cur = conn.cursor()
-        for c_item in corrections:
-            correction_note = (
-                f"\n\n[MANUAL CORRECTION {now_str}] "
-                f"Paper: {c_item['old_pnl']:+.4f} → Real: {c_item['leg_pnl']:+.4f} | "
-                f"Outcome corrected to {new_outcome}"
-            )
-            new_reason = (c_item["reason"] or "") + correction_note
-            cur.execute(
-                "UPDATE trades SET unreal_pnl_value=%s, unreal_pnl_percent=%s, reason=%s "
-                "WHERE id=%s",
-                (c_item["leg_pnl"], c_item["new_pct"], new_reason, c_item["id"]),
-            )
-        conn.commit()
-
-    # ── Update live runner state if AI is running ──────────────────────────────
-    runner_updated = False
-    with AUTO_LOCK:
-        r = AUTO_RUNNERS.get(email)
-        if r:
-            if real_pnl > 0:
-                # Trade was actually a WIN — undo the bad-trade penalty
-                r.bad_trades_today = 0
-                r.adaptive_strictness = 1.0
-                r.consecutive_wins = 0
-                r._last_trade_bad = False
-            r.log(
-                f"[MANUAL CORRECTION] {symbol} trade P&L corrected: "
-                f"${real_pnl:+.4f} total ({len(corrections)} leg(s)). "
-                f"bad_trades=0, strictness=1.0"
-            )
-            _save_runner_state(r)
-            runner_updated = True
-
-    # ── Also patch DB strictness/bad_trades in case runner is stopped ─────────
-    if real_pnl > 0:
-        try:
-            with db_conn() as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "UPDATE ai_runner_state SET adaptive_strictness=1.0, "
-                    "consecutive_wins=0, last_trade_bad=0 WHERE email=%s",
-                    (email,),
-                )
-                conn.commit()
-        except Exception as _sde:
-            print(f"[correct-trade] DB strictness patch failed: {_sde}")
-
-    # ── Update peak equity if current balance is a new high ───────────────────
-    current_equity = get_equity(email)
-    update_peak_ath(email, current_equity, current_equity)
-
-    return {
-        "ok": True,
-        "trades_corrected": len(corrections),
-        "symbol": symbol,
-        "real_pnl_total": real_pnl,
-        "legs": [{"trade_id": c["id"], "pnl": c["leg_pnl"], "pnl_pct": c["new_pct"]} for c in corrections],
-        "bad_trades_reset": real_pnl > 0,
-        "strictness_reset": real_pnl > 0,
-        "runner_updated": runner_updated,
-        "peak_equity_updated": True,
-    }
-
-
-@app.post("/auto/reset-floor")
-def auto_reset_floor(payload: FloorResetIn, user=Depends(require_user)):
-    """
-    Hard-floor reset endpoint.
-
-    Call with confirm=False first to get a dry-run status (situation, cooldown, current equity).
-    Call with confirm=True to actually apply the reset.
-
-    Situation 1 — equity >= starting_capital: one-click reset, no extra confirmation.
-    Situation 2 — equity in [50%, 100%) of starting_capital: must type 'CONFIRM'.
-    Situation 3 — equity < 50% of starting_capital: blocked entirely, contact support.
-
-    Cooldown: 3 or more resets within the last 30 days → 7-day cooldown from the most recent reset.
-    After reset: peak resets to current equity, floor = 85% of that, engine is NOT auto-restarted
-    (user clicks Start again with their preferred settings).
-    """
-    email = user["email"]
-    now_ts = time.time()
-    now_str = now_dubai().strftime("%Y-%m-%d %H:%M:%S")
-
-    # ── Read current user_state from DB ─────────────────────────────────────
-    with db_conn() as conn:
-        _rc = conn.cursor()
-        _rc.execute(
-            "SELECT peak_equity, all_time_high, starting_capital, "
-            "floor_reset_count, floor_reset_at FROM user_state WHERE email=%s",
-            (email,),
-        )
-        _row = _rc.fetchone()
-
-    if not _row:
-        raise HTTPException(status_code=400, detail="No user state found. Start the AI first.")
-
-    # Live balance — real exchange for real accounts, DB value for demo
-    current_equity = get_equity(email)
-    starting_capital = float(_row.get("starting_capital") or 0)
-    current_ath = float(_row.get("all_time_high") or 0)
-
-    # Parse the JSON list of prior reset timestamps
-    try:
-        reset_timestamps: List[float] = json.loads(_row.get("floor_reset_at") or "[]")
-    except Exception:
-        reset_timestamps = []
-
-    # Keep only resets from the last 30 days for cooldown calculation
-    thirty_days_ago = now_ts - (30 * 24 * 3600)
-    recent_resets = [t for t in reset_timestamps if t > thirty_days_ago]
-
-    # ── Cooldown check — 3+ resets in 30 days triggers a 7-day lock ────────
-    cooldown_remaining_sec = 0
-    if len(recent_resets) >= 3:
-        most_recent = max(recent_resets)
-        cooldown_until = most_recent + (7 * 24 * 3600)
-        if now_ts < cooldown_until:
-            cooldown_remaining_sec = int(cooldown_until - now_ts)
-
-    # ── Determine situation ──────────────────────────────────────────────────
-    # starting_capital = 0 means the AI was never started (no record), treat as Situation 1.
-    if starting_capital <= 0:
-        situation = 1
-    elif current_equity >= starting_capital:
-        # Equity is at or above what the user started with — profitable overall
-        situation = 1
-    elif current_equity >= starting_capital * 0.50:
-        # Lost money but more than half remains — recoverable with caution
-        situation = 2
-    else:
-        # Lost more than half of starting capital — blocked, manual review needed
-        situation = 3
-
-    # Build dry-run response — always return this info so frontend can show the dialog
-    status = {
-        "ok": True,
-        "situation": situation,
-        "current_equity": round(current_equity, 2),
-        "starting_capital": round(starting_capital, 2),
-        "new_peak_if_reset": round(current_equity, 2),
-        "new_floor_if_reset": round(current_equity * 0.85, 2),
-        "resets_in_30d": len(recent_resets),
-        "cooldown_remaining_sec": cooldown_remaining_sec,
-        "reset_applied": False,
-        "message": "",
-    }
-
-    # ── Dry-run: return status without applying ──────────────────────────────
-    if not payload.confirm:
-        if situation == 1:
-            status["message"] = (
-                f"Situation 1 — your equity (${current_equity:.2f}) is at or above your "
-                f"starting capital (${starting_capital:.2f}). "
-                f"One-click reset available."
-            )
-        elif situation == 2:
-            status["message"] = (
-                f"Situation 2 — your equity (${current_equity:.2f}) is below your starting "
-                f"capital (${starting_capital:.2f}). You must type 'CONFIRM' to proceed."
-            )
-        else:
-            status["message"] = (
-                f"Situation 3 — your equity (${current_equity:.2f}) is below 50% of your "
-                f"starting capital (${starting_capital:.2f}). Reset is blocked. "
-                f"Please contact support."
-            )
-        return status
-
-    # ── Validation before applying ───────────────────────────────────────────
-    if cooldown_remaining_sec > 0:
-        h = cooldown_remaining_sec // 3600
-        m = (cooldown_remaining_sec % 3600) // 60
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Reset cooldown — you have reset the floor 3 times in 30 days. "
-                f"Cooldown expires in {h}h {m}m. "
-                f"This protects your account from repeatedly overriding risk protection."
-            ),
-        )
-
-    if situation == 3:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Floor reset blocked — your equity (${current_equity:.2f}) is below 50% of "
-                f"your starting capital (${starting_capital:.2f}). "
-                f"Please contact support to review your account."
-            ),
-        )
-
-    if situation == 2 and payload.typed_confirm.strip().upper() != "CONFIRM":
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Your equity (${current_equity:.2f}) is below your starting capital "
-                f"(${starting_capital:.2f}). Please type 'CONFIRM' to accept this loss "
-                f"and reset the safety floor."
-            ),
-        )
-
-    # ── Apply the reset ──────────────────────────────────────────────────────
-    new_peak = current_equity
-    new_floor = round(current_equity * 0.85, 2)
-    # all_time_high never goes down — only update if new_peak exceeds it
-    new_ath = max(current_ath, new_peak)
-    updated_resets = recent_resets + [now_ts]  # add this reset to history
-
-    with db_conn() as conn:
-        _ac = conn.cursor()
-        # Write peak AND floor_equity — floor_equity is the persistent floor that survives
-        # runner restarts. We explicitly set it here (not max) because this is an intentional reset.
-        _ac.execute(
-            "UPDATE user_state SET "
-            "peak_equity=%s, all_time_high=%s, floor_equity=%s, "
-            "floor_reset_count=%s, floor_reset_at=%s "
-            "WHERE email=%s",
-            (
-                new_peak, new_ath, new_floor,
-                len(updated_resets),
-                json.dumps(updated_resets),
-                email,
-            ),
-        )
-        # Log the reset permanently in ai_logs so it appears in the user's AI log history
-        sid = get_session_id(email)
-        _ac.execute(
-            "INSERT INTO ai_logs(email, session_id, t, msg) VALUES(%s, %s, %s, %s)",
-            (
-                email, sid, now_str,
-                (
-                    f"FLOOR RESET (Situation {situation}) — "
-                    f"new peak=${new_peak:.2f}, new floor=${new_floor:.2f}, "
-                    f"starting_capital=${starting_capital:.2f}, "
-                    f"resets_in_30d={len(updated_resets)}"
-                ),
-            ),
-        )
-        conn.commit()
-
-    # ── Update live runner in memory if somehow still present ────────────────
-    # Normally the runner has already removed itself when HARD_FLOOR hit,
-    # but we patch in-memory state defensively in case of any race condition.
-    with AUTO_LOCK:
-        _r = AUTO_RUNNERS.get(email)
-    if _r:
-        _r.peak_equity = new_peak
-        _r.floor_equity = new_floor
-        _r.blocked_reason = None
-        _r.log(
-            f"FLOOR RESET applied by user — new peak=${new_peak:.2f}, "
-            f"new floor=${new_floor:.2f} (Situation {situation})"
-        )
-        _save_runner_state(_r)
-
-    status["reset_applied"] = True
-    status["resets_in_30d"] = len(updated_resets)
-    status["message"] = (
-        f"Floor reset applied (Situation {situation}). "
-        f"New peak: ${new_peak:.2f}, new floor: ${new_floor:.2f}. "
-        f"Click Start to resume trading with the new floor."
-    )
-    return status
-
-
-# =========================
-# ADMIN ENDPOINTS
-# =========================
-class AdminSettingsIn(BaseModel):
-    signup_enabled: bool
-    seat_capacity: int
-
-
-@app.get("/admin/status")
-def admin_status(admin=Depends(require_admin)):
-    return {
-        "ok": True, "admin": admin,
-        "signup_enabled": signup_is_enabled(),
-        "seat_capacity": seat_capacity(),
-        "seats_used": seats_used(),
-        "seats_remaining": max(0, seat_capacity() - seats_used()),
-        "auto_runners": list(AUTO_RUNNERS.keys()),
-    }
-
-
-@app.get("/admin/settings")
-def admin_settings(admin=Depends(require_admin)):
-    return {
-        "signup_enabled": signup_is_enabled(),
-        "seat_capacity": seat_capacity(),
-        "seats_used": seats_used(),
-        "seats_remaining": max(0, seat_capacity() - seats_used()),
-    }
-
-
-@app.post("/admin/settings")
-def admin_update_settings(payload: AdminSettingsIn, admin=Depends(require_admin)):
-    sc = int(max(1, min(100000, payload.seat_capacity)))
-    admin_set_setting("signup_enabled", "true" if payload.signup_enabled else "false")
-    admin_set_setting("seat_capacity", str(sc))
-    return {"ok": True, **admin_settings(admin)}
-
-
-@app.post("/admin/stop-all-ai")
-def admin_stop_all_ai(admin=Depends(require_admin)):
-    stopped = []
-    with AUTO_LOCK:
-        for email, runner in list(AUTO_RUNNERS.items()):
-            runner.stop("Stopped by admin.")
-            stopped.append(email)
-            del AUTO_RUNNERS[email]
-    return {"ok": True, "stopped_ai_for": stopped}
-
-
-@app.post("/admin/reset-user")
-def admin_reset_user(email: str, admin=Depends(require_admin)):
-    email = (email or "").strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="email required")
-    ensure_user_state(email)
-    set_equity(email, START_EQUITY)
-    set_session_id(email, get_session_id(email) + 1)
-    return {"ok": True, "reset_user": email, "equity": START_EQUITY}
-
-
-@app.get("/admin/users")
-def admin_users(
-    admin=Depends(require_admin),
-    q: Optional[str] = Query(default=None, max_length=200),
-    limit: int = Query(default=100, ge=1, le=2000),
-):
-    qn = (q or "").strip().lower()
-    with db_conn() as conn:
-        cur = conn.cursor()
-
-        if qn:
-            cur.execute(
-                """
-                SELECT u.email, u.created_at,
-                       COALESCE(s.equity, 0) AS equity,
-                       COALESCE(s.session_id, 0) AS session_id
-                FROM users u
-                LEFT JOIN user_state s ON s.email = u.email
-                WHERE LOWER(u.email) LIKE %s
-                ORDER BY u.created_at DESC
-                LIMIT %s
-                """,
-                (f"%{qn}%", int(limit)),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT u.email, u.created_at,
-                       COALESCE(s.equity, 0) AS equity,
-                       COALESCE(s.session_id, 0) AS session_id
-                FROM users u
-                LEFT JOIN user_state s ON s.email = u.email
-                ORDER BY u.created_at DESC
-                LIMIT %s
-                """,
-                (int(limit),),
-            )
-
-        rows = cur.fetchall()
-        out = []
-        for r in rows:
-            email = r["email"]
-            cur.execute("SELECT 1 FROM exchange_keys WHERE email=%s LIMIT 1", (email,))
-            ex = bool(cur.fetchone())
-            cur.execute("SELECT COUNT(*) AS n FROM trades WHERE email=%s", (email,))
-            tcount = int(cur.fetchone()["n"])
-            with AUTO_LOCK:
-                rr = AUTO_RUNNERS.get(email)
-                running = bool(rr and rr.is_running())
-                # today P&L (Dubai date = UTC+4)
-            dubai_today = (now_dubai()).strftime("%Y-%m-%d")
-            cur.execute(
-                "SELECT COALESCE(SUM(unreal_pnl_value),0) AS pnl FROM trades WHERE email=%s AND time::text LIKE %s",
-                (email, f"{dubai_today}%"),
-            )
-            today_pnl = float(cur.fetchone()["pnl"])
-
-            # win rate
-            cur.execute("SELECT COUNT(*) AS w FROM trades WHERE email=%s AND unreal_pnl_value>=0", (email,))
-            wins = int(cur.fetchone()["w"])
-            win_rate = round(wins / tcount * 100, 1) if tcount else 0.0
-
-            # last active (last trade time)
-            cur.execute("SELECT time FROM trades WHERE email=%s ORDER BY id DESC LIMIT 1", (email,))
-            la_row = cur.fetchone()
-            last_active = str(la_row["time"]) if la_row else None
-
-            # open positions from runner
-            open_positions = 0
-            with AUTO_LOCK:
-                rr2 = AUTO_RUNNERS.get(email)
-                if rr2 and rr2.is_running():
-                    open_positions = len(rr2.pending_trades)
-
-            out.append({
-                "email": email,
-                "created_at": r["created_at"],
-                "equity": float(r["equity"]),
-                "session_id": int(r["session_id"]),
-                "exchange_connected": ex,
-                "trades_count": tcount,
-                "ai_running": running,
-                "today_pnl": round(today_pnl, 2),
-                "win_rate": win_rate,
-                "last_active": last_active,
-                "open_positions": open_positions,
-            })
-
-    return {"ok": True, "users": out}
-
-
-@app.get("/admin/user/{email}")
-def admin_user_details(
-    email: str,
-    admin=Depends(require_admin),
-    trades_limit: int = Query(default=50, ge=1, le=500),
-):
-    email = (email or "").strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="email required")
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-
-        cur.execute("SELECT email, created_at FROM users WHERE email=%s", (email,))
-        u = cur.fetchone()
-        if not u:
-            raise HTTPException(status_code=404, detail="User not found")
-
-        cur.execute("SELECT equity, session_id FROM user_state WHERE email=%s", (email,))
-        st = cur.fetchone()
-        equity = float(st["equity"]) if st else START_EQUITY
-        session_id = int(st["session_id"]) if st else 0
-
-        cur.execute("SELECT exchange, created_at FROM exchange_keys WHERE email=%s", (email,))
-        ex = cur.fetchone()
-
-        cur.execute("SELECT COUNT(*) AS n FROM trades WHERE email=%s", (email,))
-        tcount = int(cur.fetchone()["n"])
-
-        cur.execute("SELECT * FROM trades WHERE email=%s ORDER BY id DESC LIMIT %s", (email, int(trades_limit)))
-        trows = [dict(r) for r in cur.fetchall()]
-
-    with AUTO_LOCK:
-        rr = AUTO_RUNNERS.get(email)
-        running = bool(rr and rr.is_running())
-        auto_status_obj = asdict(rr.status()) if running and rr else None
-
-    return {
-        "ok": True,
-        "user": {"email": u["email"], "created_at": u["created_at"]},
-        "state": {"equity": equity, "session_id": session_id},
-        "exchange": {"connected": bool(ex), "exchange": ex["exchange"] if ex else None, "connected_at": ex["created_at"] if ex else None},
-        "trades": {"count": tcount, "recent": trows},
-        "ai": {"running": running, "status": auto_status_obj},
-    }
-
-
-# =========================
-# ADMIN EXTENDED ENDPOINTS
-# =========================
-
-@app.post("/admin/log-access")
-def admin_log_access(
-    user_email: str,
-    tab: str = "overview",
-    admin=Depends(require_admin),
-):
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO admin_access_log(admin_email, user_email, timestamp, tab_viewed) VALUES(%s,%s,%s,%s)",
-            (admin, user_email, now_utc_str(), tab),
-        )
-        conn.commit()
-    return {"ok": True}
-
-
-@app.get("/admin/access-log")
-def admin_access_log_list(
-    admin=Depends(require_admin),
-    limit: int = Query(default=200, ge=1, le=2000),
-):
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT admin_email, user_email, timestamp, tab_viewed FROM admin_access_log ORDER BY id DESC LIMIT %s",
-            (int(limit),),
-        )
-        rows = [dict(r) for r in cur.fetchall()]
-    return {"ok": True, "log": rows}
-
-
-@app.get("/admin/user/{email}/log")
-def admin_user_log(
-    email: str,
-    admin=Depends(require_admin),
-    limit: int = Query(default=50, ge=1, le=200),
-):
-    email = (email or "").strip().lower()
-    with AUTO_LOCK:
-        rr = AUTO_RUNNERS.get(email)
-        running = bool(rr and rr.is_running())
-
-    with db_conn() as conn:
-        cur = conn.cursor()
-        # Fetch last 20 sessions newest first
-        cur.execute(
-            "SELECT id, symbol, mode, trade_style, started_at, ended_at, stop_reason "
-            "FROM ai_sessions WHERE email=%s ORDER BY id DESC LIMIT 20",
-            (email,),
-        )
-        sessions = [dict(r) for r in cur.fetchall()]
-        # Fetch logs for each session
-        for sess in sessions:
-            cur.execute(
-                "SELECT t, msg FROM ai_logs WHERE email=%s AND session_id=%s "
-                "ORDER BY id ASC LIMIT %s",
-                (email, sess["id"], int(limit)),
-            )
-            sess["events"] = [{"t": r["t"], "msg": r["msg"]} for r in cur.fetchall()]
-
-    return {"ok": True, "running": running, "sessions": sessions}
-
-
-@app.get("/admin/user/{email}/portfolio")
-def admin_user_portfolio(email: str, admin=Depends(require_admin)):
-    import statistics as _st
-    from datetime import timezone as _tz, timedelta as _td
-
-    email = (email or "").strip().lower()
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT * FROM trades WHERE email = %s ORDER BY time ASC", (email,))
-        rows = [dict(r) for r in cur.fetchall()]
-
-    if not rows:
-        return {"empty": True}
-
-    def _parse_dt(s):
-        s = str(s).strip()
-        iso = s if "T" in s else s.replace(" ", "T")
-        if not iso.endswith("Z"):
-            iso += "Z"
-        try:
-            from datetime import datetime as _dt
-            return _dt.fromisoformat(iso.replace("Z", "+00:00"))
-        except Exception:
-            return None
-
-    def _dubai_month(s):
-        dt = _parse_dt(s)
-        if not dt:
-            return "Unknown"
-        dubai = dt + _td(hours=4)
-        return dubai.strftime("%Y-%m")
-
-    pnls = [float(t["unreal_pnl_value"]) for t in rows]
-    total = len(rows)
-    wins = [t for t in rows if float(t["unreal_pnl_value"]) >= 0]
-    losses = [t for t in rows if float(t["unreal_pnl_value"]) < 0]
-    win_rate = len(wins) / total if total else 0
-    total_pnl = sum(pnls)
-
-    first_eq = float(rows[0]["equity_after"]) - pnls[0]
-    eq_curve = [{"time": str(rows[0]["time"]), "equity": round(first_eq, 2)}]
-    for t in rows:
-        eq_curve.append({"time": str(t["time"]), "equity": round(float(t["equity_after"]), 2)})
-
-    peak = eq_curve[0]["equity"]
-    max_dd = 0.0
-    for pt in eq_curve[1:]:
-        if pt["equity"] > peak:
-            peak = pt["equity"]
-        dd = (peak - pt["equity"]) / peak if peak > 0 else 0.0
-        max_dd = max(max_dd, dd)
-
-    monthly: dict = {}
-    for t in rows:
-        m = _dubai_month(str(t["time"]))
-        monthly.setdefault(m, 0.0)
-        monthly[m] += float(t["unreal_pnl_value"])
-
-    best = max(rows, key=lambda t: float(t["unreal_pnl_value"]))
-    worst = min(rows, key=lambda t: float(t["unreal_pnl_value"]))
-
-    return {
-        "empty": False,
-        "total_trades": total,
-        "win_rate": round(win_rate * 100, 1),
-        "total_pnl": round(total_pnl, 2),
-        "max_drawdown_pct": round(max_dd * 100, 2),
-        "eq_curve": eq_curve,
-        "monthly_pnl": [{"month": k, "pnl": round(v, 2)} for k, v in sorted(monthly.items())],
-        "best_trade": {"symbol": best["symbol"], "pnl": round(float(best["unreal_pnl_value"]), 2), "time": str(best["time"])},
-        "worst_trade": {"symbol": worst["symbol"], "pnl": round(float(worst["unreal_pnl_value"]), 2), "time": str(worst["time"])},
-    }
-
-
-@app.get("/admin/user/{email}/notes")
-def admin_get_notes(email: str, admin=Depends(require_admin)):
-    email = (email or "").strip().lower()
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT notes, updated_at, updated_by FROM admin_notes WHERE email=%s", (email,))
-        row = cur.fetchone()
-    if row:
-        return {"ok": True, "notes": row["notes"], "updated_at": row["updated_at"], "updated_by": row["updated_by"]}
-    return {"ok": True, "notes": "", "updated_at": None, "updated_by": None}
-
-
-class AdminNotesIn(BaseModel):
-    notes: str
-
-@app.post("/admin/user/{email}/notes")
-def admin_save_notes(email: str, payload: AdminNotesIn, admin=Depends(require_admin)):
-    email = (email or "").strip().lower()
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """INSERT INTO admin_notes(email, notes, updated_at, updated_by)
-               VALUES(%s,%s,%s,%s)
-               ON CONFLICT(email) DO UPDATE SET notes=EXCLUDED.notes, updated_at=EXCLUDED.updated_at, updated_by=EXCLUDED.updated_by""",
-            (email, payload.notes, now_utc_str(), admin),
-        )
-        conn.commit()
-    return {"ok": True}
-
-
-# =========================
-# ANALYTICS ENDPOINTS (admin only)
-# =========================
-
-def _analytics_win_rate(rows: List[Dict]) -> Dict:
-    """Helper: compute win rate, avg win, avg loss from a list of trade dicts.
-    A trade is a win when unreal_pnl_value > 0 (stored for all closed trades in DB)."""
-    wins   = [float(r.get("unreal_pnl_value") or 0) for r in rows if float(r.get("unreal_pnl_value") or 0) > 0]
-    losses = [float(r.get("unreal_pnl_value") or 0) for r in rows if float(r.get("unreal_pnl_value") or 0) <= 0]
-    total  = len(rows)
-    return {
-        "total":     total,
-        "wins":      len(wins),
-        "losses":    len(losses),
-        "win_rate":  round(len(wins) / total * 100, 1) if total > 0 else 0.0,
-        "avg_win":   round(sum(wins)   / len(wins),   2) if wins   else 0.0,
-        "avg_loss":  round(sum(losses) / len(losses), 2) if losses else 0.0,
-        "total_pnl": round(sum(wins) + sum(losses),   2),
-    }
-
-@app.get("/analytics/overview")
-def analytics_overview(admin=Depends(require_admin)):
-    """Section 1 — overall platform performance across all accounts."""
-    try:
-        with db_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT email, unreal_pnl_value, time, equity_after FROM trades ORDER BY time DESC")
-            all_trades = [dict(r) for r in cur.fetchall()]
-            cur.execute("SELECT COUNT(*) as cnt FROM user_state")
-            user_count = int((cur.fetchone() or {}).get("cnt", 0))
-
-        stats = _analytics_win_rate(all_trades)
-
-        acct_pnl: Dict[str, float] = {}
-        for t in all_trades:
-            em = t.get("email") or "unknown"
-            acct_pnl[em] = round(acct_pnl.get(em, 0.0) + float(t.get("unreal_pnl_value") or 0), 2)
-
-        best_acct  = max(acct_pnl, key=acct_pnl.get) if acct_pnl else None
-        worst_acct = min(acct_pnl, key=acct_pnl.get) if acct_pnl else None
-
-        return {
-            "ok": True,
-            "total_trades":      stats["total"],
-            "combined_win_rate": stats["win_rate"],
-            "avg_win":           stats["avg_win"],
-            "avg_loss":          stats["avg_loss"],
-            "total_pnl":         stats["total_pnl"],
-            "total_accounts":    user_count,
-            "live_running":      len(AUTO_RUNNERS),
-            "best_account":      best_acct,
-            "worst_account":     worst_acct,
-            "best_account_pnl":  round(acct_pnl.get(best_acct,  0), 2) if best_acct  else 0,
-            "worst_account_pnl": round(acct_pnl.get(worst_acct, 0), 2) if worst_acct else 0,
-        }
-    except Exception as _e:
-        print(f"[analytics/overview] error: {_e}")
-        return {"ok": False, "error": str(_e), "total_trades": 0, "combined_win_rate": 0,
-                "avg_win": 0, "avg_loss": 0, "total_pnl": 0, "total_accounts": 0,
-                "live_running": len(AUTO_RUNNERS), "best_account": None, "worst_account": None,
-                "best_account_pnl": 0, "worst_account_pnl": 0}
-
-
-@app.get("/analytics/win-rates")
-def analytics_win_rates(admin=Depends(require_admin)):
-    """Section 2 — win rate by mode and side (using columns that exist in trades table)."""
-    try:
-        with db_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT unreal_pnl_value, mode, side FROM trades")
-            rows = [dict(r) for r in cur.fetchall()]
-
-        def _band(rows_in: List[Dict], key: str, val: str) -> Dict:
-            return _analytics_win_rate([r for r in rows_in if (r.get(key) or "") == val])
-
-        def _lev_band(rows_in: List[Dict], lo: float, hi: float) -> Dict:
-            return _analytics_win_rate([
-                r for r in rows_in
-                if lo <= float(r.get("leverage") or 0) <= hi
-            ])
-
-        return {
-            "ok": True,
-            "by_grade": {
-                "LONG":  _band(rows, "side", "LONG"),
-                "SHORT": _band(rows, "side", "SHORT"),
-            },
-            "by_score": {
-                "ULTRA_SAFE": _band(rows, "mode", "ULTRA_SAFE"),
-                "SAFE":       _band(rows, "mode", "SAFE"),
-                "NORMAL":     _band(rows, "mode", "NORMAL"),
-                "MINI_ASYM":  _band(rows, "mode", "MINI_ASYM"),
-                "AGGRESSIVE": _band(rows, "mode", "AGGRESSIVE"),
-            },
-            "by_leverage": {
-                "Low (1-5×)":  _lev_band(rows, 1, 5),
-                "Mid (6-10×)": _lev_band(rows, 6, 10),
-                "High (11+×)": _lev_band(rows, 11, 999),
-            },
-            "by_session": {},
-        }
-    except Exception as _e:
-        print(f"[analytics/win-rates] error: {_e}")
-        return {"ok": False, "error": str(_e), "by_grade": {}, "by_score": {}, "by_regime": {}, "by_session": {}}
-
-
-@app.get("/analytics/by-coin")
-def analytics_by_coin(admin=Depends(require_admin)):
-    """Section 4 — per-symbol win rate, total PnL, and trade count."""
-    try:
-        with db_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT symbol, unreal_pnl_value FROM trades")
-            rows = [dict(r) for r in cur.fetchall()]
-
-        coins: Dict[str, List[Dict]] = {}
-        for r in rows:
-            sym = (r.get("symbol") or "UNKNOWN").upper()
-            coins.setdefault(sym, []).append(r)
-
-        result = {sym: _analytics_win_rate(coin_rows) for sym, coin_rows in sorted(coins.items())}
-        return {"ok": True, "by_coin": result}
-    except Exception as _e:
-        print(f"[analytics/by-coin] error: {_e}")
-        return {"ok": False, "error": str(_e), "by_coin": {}}
-
-
-@app.get("/analytics/by-regime")
-def analytics_by_regime(admin=Depends(require_admin)):
-    """Signal quality trend — trade count and win rate per day over last 30 days."""
-    try:
-        with db_conn() as conn:
-            cur = conn.cursor()
-            if USING_PG:
-                cur.execute(
-                    "SELECT SUBSTRING(time, 1, 10) AS day, COUNT(*) AS cnt, "
-                    "AVG(CASE WHEN unreal_pnl_value > 0 THEN 1.0 ELSE 0.0 END) AS win_rate "
-                    "FROM trades "
-                    "WHERE LENGTH(time) >= 10 AND SUBSTRING(time, 1, 10) >= "
-                    "TO_CHAR(NOW() - INTERVAL '30 days', 'YYYY-MM-DD') "
-                    "GROUP BY SUBSTRING(time, 1, 10) ORDER BY day ASC"
-                )
-            else:
-                # SQLite fallback — uses strftime and SUBSTR
-                cur.execute(
-                    "SELECT SUBSTR(time, 1, 10) AS day, COUNT(*) AS cnt, "
-                    "AVG(CASE WHEN unreal_pnl_value > 0 THEN 1.0 ELSE 0.0 END) AS win_rate "
-                    "FROM trades "
-                    "WHERE LENGTH(time) >= 10 AND SUBSTR(time, 1, 10) >= "
-                    "strftime('%Y-%m-%d', datetime('now', '-30 days')) "
-                    "GROUP BY SUBSTR(time, 1, 10) ORDER BY day ASC"
-                )
-            rows = [
-                {"day": str(r["day"]), "avg_score": round(float(r["win_rate"] or 0), 3), "count": int(r["cnt"])}
-                for r in cur.fetchall()
-            ]
-        return {"ok": True, "signal_trend": rows}
-    except Exception as _e:
-        print(f"[analytics/by-regime] error: {_e}")
-        return {"ok": False, "error": str(_e), "signal_trend": []}
-
-
-@app.get("/analytics/by-session")
-def analytics_by_session(admin=Depends(require_admin)):
-    """Monthly returns over last 6 months using existing trades columns."""
-    try:
-        with db_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT unreal_pnl_value, time FROM trades")
-            rows = [dict(r) for r in cur.fetchall()]
-
-        monthly: Dict[str, float] = {}
-        for r in rows:
-            t_str = str(r.get("time") or "")
-            if len(t_str) >= 7:
-                month = t_str[:7]
-                monthly[month] = round(monthly.get(month, 0.0) + float(r.get("unreal_pnl_value") or 0), 2)
-        monthly_sorted = [{"month": k, "pnl": v} for k, v in sorted(monthly.items())[-6:]]
-
-        return {"ok": True, "by_style": {}, "monthly_returns": monthly_sorted}
-    except Exception as _e:
-        print(f"[analytics/by-session] error: {_e}")
-        return {"ok": False, "error": str(_e), "by_style": {}, "monthly_returns": []}
-
+# Admin + analytics endpoints moved to routes_admin.py (admin_router)
 
 # =========================
 # STARTUP: RESUME AI RUNNERS
@@ -7529,6 +5458,64 @@ def analytics_by_session(admin=Depends(require_admin)):
 import threading as _threading
 _threading.Thread(target=_resume_runners_on_startup, daemon=True).start()
 _threading.Thread(target=_resume_watchdog, daemon=True).start()
+
+
+def _purge_expired_sessions() -> None:
+    """Delete sessions older than 7 days from the DB on every startup.
+    Prevents indefinite accumulation of stale tokens that can never be
+    used (cookie expired) but still occupy rows and the session cache."""
+    try:
+        cutoff = int(time.time()) - 7 * 24 * 3600
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM sessions WHERE created_at < %s", (cutoff,))
+            conn.commit()
+    except Exception:
+        pass
+
+_threading.Thread(target=_purge_expired_sessions, daemon=True).start()
+
+
+def _exchange_reminder_loop() -> None:
+    """Every 6 hours, check for users with no exchange connected.
+    Send a reminder email once every 3-4 days (345600 seconds) until they connect."""
+    import random as _random
+    while True:
+        try:
+            with db_conn() as _conn:
+                _cur = _conn.cursor()
+                # All users who have never connected an exchange
+                _cur.execute("""
+                    SELECT u.email, COALESCE(us.last_exchange_reminder, 0) AS last_reminder
+                    FROM users u
+                    LEFT JOIN user_state us ON us.email = u.email
+                    WHERE u.email NOT IN (SELECT email FROM exchange_keys WHERE email IS NOT NULL)
+                """)
+                _rows = _cur.fetchall()
+            _now = time.time()
+            # 3–4 day window: 3 days + random 0-24h jitter so not everyone gets email same second
+            _interval = 3 * 86400 + _random.randint(0, 86400)
+            for _row in _rows:
+                _email = _row["email"]
+                _last  = float(_row["last_reminder"] or 0)
+                if _now - _last >= _interval:
+                    try:
+                        email_exchange_not_connected_reminder(_email)
+                        with db_conn() as _uc:
+                            _uc.cursor().execute(
+                                "UPDATE user_state SET last_exchange_reminder=%s WHERE email=%s",
+                                (_now, _email),
+                            )
+                            _uc.commit()
+                    except Exception as _em:
+                        print(f"[exchange-reminder] failed for {_email}: {_em}", flush=True)
+        except Exception as _e:
+            print(f"[exchange-reminder] loop error: {_e}", flush=True)
+        time.sleep(6 * 3600)
+
+
+_threading.Thread(target=_exchange_reminder_loop, daemon=True).start()
+
 
 # ── Deploy/restart notification ───────────────────────────────────────────────
 # Fires on every successful startup so you know the service is alive.

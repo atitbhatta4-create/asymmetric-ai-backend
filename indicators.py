@@ -6,8 +6,10 @@ Safe to import anywhere with zero side effects.
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Dict, List, Optional, Literal
-from config import now_dubai
+from config import now_dubai, DUBAI_TZ
+from coin_params import get_coin_params
 
 RiskMode = Literal["ULTRA_SAFE", "SAFE", "NORMAL", "MINI_ASYM", "AGGRESSIVE"]
 
@@ -47,6 +49,66 @@ def _atr(highs: List[float], lows: List[float], closes: List[float], period: int
     for tr in trs[period:]:
         atr = (atr * (period - 1) + tr) / period
     return atr
+
+
+def _atr_series(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> List[Optional[float]]:
+    """ATR value for every candle — single O(n) pass. Use in simulation loops instead of _atr()."""
+    n = len(closes)
+    result: List[Optional[float]] = [None] * n
+    if n < period + 1:
+        return result
+    trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+           for i in range(1, n)]
+    atr = sum(trs[:period]) / period
+    result[period] = atr
+    for k in range(period, len(trs)):
+        atr = (atr * (period - 1) + trs[k]) / period
+        result[k + 1] = atr
+    return result
+
+
+def _adx_series(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> List[Optional[float]]:
+    """Return ADX value for every candle index in a single O(n) pass.
+    Indices before the warmup period return None.
+    Use this instead of calling _adx() per candle in simulation loops."""
+    n = len(closes)
+    result: List[Optional[float]] = [None] * n
+    if n < period * 2 + 1:
+        return result
+    pdms, ndms, trs = [], [], []
+    for i in range(1, n):
+        hd = highs[i] - highs[i - 1]
+        ld = lows[i - 1] - lows[i]
+        pdms.append(hd if hd > ld and hd > 0 else 0.0)
+        ndms.append(ld if ld > hd and ld > 0 else 0.0)
+        trs.append(max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])))
+
+    def _wilder(s: List[float]) -> List[float]:
+        v = sum(s[:period])
+        out = [v]
+        for x in s[period:]:
+            v = v - v / period + x
+            out.append(v)
+        return out
+
+    s_tr, s_p, s_n = _wilder(trs), _wilder(pdms), _wilder(ndms)
+    dxs = []
+    for i in range(len(s_tr)):
+        pdi = 100 * s_p[i] / s_tr[i] if s_tr[i] else 0
+        ndi = 100 * s_n[i] / s_tr[i] if s_tr[i] else 0
+        dxs.append(100 * abs(pdi - ndi) / (pdi + ndi) if (pdi + ndi) else 0)
+    if len(dxs) < period:
+        return result
+    adx = sum(dxs[:period]) / period
+    adx_list = [adx]
+    for dx in dxs[period:]:
+        adx = (adx * (period - 1) + dx) / period
+        adx_list.append(adx)
+    # Place adx_list values at the tail of result (aligns with most-recent candles)
+    start = n - len(adx_list)
+    for k, val in enumerate(adx_list):
+        result[start + k] = val
+    return result
 
 
 def _adx(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> Optional[float]:
@@ -105,7 +167,7 @@ def _rsi_series(closes: List[float], period: int = 14) -> List[float]:
     return out
 
 
-def _session_quality(trade_style: str) -> tuple:
+def _session_quality(trade_style: str, ts_ms: Optional[int] = None) -> tuple:
     """
     Session quality multiplier — maps real market sessions to Dubai time (UTC+4).
     Higher score = more liquidity = signal threshold easier to meet.
@@ -118,10 +180,16 @@ def _session_quality(trade_style: str) -> tuple:
       16:00–21:00 → London + NY overlap (BEST — peak volume)  → 1.00
       21:00–01:00 → NY session solo                           → 0.92
       01:00–02:00 → NY close / wind-down                      → 0.80
+
+    ts_ms: candle open timestamp in milliseconds. When provided (backtesting),
+           uses the candle's historical time instead of the current real-time clock.
     """
     if trade_style == "SWING":
         return 1.0, "swing"
-    hour = now_dubai().hour
+    if ts_ms is not None:
+        hour = datetime.fromtimestamp(ts_ms / 1000, tz=DUBAI_TZ).hour
+    else:
+        hour = now_dubai().hour
 
     # Dead zone — thin market, wide spreads, low volume
     if 2 <= hour < 6:
@@ -131,7 +199,7 @@ def _session_quality(trade_style: str) -> tuple:
 
     # Asia / Tokyo session — decent crypto liquidity
     if 6 <= hour < 12:
-        return 0.85, f"Asia {hour:02d}:xx"
+        return 0.90, f"Asia {hour:02d}:xx"
 
     # London open — institutions enter, volume spikes, big directional moves
     if 12 <= hour < 16:
@@ -146,7 +214,7 @@ def _session_quality(trade_style: str) -> tuple:
         return 0.92, f"NY {hour:02d}:xx"
 
     # NY close / wind-down (01:00-02:00)
-    return 0.80, f"NY-close {hour:02d}:xx"
+    return 0.85, f"NY-close {hour:02d}:xx"
 
 
 def _ema_spread_trend(ema_fast: List[float], ema_slow: List[float], n: int = 4) -> tuple:
@@ -168,54 +236,292 @@ def _ema_spread_trend(ema_fast: List[float], ema_slow: List[float], n: int = 4) 
     return widening, round(score, 3)
 
 
-def _candle_pattern(klines: List[Dict], side: str) -> tuple:
+def _candle_pattern(
+    klines: List[Dict],
+    side: str,
+    regime: str = "TRENDING",
+    atr_val: float = 0.0,
+) -> tuple:
     """
-    Score the last candle's pattern quality for the given trade direction.
+    Detect candle patterns for the given trade direction.
     Returns (pattern_name: str, score: float 0-1)
-    pin_bar=1.0, engulfing=0.90, momentum=0.75, basic=0.50, against=0.10
+
+    LONG patterns (mirror applies for SHORT):
+      three_white_soldiers  1.00  — 3 consecutive green candles, each higher close & body-open
+      engulfing             0.90  — current green body fully covers prior red body
+      hammer                0.85  — lower wick ≥ 2× body, close in upper 30% of range
+      momentum              0.75  — body ≥ 75% of candle range
+      inside_bar_breakout   0.65  — prior inside bar + current breaks out (TRENDING only)
+      bullish / bearish     0.50  — basic directional close
+      against_trend         0.10  — candle closed against trade direction
+
+    Gates applied inside this function:
+      body < ATR × 0.4  → micro candle → score 0.0
+      RANGING regime    → score × 0.5  (prevents pattern overriding valid ranging block)
     """
     if len(klines) < 2:
-        return "none", 0.3
+        return "none", 0.30
+
     curr = klines[-1]
     prev = klines[-2]
-    body  = abs(curr["close"] - curr["open"])
-    rng   = curr["high"] - curr["low"]
+    body = abs(curr["close"] - curr["open"])
+    rng  = curr["high"] - curr["low"]
+
     if rng < 1e-10:
         return "doji", 0.25
+
+    # ATR minimum size gate — micro candles carry no signal
+    if atr_val > 0 and body < atr_val * 0.4:
+        return "micro", 0.0
+
     body_ratio = body / rng
 
+    def _rg(score: float) -> float:
+        return round(score * 0.5, 3) if regime == "RANGING" else round(score, 3)
+
     if side == "LONG":
+        # 1. Three White Soldiers — 3 green candles, each higher close, each opens in prior body
+        if len(klines) >= 3:
+            c1, c2, c3 = klines[-3], klines[-2], klines[-1]
+            b1 = abs(c1["close"] - c1["open"])
+            b2 = abs(c2["close"] - c2["open"])
+            if (c1["close"] > c1["open"] and c2["close"] > c2["open"] and c3["close"] > c3["open"]
+                    and c2["close"] > c1["close"] and c3["close"] > c2["close"]
+                    and b1 > 1e-10 and b2 > 1e-10
+                    and c2["open"] > c1["open"] and c2["open"] < c1["close"]
+                    and c3["open"] > c2["open"] and c3["open"] < c2["close"]):
+                return "three_white_soldiers", _rg(1.00)
+
+        # 2. Bullish Engulfing — current green body covers prior red body
+        if (curr["close"] > curr["open"] and prev["close"] < prev["open"]
+                and curr["open"] <= prev["close"] and curr["close"] >= prev["open"]):
+            return "engulfing", _rg(0.90)
+
+        # 3. Hammer at support — long lower wick, close in upper 30%
         lower_wick = min(curr["open"], curr["close"]) - curr["low"]
-        # Pin bar: hammer shape — long lower wick, small body, closes bullish
-        if body_ratio < 0.35 and lower_wick > rng * 0.55 and curr["close"] > curr["open"]:
-            return "pin_bar", 1.0
-        # Bullish engulfing: current body covers previous body completely
-        if (curr["close"] > curr["open"] and
-                curr["open"] <= prev["close"] and curr["close"] >= prev["open"]):
-            return "engulfing", 0.90
-        # Strong momentum candle: large bullish body
-        if curr["close"] > curr["open"] and body_ratio > 0.65:
-            return "momentum", 0.75
+        upper_wick = curr["high"] - max(curr["open"], curr["close"])
+        close_pos  = (curr["close"] - curr["low"]) / rng
+        if (curr["close"] > curr["open"] and body > 1e-10
+                and lower_wick >= body * 2.0
+                and upper_wick <= body * 0.5
+                and close_pos >= 0.70):
+            return "hammer", _rg(0.85)
+
+        # 4. Momentum candle — large bullish body, small wicks
+        if curr["close"] > curr["open"] and body_ratio >= 0.75:
+            return "momentum", _rg(0.75)
+
+        # 5. Inside bar breakout (TRENDING / PARABOLIC only)
+        if regime in ("TRENDING", "PARABOLIC") and len(klines) >= 3:
+            c_anchor = klines[-3]
+            was_inside = (prev["high"] < c_anchor["high"] and prev["low"] > c_anchor["low"])
+            if was_inside and curr["close"] > c_anchor["high"] and curr["close"] > curr["open"]:
+                return "inside_bar_breakout", _rg(0.65)
+
         # Basic bullish
         if curr["close"] > curr["open"]:
             return "bullish", 0.50
-    else:
+
+    else:  # SHORT
+        # 1. Three Black Crows
+        if len(klines) >= 3:
+            c1, c2, c3 = klines[-3], klines[-2], klines[-1]
+            b1 = abs(c1["close"] - c1["open"])
+            b2 = abs(c2["close"] - c2["open"])
+            if (c1["close"] < c1["open"] and c2["close"] < c2["open"] and c3["close"] < c3["open"]
+                    and c2["close"] < c1["close"] and c3["close"] < c2["close"]
+                    and b1 > 1e-10 and b2 > 1e-10
+                    and c2["open"] < c1["open"] and c2["open"] > c1["close"]
+                    and c3["open"] < c2["open"] and c3["open"] > c2["close"]):
+                return "three_black_crows", _rg(1.00)
+
+        # 2. Bearish Engulfing
+        if (curr["close"] < curr["open"] and prev["close"] > prev["open"]
+                and curr["open"] >= prev["close"] and curr["close"] <= prev["open"]):
+            return "engulfing", _rg(0.90)
+
+        # 3. Shooting Star — long upper wick, close in lower 30%
         upper_wick = curr["high"] - max(curr["open"], curr["close"])
-        # Shooting star / pin bar bearish
-        if body_ratio < 0.35 and upper_wick > rng * 0.55 and curr["close"] < curr["open"]:
-            return "pin_bar", 1.0
-        # Bearish engulfing
-        if (curr["close"] < curr["open"] and
-                curr["open"] >= prev["close"] and curr["close"] <= prev["open"]):
-            return "engulfing", 0.90
-        # Strong bearish momentum candle
-        if curr["close"] < curr["open"] and body_ratio > 0.65:
-            return "momentum", 0.75
+        lower_wick = min(curr["open"], curr["close"]) - curr["low"]
+        close_pos  = (curr["high"] - curr["close"]) / rng
+        if (curr["close"] < curr["open"] and body > 1e-10
+                and upper_wick >= body * 2.0
+                and lower_wick <= body * 0.5
+                and close_pos >= 0.70):
+            return "shooting_star", _rg(0.85)
+
+        # 4. Momentum bear candle
+        if curr["close"] < curr["open"] and body_ratio >= 0.75:
+            return "momentum", _rg(0.75)
+
+        # 5. Inside bar breakdown (TRENDING / PARABOLIC only)
+        if regime in ("TRENDING", "PARABOLIC") and len(klines) >= 3:
+            c_anchor = klines[-3]
+            was_inside = (prev["high"] < c_anchor["high"] and prev["low"] > c_anchor["low"])
+            if was_inside and curr["close"] < c_anchor["low"] and curr["close"] < curr["open"]:
+                return "inside_bar_breakdown", _rg(0.65)
+
         # Basic bearish
         if curr["close"] < curr["open"]:
             return "bearish", 0.50
 
     return "against_trend", 0.10
+
+
+_PAT_SIZE_MULT: Dict[str, float] = {
+    "three_white_soldiers": 1.00, "three_black_crows":    1.00,
+    "engulfing":            1.00,
+    "hammer":               1.00, "shooting_star":        1.00,
+    "momentum":             0.90,
+    "bullish":              0.80, "bearish":              0.80,
+    "inside_bar_breakout":  0.80, "inside_bar_breakdown": 0.80,
+    "micro":                0.70,
+    "doji":                 0.75, "none":                 0.75,
+}
+_PAT_TRAIL_STRONG = {"three_white_soldiers", "three_black_crows"}
+
+
+def get_pattern_exec_params(
+    klines: List[Dict], side: str, sl_pct: float, atr_pct: float
+) -> tuple:
+    """
+    Returns (size_mult, trail_mult, adj_sl_pct, pat_name) from entry candle pattern.
+    trail_mult: 1.5 for strong patterns, 0.0 = use ADX-based default.
+    Shared by live engine and backtester — zero divergence.
+    """
+    pat_name, _ = _candle_pattern(klines, side)
+    size_mult  = _PAT_SIZE_MULT.get(pat_name, 0.75)
+    trail_mult = 1.5 if pat_name in _PAT_TRAIL_STRONG else 0.0
+
+    adj_sl = sl_pct
+    if pat_name in ("hammer", "shooting_star") and len(klines) >= 1:
+        entry = klines[-1]["close"]
+        if side == "LONG":
+            wick_dist = (entry - klines[-1]["low"]) / entry
+        else:
+            wick_dist = (klines[-1]["high"] - entry) / entry
+        wick_dist = min(wick_dist, atr_pct * 2.0)
+        adj_sl = max(wick_dist, sl_pct * 0.5)
+
+    return size_mult, trail_mult, adj_sl, pat_name
+
+
+def _candle_structure_check(klines: List[Dict], side: str) -> tuple:
+    """
+    Compares the last closed candle's body against the 3–4 prior opposing candles.
+    Catches the "3 red candles then one explosive green" pattern the engine was missing.
+
+    Looks at the 4 candles before klines[-1]:
+      - 3+ oppose trade direction → compute avg opposing body
+      - ratio = last_body / avg_opp_body
+      > 1.5 → EXPLOSIVE_REVERSAL (zero penalty — this is the setup we want)
+      < 0.5 → WEAK_BOUNCE (penalty 0.10 — tiny candle after heavy opposition, low conviction)
+      else  → NEUTRAL
+
+    Returns (label: str, penalty: float)
+    """
+    if len(klines) < 5:
+        return "NEUTRAL", 0.0
+    curr = klines[-1]
+    curr_body = abs(curr["close"] - curr["open"])
+    prior = klines[-5:-1]
+    if side == "LONG":
+        opposing = [k for k in prior if k["close"] < k["open"]]
+    else:
+        opposing = [k for k in prior if k["close"] > k["open"]]
+    if len(opposing) < 3:
+        return "NEUTRAL", 0.0
+    avg_opp_body = sum(abs(k["close"] - k["open"]) for k in opposing) / len(opposing)
+    if avg_opp_body < 1e-10:
+        return "NEUTRAL", 0.0
+    ratio = curr_body / avg_opp_body
+    if ratio > 1.5:
+        return "EXPLOSIVE_REVERSAL", 0.0
+    if ratio < 0.5:
+        return "WEAK_BOUNCE", 0.10
+    return "NEUTRAL", 0.0
+
+
+def _market_structure(klines: List[Dict], side: str) -> tuple:
+    """
+    Detects swing HH/HL (uptrend) or LH/LL (downtrend) from the last 30 candles.
+    Catches trend direction 3-5 candles before EMA crossover — faster signal than EMA alone.
+
+    Pivot rule (lb=2): candle i is a swing high if highs[i] is the maximum in the
+    5-candle window [i-2 .. i+2]. Same for swing lows (minimum).
+    Needs ≥3 swing highs AND ≥3 swing lows to classify; otherwise returns NEUTRAL.
+
+    Returns (label: str, score_adj: float)
+      UPTREND  agrees with side  → +0.05
+      DOWNTREND agrees with side → +0.05
+      Either disagrees with side → -0.05
+      NEUTRAL                   →  0.0
+    """
+    if len(klines) < 10:
+        return "NEUTRAL", 0.0
+
+    window = klines[-30:] if len(klines) >= 30 else klines
+    highs  = [k["high"] for k in window]
+    lows   = [k["low"]  for k in window]
+    n      = len(window)
+    lb     = 2
+
+    swing_highs, swing_lows = [], []
+    for i in range(lb, n - lb):
+        if highs[i] == max(highs[i - lb : i + lb + 1]):
+            swing_highs.append(highs[i])
+        if lows[i] == min(lows[i - lb : i + lb + 1]):
+            swing_lows.append(lows[i])
+
+    if len(swing_highs) < 3 or len(swing_lows) < 3:
+        return "NEUTRAL", 0.0
+
+    sh = swing_highs[-3:]
+    sl = swing_lows[-3:]
+
+    hh = sh[0] < sh[1] < sh[2]
+    hl = sl[0] < sl[1] < sl[2]
+    lh = sh[0] > sh[1] > sh[2]
+    ll = sl[0] > sl[1] > sl[2]
+
+    if hh and hl:
+        label = "UPTREND"
+    elif lh and ll:
+        label = "DOWNTREND"
+    else:
+        label = "NEUTRAL"
+
+    if label == "NEUTRAL":
+        return "NEUTRAL", 0.0
+
+    agrees = (label == "UPTREND" and side == "LONG") or (label == "DOWNTREND" and side == "SHORT")
+    return label, 0.05 if agrees else -0.05
+
+
+def _daily_bias(daily_klines: List[Dict]) -> str:
+    """
+    Daily trend bias from up to 30 daily candles.
+    Price above a rising EMA21 = BULL. Below a falling EMA21 = BEAR. Otherwise NEUTRAL.
+    Returns "BULL" | "BEAR" | "NEUTRAL"
+    """
+    if not daily_klines or len(daily_klines) < 5:
+        return "NEUTRAL"
+
+    closes  = [k["close"] for k in daily_klines]
+    ema21   = _ema(closes, min(21, len(closes) - 1))
+
+    if len(ema21) < 2:
+        return "NEUTRAL"
+
+    price   = closes[-1]
+    slope_n = min(5, len(ema21) - 1)
+    slope   = ema21[-1] - ema21[-1 - slope_n]
+
+    if price > ema21[-1] and slope > 0:
+        return "BULL"
+    if price < ema21[-1] and slope < 0:
+        return "BEAR"
+    return "NEUTRAL"
 
 
 def _rsi_divergence(closes: List[float], rsi_vals: List[float], side: str, n: int = 12) -> tuple:
@@ -322,9 +628,224 @@ def _reversal_signal(klines: List[Dict], rsi: Optional[float], adx: Optional[flo
     }
 
 
+def _bollinger_bands(closes: List[float], period: int = 20, std_dev: float = 2.0) -> tuple:
+    """Returns (upper_bb, middle_bb, lower_bb) for the most recent candle."""
+    if len(closes) < period:
+        return None, None, None
+    window = closes[-period:]
+    middle = sum(window) / period
+    variance = sum((c - middle) ** 2 for c in window) / period
+    std = variance ** 0.5
+    return middle + std_dev * std, middle, middle - std_dev * std
+
+
+def donchian_channel(highs: List[float], lows: List[float], period: int = 20) -> Dict:
+    """
+    Donchian channel — where price sits within its own N-period range.
+
+    Returns:
+        upper    : highest high over last N candles
+        lower    : lowest low over last N candles
+        middle   : midpoint of channel
+        position : 0.0 (at lower) to 1.0 (at upper), based on last close
+        trend    : "UP" | "DOWN" | "RANGING"
+
+    Trend logic (used as regime gate):
+        position > 0.65 → price in upper 35% of channel → UP trend confirmed
+        position < 0.35 → price in lower 35% of channel → DOWN trend confirmed
+        0.35–0.65       → price in middle 30% → RANGING → block entry
+    """
+    if len(highs) < period or len(lows) < period:
+        return {"upper": None, "lower": None, "middle": None, "position": 0.5, "trend": "RANGING"}
+    upper  = max(highs[-period:])
+    lower  = min(lows[-period:])
+    middle = (upper + lower) / 2.0
+    span   = upper - lower
+    last_close = highs[-1]  # use last high as proxy if close not passed
+    position   = (last_close - lower) / span if span > 0 else 0.5
+    if position > 0.65:
+        trend = "UP"
+    elif position < 0.35:
+        trend = "DOWN"
+    else:
+        trend = "RANGING"
+    return {
+        "upper":    round(upper, 6),
+        "lower":    round(lower, 6),
+        "middle":   round(middle, 6),
+        "position": round(position, 3),
+        "trend":    trend,
+    }
+
+
+def donchian_regime_gate(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    side: str,
+    period: int = 20,
+) -> tuple:
+    """
+    Gate for a proposed entry direction using Donchian channel.
+
+    Returns (allowed: bool, reason: str).
+    - LONG  allowed only when Donchian trend = UP (price in upper 35%)
+    - SHORT allowed only when Donchian trend = DOWN (price in lower 35%)
+    - RANGING blocks both directions
+    """
+    if len(highs) < period:
+        return True, ""  # not enough data — don't block
+
+    upper  = max(highs[-period:])
+    lower  = min(lows[-period:])
+    span   = upper - lower
+    pos    = (closes[-1] - lower) / span if span > 0 else 0.5
+
+    if pos > 0.65:
+        dc_trend = "UP"
+    elif pos < 0.35:
+        dc_trend = "DOWN"
+    else:
+        dc_trend = "RANGING"
+
+    if dc_trend == "RANGING":
+        return False, (
+            f"Donchian: price at {pos:.0%} of {period}-bar channel — "
+            f"ranging zone (35–65%). No directional edge."
+        )
+    if side == "LONG" and dc_trend == "DOWN":
+        return False, (
+            f"Donchian: price at {pos:.0%} of {period}-bar channel — "
+            f"downtrend. LONG blocked by regime gate."
+        )
+    if side == "SHORT" and dc_trend == "UP":
+        return False, (
+            f"Donchian: price at {pos:.0%} of {period}-bar channel — "
+            f"uptrend. SHORT blocked by regime gate."
+        )
+    return True, ""
+
+
+def get_4h_trend_direction(candles_4h: List[Dict]) -> str:
+    """
+    Returns 'BULLISH', 'BEARISH', or 'NEUTRAL' based on 4h EMA9 vs EMA21.
+
+    BULLISH:  EMA9 above EMA21 AND EMA9 slope rising (both agree → clear uptrend)
+    BEARISH:  EMA9 below EMA21 AND EMA9 slope falling (both agree → clear downtrend)
+    NEUTRAL:  mixed (EMA9 above but falling, or below but rising) → no clear bias
+
+    Used by MR direction gate: NEUTRAL allows both LONG and SHORT MR to fire.
+    Single implementation shared by live engine and backtester — no divergence.
+    """
+    if len(candles_4h) < 22:
+        return "NEUTRAL"
+    closes    = [k["close"] for k in candles_4h[:-1]]
+    ema9      = _ema(closes,      9)
+    ema21     = _ema(closes,     21)
+    ema9_prev = _ema(closes[:-1], 9)
+    if len(ema9) < 1 or len(ema21) < 1 or len(ema9_prev) < 1:
+        return "NEUTRAL"
+    ema_aligned = ema9[-1]  > ema21[-1]
+    ema_rising  = ema9[-1]  > ema9_prev[-1]
+    if ema_aligned and ema_rising:
+        return "BULLISH"
+    if not ema_aligned and not ema_rising:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
+def _mean_reversion_signal(
+    klines: List[Dict], rsi: Optional[float], adx: Optional[float], atr: Optional[float],
+    trend_4h: str = "NEUTRAL",
+) -> Dict:
+    """
+    Mean Reversion — fires when price touches a Bollinger Band in a ranging market.
+    Complements T16 reversal (extreme RSI bounce): fires at milder RSI, no volume spike required.
+
+    Conditions:
+      1. ADX < 20 (ranging — low trend strength)
+      2. Price at or beyond Bollinger Band (20-period, 2 std dev)
+      3. RSI < 45 for LONG, RSI > 55 for SHORT
+      4. Volume ≥ 0.5× median (market is active, not dead)
+      5. [Optional] trend_4h must not oppose the MR direction — blocks catching falling knives
+         LONG MR blocked if trend_4h == "BEARISH" (selling into 4h downtrend)
+         SHORT MR blocked if trend_4h == "BULLISH" (selling into 4h uptrend)
+         NEUTRAL 4h → both directions allowed
+
+    TP: middle Bollinger Band (20-period SMA), expressed as ATR multiples
+    SL: 1.0× ATR beyond entry (tight — ranging markets don't run far)
+    Grade A only
+    """
+    if rsi is None or adx is None or atr is None or len(klines) < 25:
+        return {"ok": False}
+
+    if adx >= 20:
+        return {"ok": False}
+
+    closes  = [k["close"]  for k in klines]
+    volumes = [k["volume"] for k in klines]
+    price   = closes[-1]
+
+    upper_bb, middle_bb, lower_bb = _bollinger_bands(closes)
+    if upper_bb is None:
+        return {"ok": False}
+
+    long_signal  = price <= lower_bb
+    short_signal = price >= upper_bb
+    if not (long_signal or short_signal):
+        return {"ok": False}
+    side = "LONG" if long_signal else "SHORT"
+
+    # 4h direction gate: block counter-trend MR when 4h has a clear opposing trend.
+    # LONG into 4h BEARISH = catching a falling knife. SHORT into 4h BULLISH = selling strength.
+    # NEUTRAL 4h = no clear bias, both directions allowed.
+    if side == "LONG"  and trend_4h == "BEARISH":
+        return {"ok": False, "blocked": "MR_LONG blocked: 4h bearish — catching falling knife"}
+    if side == "SHORT" and trend_4h == "BULLISH":
+        return {"ok": False, "blocked": "MR_SHORT blocked: 4h bullish — selling into strength"}
+
+    if side == "LONG"  and rsi >= 45:
+        return {"ok": False}
+    if side == "SHORT" and rsi <= 55:
+        return {"ok": False}
+
+    vol_window = sorted(volumes[-22:-2]) if len(volumes) >= 22 else sorted(volumes[:-2])
+    avg_vol   = vol_window[len(vol_window) // 2] if vol_window else 0.0
+    vol_ratio = volumes[-2] / avg_vol if avg_vol > 0 else 0.0
+    if vol_ratio < 0.5:
+        return {"ok": False}
+
+    dist_to_middle = abs(middle_bb - price)
+    tp_atr = min(5.0, max(1.5, dist_to_middle / atr)) if atr > 0 else 2.0
+
+    score = 0.72
+    bb_width  = max(upper_bb - lower_bb, 1e-9)
+    depth_pct = abs(price - (lower_bb if side == "LONG" else upper_bb)) / bb_width
+    score += min(0.05, depth_pct * 0.2)
+    if side == "LONG":
+        score += min(0.05, (45 - rsi) / 100)
+    else:
+        score += min(0.05, (rsi - 55) / 100)
+
+    band_word = "lower" if side == "LONG" else "upper"
+    band_val  = lower_bb if side == "LONG" else upper_bb
+    log_msg = (
+        f"MEAN REVERSION: ADX {adx:.1f} (ranging) + price at {band_word} BB "
+        f"({price:.4f} vs band {band_val:.4f}) + RSI {rsi:.1f} → {side}, "
+        f"TP at middle BB ({middle_bb:.4f}, {tp_atr:.1f}×ATR)"
+    )
+    return {
+        "ok": True, "side": side, "score": round(min(0.82, score), 3),
+        "signal_type": "MEAN_REVERSION", "grade": "A",
+        "sl_atr_override": 1.0, "tp_atr_override": round(tp_atr, 2),
+        "log": log_msg,
+    }
+
+
 def _classify_regime(
     highs: List[float], lows: List[float], closes: List[float],
     adx: Optional[float], atr_pct: float,
+    _atr_slow_pct: Optional[float] = None,
 ) -> Dict:
     """
     Phase 4 — Market regime classifier.
@@ -339,10 +860,12 @@ def _classify_regime(
         spike_ratio : current ATR / 50-candle ATR baseline
         reason   : human-readable explanation
     """
-    # 50-candle ATR as the volatility baseline for this symbol
-    atr_slow = _atr(highs, lows, closes, 50)
-    price    = closes[-1] if closes else 1.0
-    atr_slow_pct = (atr_slow / price) if (atr_slow and price) else 0.0
+    if _atr_slow_pct is not None:
+        atr_slow_pct = _atr_slow_pct
+    else:
+        atr_slow = _atr(highs, lows, closes, 50)
+        price    = closes[-1] if closes else 1.0
+        atr_slow_pct = (atr_slow / price) if (atr_slow and price) else 0.0
 
     spike_ratio = round(atr_pct / atr_slow_pct, 2) if atr_slow_pct > 0 else 1.0
     adx_val     = round(adx or 0.0, 1)
@@ -381,7 +904,7 @@ def _classify_regime(
 
     # ── MARGINAL — weak trend or mildly elevated volatility ─────────────────
     # Still tradeable but requires a stronger signal than normal.
-    # Raise min_score by 0.07 so only the clearest setups fire.
+    # Raise min_score by 0.04 so only the clearest setups fire.
     if (adx is not None and adx < 22) or spike_ratio >= 1.80:
         label = (
             f"ADX {adx_val} — weak trend"
@@ -391,7 +914,7 @@ def _classify_regime(
         return {
             "regime": "MARGINAL",
             "block":  False,
-            "min_score_penalty": 0.07,
+            "min_score_penalty": 0.04,
             "spike_ratio": spike_ratio,
             "adx": adx_val,
             "reason": f"{label}. Requiring stronger signal before entry.",
@@ -413,7 +936,7 @@ MODE_SIGNAL_PARAMS: Dict[str, Dict] = {
     "ULTRA_SAFE": dict(adx_min=28, atr_min=0.003, atr_max=0.020, rsi_min=42, rsi_max=58, pullback_max=0.012, vol_factor=1.40, mom_n=3, min_score=0.75),
     "SAFE":       dict(adx_min=22, atr_min=0.002, atr_max=0.025, rsi_min=40, rsi_max=62, pullback_max=0.015, vol_factor=1.25, mom_n=2, min_score=0.68),
     "NORMAL":     dict(adx_min=18, atr_min=0.002, atr_max=0.030, rsi_min=38, rsi_max=65, pullback_max=0.020, vol_factor=1.15, mom_n=2, min_score=0.62),
-    "MINI_ASYM":  dict(adx_min=16, atr_min=0.001, atr_max=0.035, rsi_min=35, rsi_max=68, pullback_max=0.025, vol_factor=1.05, mom_n=1, min_score=0.63),
+    "MINI_ASYM":  dict(adx_min=20, atr_min=0.001, atr_max=0.035, rsi_min=35, rsi_max=68, pullback_max=0.025, vol_factor=1.05, mom_n=1, min_score=0.63),
     "AGGRESSIVE": dict(adx_min=13, atr_min=0.001, atr_max=0.040, rsi_min=32, rsi_max=70, pullback_max=0.030, vol_factor=0.95, mom_n=1, min_score=0.58),
 }
 
@@ -427,6 +950,17 @@ def _compute_signal_layers(
     mtf_klines: Optional[List[Dict]] = None,
     param_overrides: Optional[Dict] = None,
     enable_t16: bool = True,
+    enable_s4: bool = False,
+    symbol: str = "BTCUSDT",
+    _precomp: Optional[Dict] = None,
+    daily_klines: Optional[List[Dict]] = None,
+    enable_candle_pat: bool = False,
+    candle_ts_ms: Optional[int] = None,
+    weekly_klines: Optional[List[Dict]] = None,
+    enable_weekly_gate: bool = False,
+    enable_mr_4h_gate: bool = False,
+    enable_regime_gate: bool = False,
+    enable_step2_score: bool = False,
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -437,7 +971,7 @@ def _compute_signal_layers(
     # Low-liquidity hours reduce the final score so signals must be stronger.
     # SCALP 02:00-06:00 Dubai returns sess_score=0.0 = hard block (scalping
     # thin markets is bad practice and the math is unfavourable at <0.72×).
-    sess_score, sess_label = _session_quality(trade_style)
+    sess_score, sess_label = _session_quality(trade_style, ts_ms=candle_ts_ms)
     if sess_score == 0.0:
         return {
             "ok": False,
@@ -454,14 +988,29 @@ def _compute_signal_layers(
     lows    = [k["low"]    for k in klines]
     volumes = [k["volume"] for k in klines]
 
-    ema9      = _ema(closes, 9)
-    ema21     = _ema(closes, 21)
-    ema50     = _ema(closes, 50)
-    ema200    = _ema(closes, 200)
-    rsi       = _rsi(closes, 14)
-    rsi_vals  = _rsi_series(closes, 14)   # full series for divergence
-    atr       = _atr(highs, lows, closes, 14)
-    adx       = _adx(highs, lows, closes, 14)
+    if _precomp is not None:
+        # O(1) precomputed lookup — eliminates ~9× O(300) indicator recomputation per candle.
+        # Caller sets _precomp["idx"] = absolute candle index in the full candle array.
+        idx      = _precomp["idx"]
+        ema9     = _precomp["ema9"][max(0, idx - 4):idx + 1]
+        ema21    = _precomp["ema21"][max(0, idx - 4):idx + 1]
+        ema50    = [_precomp["ema50"][idx]]
+        rsi      = _precomp["rsi"][idx]
+        rsi_vals = _precomp["rsi"][max(0, idx - 13):idx + 1]
+        atr      = _precomp["atr14"][idx]
+        adx      = _precomp["adx"][idx]
+        _atr50_v = _precomp["atr50"][idx]
+        _atr_slow_pct_pc = (_atr50_v / closes[-1]) if (_atr50_v and closes[-1]) else None
+    else:
+        ema9      = _ema(closes, 9)
+        ema21     = _ema(closes, 21)
+        ema50     = _ema(closes, 50)
+        ema200    = _ema(closes, 200)
+        rsi       = _rsi(closes, 14)
+        rsi_vals  = _rsi_series(closes, 14)   # full series for divergence
+        atr       = _atr(highs, lows, closes, 14)
+        adx       = _adx(highs, lows, closes, 14)
+        _atr_slow_pct_pc = None
 
     price      = closes[-1]
     atr_pct    = (atr / price) if atr else 0.0
@@ -471,26 +1020,50 @@ def _compute_signal_layers(
     # system would reject. If regime would block AND reversal conditions are met,
     # return the reversal signal instead of BLOCKED.
     _rev = _reversal_signal(klines, rsi, adx, atr) if enable_t16 else {"ok": False}
+    _trend_4h = get_4h_trend_direction(higher_klines or []) if enable_mr_4h_gate else "NEUTRAL"
+    _mr  = _mean_reversion_signal(klines, rsi, adx, atr, trend_4h=_trend_4h)
 
     # ── Phase 4: Regime classification (before any layer scoring) ────────────
-    regime_class = _classify_regime(highs, lows, closes, adx, atr_pct)
-    if regime_class["block"]:
-        if _rev["ok"]:
+    regime_class = _classify_regime(highs, lows, closes, adx, atr_pct, _atr_slow_pct=_atr_slow_pct_pc)
+
+    # ── Regime gate (Step 1) — only trade in TRENDING regime ─────────────────
+    # When enable_regime_gate=True:
+    #   • MARGINAL is promoted to a hard block (normally just raises score bar)
+    #   • Donchian channel confirms direction before any entry is allowed
+    # Default OFF — existing behaviour preserved until backtest validates this.
+    _regime_gate_blocked = False
+    _regime_gate_reason  = ""
+    if enable_regime_gate and regime_class["regime"] == "MARGINAL":
+        _regime_gate_blocked = True
+        _regime_gate_reason  = (
+            f"REGIME_GATE: ADX {regime_class['adx']} — MARGINAL trend blocked. "
+            f"Waiting for ADX > 22 before entry."
+        )
+
+    if regime_class["block"] or _regime_gate_blocked:
+        # Pick the highest-scoring alternative signal (T16 reversal or mean reversion)
+        _alt = max(
+            [r for r in [_rev, _mr] if r.get("ok")],
+            key=lambda r: r["score"],
+            default=None,
+        )
+        if _alt and not _regime_gate_blocked:
             return {
-                "ok": True, "signal": "REVERSAL", "side": _rev["side"],
-                "score": _rev["score"], "grade": "B",
-                "signal_type": "REVERSAL",
-                "sl_atr_override": _rev["sl_atr_override"],
-                "tp_atr_override": _rev["tp_atr_override"],
-                "reversal_log": _rev["log"],
-                "breakdown": {"reversal": _rev["log"]},
+                "ok": True, "signal": _alt["signal_type"], "side": _alt["side"],
+                "score": _alt["score"], "grade": _alt["grade"],
+                "signal_type": _alt["signal_type"],
+                "sl_atr_override": _alt["sl_atr_override"],
+                "tp_atr_override": _alt["tp_atr_override"],
+                "reversal_log": _alt["log"],
+                "breakdown": {"reversal": _alt["log"]},
                 "atr_pct": atr_pct,
                 "market_regime": regime_class["regime"],
                 "adaptive_strictness": adaptive_strictness,
             }
+        _block_reason = _regime_gate_reason if _regime_gate_blocked else f"REGIME_{regime_class['regime']}: {regime_class['reason']}"
         return {
             "ok": False,
-            "blocked": f"REGIME_{regime_class['regime']}: {regime_class['reason']}",
+            "blocked": _block_reason,
             "signal": "BLOCKED", "score": 0.0, "breakdown": {},
             "side": None, "adaptive_strictness": adaptive_strictness,
             "market_regime": regime_class["regime"],
@@ -508,6 +1081,30 @@ def _compute_signal_layers(
 
     # Apply adaptive strictness for MINI_ASYM
     p = MODE_SIGNAL_PARAMS.get(mode, MODE_SIGNAL_PARAMS["NORMAL"]).copy()
+
+    # ── Per-coin parameter overrides ─────────────────────────────────────────
+    # Layered on top of mode params: coin-specific ADX range, score threshold,
+    # ATR bounds, TP/SL geometry, and volume multiplier.  Mode params set the
+    # baseline strictness; coin params tighten or loosen per-asset behaviour.
+    _cp = get_coin_params(symbol)
+    # adx_min: use the HIGHER of mode baseline and coin minimum (both must agree)
+    p["adx_min"]    = max(p["adx_min"],    _cp["adx_min"])
+    # adx_max: hard ceiling — very high ADX means parabolic / exhaustion
+    p["adx_max"]    = _cp["adx_max"]
+    # ATR bounds from coin (coin volatility profile overrides mode defaults)
+    p["atr_min"]    = max(p["atr_min"],    _cp["atr_min_pct"] / 100.0)
+    p["atr_max"]    = min(p["atr_max"],    _cp["atr_max_pct"] / 100.0)
+    # Score threshold: use the HIGHER of mode and coin (stricter wins)
+    p["min_score"]  = max(p["min_score"],  _cp["score_threshold"])
+    # Volume multiplier: coin-specific liquidity profile
+    p["vol_factor"] = max(p["vol_factor"], _cp["volume_confirmation_mult"])
+    # Pullback tolerance: coin-specific EMA proximity requirement
+    p["pullback_max"] = max(p["pullback_max"], _cp["pullback_tolerance_pct"] / 100.0)
+    # Store TP/SL multipliers for use by the caller
+    p["tp_multiplier"] = _cp["tp_multiplier"]
+    p["sl_multiplier"] = _cp["sl_multiplier"]
+    p["ema_distance_max"] = _cp["ema_distance_max_pct"] / 100.0
+
     if param_overrides:
         p.update({k: v for k, v in param_overrides.items() if k in p})
         # Delta keys: optimizer passes offsets, not absolute replacements
@@ -521,7 +1118,7 @@ def _compute_signal_layers(
     # mom_n_add=0 for SCALP: MINI_ASYM already requires 1 candle — adding a 2nd
     # blocks too many valid entries in volatile/recovering markets.
     _style_adj = {
-        "SCALP":     dict(pullback_mult=0.40, mom_n_add=0, rsi_tighten=4,  score_add=0.02),
+        "SCALP":     dict(pullback_mult=0.55, mom_n_add=0, rsi_tighten=4,  score_add=0.02),
         "DAY_TRADE": dict(pullback_mult=0.70, mom_n_add=0, rsi_tighten=2,  score_add=0.02),
         "SWING":     dict(pullback_mult=1.20, mom_n_add=0, rsi_tighten=-3, score_add=0.0),
     }
@@ -547,7 +1144,13 @@ def _compute_signal_layers(
         p["rsi_max"]      = max(50, new_rsi_max)
         p["pullback_max"] = p["pullback_max"] / max(0.5, s)
         p["vol_factor"]   = p["vol_factor"] * s
-        p["min_score"]    = min(0.90, p["min_score"] + (s - 1) * 0.12)
+        # Cap: adaptive strictness may raise min_score by at most 0.07 above base.
+        # Without the cap, 2.50× strictness pushed NEAR to 0.65 + 0.18 = 0.83 — too aggressive.
+        p["min_score"]    = min(0.70, p["min_score"] + (s - 1) * 0.12)
+
+    # ── Step 2: Score floor 0.70 — only entries with strong conviction pass ──
+    if enable_step2_score:
+        p["min_score"] = max(p["min_score"], 0.70)
 
     # Apply MARGINAL regime penalty — raises min_score so only strong signals fire
     p["min_score"] = min(0.92, p["min_score"] + regime_class["min_score_penalty"])
@@ -560,8 +1163,8 @@ def _compute_signal_layers(
     _htf_bear_debug = None
     _htf_bear_triggered = False
     _htf_bear_slope_pct = None
-    if higher_klines and len(higher_klines) >= 55:
-        htf_closes = [k["close"] for k in higher_klines]
+    if higher_klines and len(higher_klines) >= 56:
+        htf_closes = [k["close"] for k in higher_klines[:-1]]
         htf_ema21  = _ema(htf_closes, 21)
         htf_ema50  = _ema(htf_closes, 50)
         htf_bull_cross = htf_ema21[-1] > htf_ema50[-1]
@@ -582,6 +1185,30 @@ def _compute_signal_layers(
         htf_ok   = False
 
     desired_side: Side = "LONG" if htf_bull else "SHORT"
+
+    # ── Weekly trend gate — block LONG normal signals in weekly bear trends ──
+    # Weekly bear flag — computed early so it can raise min_score later (soft filter).
+    # When weekly EMA9 slope is negative, require higher conviction (0.72) instead of
+    # hard-blocking. This preserves exceptional LONG setups in bear markets while
+    # filtering weaker ones. Hard block was rejected: hurt 2021 entries (-$297 vs +$251 saved).
+    _wk_bear = False
+    if enable_weekly_gate and desired_side == "LONG" and weekly_klines and len(weekly_klines) >= 12:
+        _wk_closes = [k["close"] for k in weekly_klines[:-1][-15:]]
+        _wk_ema9   = _ema(_wk_closes, 9)
+        _wk_bear   = len(_wk_ema9) >= 2 and (_wk_ema9[-1] < _wk_ema9[-2])
+
+    # ── Market structure (4h swing HH/HL) + daily bias ───────────────────
+    # Both are soft score adjustments: agree = +0.05, disagree = -0.05, neutral = 0.
+    # daily_klines=None (default) → _db_adj=0.0 — zero regression on all existing callers.
+    _ms_label, _ms_adj = _market_structure(higher_klines[:-1] if higher_klines else [], desired_side)
+    _db_label = _daily_bias(daily_klines or [])
+    _db_adj = (
+         0.05 if (_db_label == "BULL"  and desired_side == "LONG")  else
+        -0.05 if (_db_label == "BULL"  and desired_side == "SHORT") else
+         0.05 if (_db_label == "BEAR"  and desired_side == "SHORT") else
+        -0.05 if (_db_label == "BEAR"  and desired_side == "LONG")  else
+        0.0
+    )
 
     # ── Direction-dependent RSI shift ─────────────────────────────────────
     # LONG setups enter near oversold, so shift window lower.
@@ -650,6 +1277,12 @@ def _compute_signal_layers(
         # Fallback to local EMAs (less reliable) — cap at 0.5
         htf_score = 0.4
 
+    # HTF timeout floor — after 12h+ of HTF blocking, caller passes a floor score
+    # so the filter gradually relaxes rather than blocking indefinitely.
+    _htf_floor = (param_overrides.get("htf_score_floor", 0.0) or 0.0) if param_overrides else 0.0
+    if _htf_floor > 0:
+        htf_score = max(htf_score, _htf_floor)
+
     # local_score = 0.0 when not aligned (was 0.4 — gave free credit even against trend).
     local_score   = 1.0 if local_aligned else 0.0
     ema9_bonus    = 0.20 if ema9_aligned else 0.0
@@ -657,9 +1290,10 @@ def _compute_signal_layers(
     # EMA spread widening = trend accelerating = better entry quality
     spread_widening, spread_score = _ema_spread_trend(ema9, ema21, n=4)
 
-    direction_score = round(min(1.0,
+    direction_score = round(min(1.0, max(0.0,
         htf_score * 0.45 + local_score * 0.25 + ema9_bonus * 0.15 + spread_score * 0.15
-    ), 3)
+        + _ms_adj + _db_adj
+    )), 3)
     # Threshold raised 0.55 → 0.65: requires meaningful local + HTF agreement.
     # At 0.55, HTF alone (0.45) + neutral spread (0.075) = 0.525 could barely pass.
     # At 0.65, you need at least HTF confirmed + local OR HTF + ema9 + good spread.
@@ -676,19 +1310,58 @@ def _compute_signal_layers(
         "local_trend": "BULL" if local_bull else "BEAR",
         "ema9_momentum": "aligned" if ema9_aligned else "not aligned",
         "ema_spread": "widening" if spread_widening else "narrowing",
+        "market_structure": _ms_label, "ms_adj": round(_ms_adj, 2),
+        "daily_bias": _db_label,       "db_adj": round(_db_adj, 2),
         "signal": sig, "side": desired_side,
         "score": direction_score, "ok": direction_score >= _DIR_PASS, "reason": dir_reason,
     }
 
     # ── Layer 3: Entry — pullback + candle pattern + RSI + divergence check ──
+    # ADX-dynamic pullback tolerance — strong trends run far from EMA21
+    # and should not be blocked by a tight distance gate calibrated for ranges.
+    if adx is not None:
+        _adx_pb_floor = (0.15 if adx >= 50 else
+                         0.10 if adx >= 40 else
+                         0.05 if adx >= 30 else
+                         0.03 if adx >= 20 else None)
+        if _adx_pb_floor is not None:
+            p["pullback_max"] = max(p["pullback_max"], _adx_pb_floor)
+
     pb_pct = abs(price - ema21[-1]) / max(1e-9, ema21[-1])
     pullback_score = max(0.0, 1.0 - pb_pct / p["pullback_max"]) if pb_pct <= p["pullback_max"] else 0.0
 
-    # Candle pattern at pullback zone (replaces simple bounce check)
-    pattern_name, pattern_score = _candle_pattern(klines, desired_side)
+    # Candle pattern — full system with regime gate, ATR size gate, coin weight
+    _sym_upper = (symbol or "").upper()
+    if enable_candle_pat:
+        _coin_wt = (1.0 if any(x in _sym_upper for x in ("BTC", "ETH")) else
+                    0.8 if any(x in _sym_upper for x in ("SOL", "BNB", "ADA")) else
+                    0.6)
+        pattern_name, _raw_pat = _candle_pattern(
+            klines, desired_side,
+            regime=regime_class["regime"],
+            atr_val=float(atr) if atr else 0.0,
+        )
+        pattern_score = round(min(1.0, _raw_pat * _coin_wt), 3)
+    else:
+        _coin_wt  = 1.0
+        pattern_name, _raw_pat = _candle_pattern(klines, desired_side)
+        pattern_score = _raw_pat
+
+    # Structure check: was the reversal candle explosive vs a weak bounce?
+    struct_label, struct_penalty = _candle_structure_check(klines, desired_side)
+
+    # ADX-dynamic RSI zone — strong trends keep RSI elevated for many candles.
+    # A fixed zone (e.g. 35–68) blocks every entry when RSI holds above 70 all day.
+    _strong_trend_adx = adx is not None and adx >= 45
+    if adx is not None:
+        if adx >= 45:
+            p["rsi_min"] = min(p["rsi_min"], 35 if desired_side == "LONG" else 20)
+            p["rsi_max"] = max(p["rsi_max"], 80 if desired_side == "LONG" else 65)
+        elif adx >= 30:
+            p["rsi_min"] = min(p["rsi_min"], 33 if desired_side == "LONG" else 28)
+            p["rsi_max"] = max(p["rsi_max"], 72 if desired_side == "LONG" else 67)
 
     # RSI: closer to center of the range = better entry quality
-    print(f"RSI check: value={rsi:.1f} zone={p['rsi_min']}-{p['rsi_max']} mode={mode} style={trade_style} direction={desired_side}", flush=True)
     rsi_in_range = rsi is not None and p["rsi_min"] <= rsi <= p["rsi_max"]
     if rsi is not None and rsi_in_range:
         mid  = (p["rsi_min"] + p["rsi_max"]) / 2.0
@@ -697,11 +1370,14 @@ def _compute_signal_layers(
     else:
         rsi_score = 0.0
 
-    # RSI divergence — price extreme not confirmed by RSI = weakening setup
+    # RSI divergence — price extreme not confirmed by RSI = weakening setup.
+    # In a strong trend (ADX ≥ 45) RSI divergence is expected — price leads and
+    # RSI lags. Applying the penalty here would block every entry in a sustained move.
     div_detected, div_penalty = _rsi_divergence(closes, rsi_vals, desired_side, n=12)
+    _eff_div_penalty = 0.0 if _strong_trend_adx else div_penalty
 
     entry_score = round(
-        max(0.0, pullback_score * 0.35 + pattern_score * 0.35 + rsi_score * 0.30 - div_penalty),
+        max(0.0, pullback_score * 0.35 + pattern_score * 0.35 + rsi_score * 0.30 - _eff_div_penalty - struct_penalty),
         3,
     )
     # against_trend: last candle closed against the trade direction at the entry zone.
@@ -710,11 +1386,13 @@ def _compute_signal_layers(
     # the entry is not ready yet. Wait for a bullish close to confirm the bounce.
     against_trend_candle = pattern_name == "against_trend"
     ent_reason = (
-        f"RSI divergence — price at new extreme but RSI disagrees, trend may be weakening" if div_detected
+        f"RSI divergence noted — ignored in strong trend (ADX {adx:.0f}≥45)" if (div_detected and _strong_trend_adx)
+        else f"RSI divergence — price at new extreme but RSI disagrees, trend may be weakening" if div_detected
         else f"Price {pb_pct*100:.1f}% from EMA21 — need <{p['pullback_max']*100:.1f}% to enter" if pullback_score == 0
         else f"RSI {rsi:.0f} outside entry zone {p['rsi_min']}–{p['rsi_max']}" if not rsi_in_range
         else f"Candle closed against trade direction — wait for {'bullish' if desired_side == 'LONG' else 'bearish'} close to confirm bounce" if against_trend_candle
         else f"Candle pattern weak ({pattern_name}) — wait for pin bar or engulfing at EMA21" if pattern_score < 0.40
+        else f"Weak bounce — reversal candle body too small vs prior opposing move" if struct_label == "WEAK_BOUNCE"
         else ""
     )
     breakdown_entry = {
@@ -722,6 +1400,8 @@ def _compute_signal_layers(
         "pullback_max_pct":   round(p["pullback_max"] * 100, 1),
         "candle_pattern":     pattern_name,
         "pattern_score":      round(pattern_score, 2),
+        "candle_structure":   struct_label,
+        "structure_penalty":  round(struct_penalty, 2),
         "rsi":                round(rsi or 0, 1),
         "rsi_range":          f"{p['rsi_min']}–{p['rsi_max']}",
         "rsi_divergence":     div_detected,
@@ -774,15 +1454,66 @@ def _compute_signal_layers(
     # sess_score scales the total: 1.0 = full, 0.60 = needs 67% stronger signal
     # This means a news spike (high ATR, high ADX, high volume) can still
     # fire at 3am — but a mediocre setup in thin hours gets filtered out.
+
+    # S4 — Dynamic weights by regime (enable_s4=True, backtest-gated before live deploy)
+    # TRENDING: regime carries less new info (already high); direction+entry matter most.
+    # MARGINAL: regime score reveals HOW borderline the market is — high predictive value.
+    #           Momentum confirmation becomes critical to justify trading near the edge.
+    # Fixed weights remain default until backtester confirms improvement over baseline.
+    _regime_type = regime_class["regime"]
+    if enable_s4 and _regime_type == "TRENDING":
+        _w = {"regime": 0.15, "direction": 0.35, "entry": 0.35, "momentum": 0.15}
+    elif enable_s4 and _regime_type == "MARGINAL":
+        _w = {"regime": 0.30, "direction": 0.25, "entry": 0.25, "momentum": 0.20}
+    else:
+        _w = {"regime": 0.25, "direction": 0.30, "entry": 0.30, "momentum": 0.15}
+
     raw_score = (
-        regime_score    * 0.25 +
-        direction_score * 0.30 +
-        entry_score     * 0.30 +
-        momentum_score  * 0.15
+        regime_score    * _w["regime"] +
+        direction_score * _w["direction"] +
+        entry_score     * _w["entry"] +
+        momentum_score  * _w["momentum"]
     )
     total_score = round(raw_score * sess_score, 3)
-    min_score = p.get("min_score", 0.62)
-    breakdown["session"] = {"label": sess_label, "quality": round(sess_score, 2), "raw_score": round(raw_score, 3), "ok": True, "reason": ""}
+
+    # Strong trend override — candle pattern AND score both confirm high conviction.
+    # Extends pullback timeout to 6 candles even without ADX ≥ 45.
+    # Catches near-threshold days where pattern pushes score over 0.80 (NEAR 14% day scenario).
+    _strong_pattern = _raw_pat >= 0.90 and _coin_wt >= 0.8
+    strong_trend_override = total_score >= 0.80 and _strong_pattern
+
+    _base_min_score = p.get("min_score", 0.62)
+    min_score = _base_min_score
+
+    # Asia / overnight session (00:00–08:00 Dubai): raise floor slightly.
+    # Capped at 0.70 (was 0.78 — too aggressive, blocked valid setups for hours).
+    if candle_ts_ms is not None:
+        _dubai_hour = datetime.fromtimestamp(candle_ts_ms / 1000, tz=DUBAI_TZ).hour
+    else:
+        _dubai_hour = now_dubai().hour
+    _asia_floor = 0 <= _dubai_hour < 8
+    if _asia_floor:
+        min_score = max(min_score, 0.70)
+    if _wk_bear:
+        min_score = max(min_score, 0.72)
+
+    # Threshold source — logged so ops can see exactly why the threshold is what it is.
+    _thresh_source = (
+        "weekly_bear"                   if _wk_bear and min_score >= 0.72 else
+        "asia_floor"                    if _asia_floor and min_score > _base_min_score else
+        f"adaptive_x{adaptive_strictness:.2f}" if (adaptive_strictness > 1.0 and mode == "MINI_ASYM") else
+        "coin_param"                    if _base_min_score > MODE_SIGNAL_PARAMS.get(mode, {}).get("min_score", 0) else
+        "base"
+    )
+
+    breakdown["session"] = {
+        "label": sess_label, "quality": round(sess_score, 2),
+        "raw_score": round(raw_score, 3), "ok": True, "reason": "",
+        "asia_grade_a_floor": _asia_floor,
+        "effective_min_score": round(min_score, 2),
+        "threshold_source": _thresh_source,
+    }
+    breakdown["weights"] = {**_w, "s4_active": enable_s4, "regime_type": _regime_type, "ok": True}
 
     # Market grade for trades that FIRE (ok=True path only):
     # A = high conviction (≥0.78) → full position
@@ -828,10 +1559,21 @@ def _compute_signal_layers(
         "reason": "" if mtf_confirmed else "15m not confirmed — size reduced 15% for lower conviction",
     }
 
+    # ── Donchian direction gate (Step 1) ─────────────────────────────────────
+    # Only runs when enable_regime_gate=True. Checks that price is in the
+    # upper 35% (LONG) or lower 35% (SHORT) of its 20-bar channel.
+    # Prevents entries when price is stuck in the middle of a range.
+    if enable_regime_gate:
+        _dc_ok, _dc_reason = donchian_regime_gate(highs, lows, closes, desired_side, period=20)
+        breakdown["donchian"] = {"ok": _dc_ok, "reason": _dc_reason}
+    else:
+        breakdown["donchian"] = {"ok": True, "reason": ""}
+
     failed = [k for k, v in breakdown.items() if not v.get("ok") and k != "mtf_15m"]
-    if failed or total_score < min_score:
+    _score_below = round(total_score, 4) < round(min_score, 4)
+    if failed or _score_below:
         reasons = " | ".join(breakdown[k]["reason"] for k in failed if breakdown[k].get("reason"))
-        if total_score < min_score and not failed:
+        if _score_below and not failed:
             reasons = f"Signal quality {total_score:.2f} below threshold {min_score:.2f} — setup not strong enough"
         return {
             "ok": False,
@@ -858,5 +1600,262 @@ def _compute_signal_layers(
         "htf_bear_slope_pct": _htf_bear_slope_pct,
         "mtf_confirmed": mtf_confirmed,
         "mtf_size_mult": mtf_size_mult,
+        "strong_trend_override": strong_trend_override,
+        "candle_pattern": pattern_name,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHANGE 4 — Three-state market regime detector
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_market_regime(
+    btc_weekly_candles: List[Dict],
+    current_coin_adx: float,
+    is_parabolic: bool = False,
+    ranging_threshold: float = 15.0,
+) -> tuple:
+    """
+    Classify the global crypto market into one of three regimes using
+    weekly BTC candles and the current coin's ADX.
+
+    Returns:
+        (regime: str, new_is_parabolic: bool)
+
+    regime values:
+        "RANGING"   — ADX too low; sideways market, no trades.
+        "TRENDING"  — Normal directional conditions.
+        "PARABOLIC" — BTC well above 200-week EMA + strong ADX.
+                      Aggressive long-only mode, no ADX ceiling.
+
+    Hysteresis thresholds:
+        Enter PARABOLIC : BTC > 1.55× 200w EMA  AND  ADX > 40
+        Exit  PARABOLIC : BTC < 1.40× 200w EMA  (prevents whipsaw)
+
+    State (is_parabolic) must be stored on the caller (AutoRunner) and
+    passed in each call — never use a function attribute for shared state.
+
+    ranging_threshold: style-specific ADX floor below which market is too choppy.
+        DAY_TRADE=12, SWING=15, SCALP=18. Passed from STYLE_CONFIG.
+    """
+    if current_coin_adx is not None and current_coin_adx < ranging_threshold:
+        return "RANGING", False
+
+    if len(btc_weekly_candles) < 20:
+        return "TRENDING", is_parabolic
+
+    btc_closes = [c["close"] for c in btc_weekly_candles]
+    ema_period = min(200, len(btc_closes) - 1)
+    btc_long_ema_series = _ema(btc_closes, ema_period)
+    if not btc_long_ema_series:
+        return "TRENDING", is_parabolic
+
+    btc_price    = btc_closes[-1]
+    btc_long_ema = btc_long_ema_series[-1]
+    if btc_long_ema <= 0:
+        return "TRENDING", is_parabolic
+
+    ratio = btc_price / btc_long_ema
+
+    if is_parabolic:
+        # Already parabolic — stay until BTC drops below exit threshold
+        if ratio < 1.40:
+            return "TRENDING", False
+        return "PARABOLIC", True
+    else:
+        # Not parabolic — enter only on strong breakout above 200w EMA
+        if ratio > 1.55 and current_coin_adx is not None and current_coin_adx > 40:
+            return "PARABOLIC", True
+        return "TRENDING", False
+
+
+def check_weekly_trend(btc_weekly_candles: List[Dict]) -> str:
+    """
+    Weekly BTC trend direction for SWING trades.
+
+    Both the price position AND EMA slope must agree.
+
+    Returns:
+        "BULLISH"       — price above EMA21 and EMA21 rising → LONG only
+        "BEARISH"       — price below EMA21 and EMA21 falling → SHORT only
+        "TRANSITIONING" — disagreement → block SWING entries
+    """
+    if len(btc_weekly_candles) < 22:
+        return "TRANSITIONING"
+
+    btc_closes = [c["close"] for c in btc_weekly_candles]
+    ema21_series = _ema(btc_closes, 21)
+    if len(ema21_series) < 2:
+        return "TRANSITIONING"
+
+    price_above_ema = btc_closes[-1] > ema21_series[-1]
+    ema_rising      = ema21_series[-1] > ema21_series[-2]
+
+    if price_above_ema and ema_rising:
+        return "BULLISH"
+    if not price_above_ema and not ema_rising:
+        return "BEARISH"
+    return "TRANSITIONING"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHANGE 2 — Pullback entry system
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def check_pullback_entry(
+    candles: List[Dict],
+    signal_direction: str,
+    coin_params: dict,
+    regime: str,
+    candles_since_signal: int,
+    trade_style: str = "DAY_TRADE",
+    enable_fix3: bool = False,
+    strong_trend_override: bool = False,
+) -> str:
+    """
+    After a signal fires, wait for price to pull back to EMA9/EMA21
+    before entering.  Prevents chasing extended candles.
+
+    Returns:
+        "ENTER"              — pullback complete, confirmed bounce, enter now
+        "WAIT"               — still waiting for pullback
+        "TIMEOUT"            — too many candles elapsed, cancel signal
+        "IMMEDIATE"          — PARABOLIC regime, enter on signal without waiting
+        "ENTER_STRONG_TREND" — ADX ≥ 45 and timeout reached; enter without pullback
+                               (caller uses wider 2×ATR SL to compensate)
+    """
+    if regime == "PARABOLIC":
+        return "IMMEDIATE"
+
+    # Compute current ADX to detect a very strong trend.
+    # In strong trends price does not pull back — waiting for EMA9 touch causes TIMEOUT
+    # on every candle, missing the entire move.
+    _highs  = [c["high"]  for c in candles]
+    _lows   = [c["low"]   for c in candles]
+    _closes = [c["close"] for c in candles]
+    _adx_val = _adx(_highs, _lows, _closes, 14) if len(candles) >= 28 else None
+    _strong_trend = _adx_val is not None and _adx_val >= 45
+
+    # Strong trend: extend timeout to 6 candles.
+    # Also triggered by strong_trend_override (pattern + score ≥ 0.80) even without ADX ≥ 45.
+    if _strong_trend or strong_trend_override:
+        timeout = 6
+    elif trade_style == "DAY_TRADE":
+        timeout = 3
+    else:
+        timeout = 5
+
+    if candles_since_signal >= timeout:
+        if _strong_trend:
+            # Price has not pulled back in 6 candles — trend is very strong.
+            # Enter without pullback; caller applies 2×ATR SL for extra room.
+            return "ENTER_STRONG_TREND"
+        return "TIMEOUT"
+
+    closes = [c["close"] for c in candles]
+    ema9_series  = _ema(closes, 9)
+    ema21_series = _ema(closes, 21)
+    if not ema9_series or not ema21_series:
+        return "WAIT"
+
+    ema9  = ema9_series[-1]
+    ema21 = ema21_series[-1]
+    price = closes[-1]
+    tol   = coin_params.get("pullback_tolerance_pct", 0.6) / 100.0
+
+    last_candle = candles[-1]
+    bullish_close = last_candle["close"] > last_candle["open"]
+    bearish_close = last_candle["close"] < last_candle["open"]
+
+    if signal_direction == "LONG":
+        # In uptrend EMA9 > EMA21; wait for price to dip toward EMA9 support
+        support_ema = max(ema9, ema21)
+        distance    = (price - support_ema) / support_ema if support_ema > 0 else 1.0
+        if distance <= tol and bullish_close:
+            return "ENTER"
+
+    elif signal_direction == "SHORT":
+        # In downtrend EMA9 < EMA21; wait for price to bounce toward EMA9 resistance
+        resist_ema = min(ema9, ema21)
+        distance   = (resist_ema - price) / price if price > 0 else 1.0
+        if distance <= tol and bearish_close:
+            return "ENTER"
+
+    return "WAIT"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHANGE 3 — Hour-of-day volume confirmation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def check_volume_hour_confirmed(
+    candles: List[Dict],
+    coin_params: dict,
+) -> tuple:
+    """
+    Volume on the signal candle must exceed the average volume for the
+    same UTC hour across the last 20 occurrences of that hour.
+
+    Prevents false signals during thin off-hours when even small orders
+    can produce inflated volume-ratio readings on a simple 20-candle average.
+
+    Returns:
+        (confirmed: bool, current_vol: float, required_vol: float)
+    """
+    if len(candles) < 3:
+        return True, 0.0, 0.0
+
+    # Use the last completed candle (index -2) to avoid partial-volume bias
+    signal_candle  = candles[-2]
+    current_volume = signal_candle.get("volume", 0.0)
+
+    # UTC hour of the signal candle
+    ts = signal_candle.get("t") or signal_candle.get("timestamp")
+    try:
+        from datetime import datetime, timezone
+        if isinstance(ts, (int, float)):
+            # millisecond timestamp
+            dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+        else:
+            dt = datetime.fromisoformat(str(ts)).replace(tzinfo=timezone.utc)
+        signal_hour = dt.hour
+    except Exception:
+        # Fallback: no hour filter, use simple 20-candle average
+        vols = [c.get("volume", 0.0) for c in candles[-22:-2] if c.get("volume")]
+        avg  = sum(vols) / len(vols) if vols else 0.0
+        req  = avg * coin_params.get("volume_confirmation_mult", 1.2)
+        return current_volume >= req, current_volume, req
+
+    # Find last 20 completed candles at the same UTC hour
+    same_hour = [
+        c for c in candles[-202:-2]
+        if _candle_hour_utc(c) == signal_hour and c.get("volume", 0.0) > 0
+    ][-20:]
+
+    if len(same_hour) < 5:
+        # Not enough history for this hour — fall back to 20-candle median
+        vols = sorted(c.get("volume", 0.0) for c in candles[-22:-2] if c.get("volume"))
+        avg  = vols[len(vols) // 2] if vols else 0.0
+    else:
+        # Trim top 20% to exclude news-event spikes that inflate the baseline
+        vols = sorted(c["volume"] for c in same_hour)
+        trim_count = max(1, len(vols) // 5)
+        trimmed = vols[:-trim_count]
+        avg = sum(trimmed) / len(trimmed)
+
+    required_mult = coin_params.get("volume_confirmation_mult", 1.2)
+    required      = avg * required_mult
+    return current_volume >= required, current_volume, required
+
+
+def _candle_hour_utc(candle: dict) -> int:
+    """Extract UTC hour from a candle's timestamp field."""
+    ts = candle.get("t") or candle.get("timestamp")
+    try:
+        from datetime import datetime, timezone
+        if isinstance(ts, (int, float)):
+            return datetime.fromtimestamp(ts / 1000, tz=timezone.utc).hour
+        return datetime.fromisoformat(str(ts)).replace(tzinfo=timezone.utc).hour
+    except Exception:
+        return -1
 

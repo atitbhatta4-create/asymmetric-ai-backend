@@ -10,13 +10,12 @@ Wire up in main.py:
 """
 from __future__ import annotations
 
-import os
-import time
-from typing import Dict, List, Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
+from auth_helpers import require_user as _require_user, require_admin as _require_admin
 from backtester import (
     compare_runs,
     get_run,
@@ -26,42 +25,6 @@ from backtester import (
 from database import db_conn
 
 backtest_router = APIRouter(prefix="/backtest", tags=["backtest"])
-
-# ── Auth (standalone, no import from main.py to avoid circular imports) ────────
-_ADMIN_EMAILS = set(
-    e.strip().lower()
-    for e in os.getenv("ADMIN_EMAILS", "admin@demo.com").split(",")
-    if e.strip()
-)
-_SESSION_CACHE: Dict[str, tuple] = {}
-_SESSION_TTL   = 300  # 5 minutes
-
-
-def _require_user(session: Optional[str] = Cookie(default=None)) -> Dict:
-    if not session:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    now = time.time()
-    cached = _SESSION_CACHE.get(session)
-    if cached:
-        email, ts = cached
-        if now - ts < _SESSION_TTL:
-            return {"email": email}
-    with db_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT email FROM sessions WHERE token = %s", (session,))
-        row = cur.fetchone()
-    if not row:
-        _SESSION_CACHE.pop(session, None)
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    _SESSION_CACHE[session] = (row["email"], now)
-    return {"email": row["email"]}
-
-
-def _require_admin(user=Depends(_require_user)) -> str:
-    email = user["email"].strip().lower()
-    if email not in _ADMIN_EMAILS:
-        raise HTTPException(status_code=403, detail="Admin access only")
-    return email
 
 
 # ── Pydantic models ────────────────────────────────────────────────────────────
@@ -75,6 +38,7 @@ class BacktestRunIn(BaseModel):
     start_equity: float = Field(1000.0, ge=100, le=1_000_000)
     enable_t16:   bool  = Field(True,  description="T16 Reversal Detection (choppy-market entries)")
     enable_t18:   bool  = Field(True,  description="T18 Momentum Scaling (scale in at +1.5× / +3× ATR)")
+    enable_s4:    bool  = Field(False, description="S4 Dynamic Signal Weights by regime (TRENDING vs MARGINAL)")
 
 
 class CompareIn(BaseModel):
@@ -101,6 +65,7 @@ def backtest_run(payload: BacktestRunIn, admin: str = Depends(_require_admin)):
             start_equity = payload.start_equity,
             enable_t16   = payload.enable_t16,
             enable_t18   = payload.enable_t18,
+            enable_s4    = payload.enable_s4,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
