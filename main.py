@@ -107,7 +107,7 @@ ENABLE_T18          = False
 ENABLE_REGIME_GATE  = False  # Step 1: set True only after backtest passes
 ENABLE_E2           = False  # Step 8: set True only after backtest passes
 ENABLE_STEP2_SCORE  = False  # Step 2: set True only after backtest passes
-ENABLE_GRADE_B_ALL  = False  # Option 3: all trades use Grade B T1/T2 exits regardless of signal grade
+ENABLE_GRADE_B_ALL  = True   # Option 3: all trades use Grade B T1/T2 exits regardless of signal grade
 ENABLE_GRID_MODULE  = False  # Step 4: ranging-only grid entries (Donchian channel, breakout stop)
 ENABLE_DC_FILTER    = False  # Donchian core: daily/4h trend direction gate (block against HTF trend)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2589,6 +2589,12 @@ class AutoRunner:
         _candles_open = int((time.time() - _open_ts) / self.interval_sec) if _open_ts and self.interval_sec > 0 else 0
         _opened_at = datetime.utcfromtimestamp(_open_ts).strftime("%Y-%m-%dT%H:%M:%SZ") if _open_ts else ""
         _closed_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        _bd_raw = pt.get("breakdown_open") or self.last_breakdown or {}
+        _bd_slim = {
+            k: {"ok": v.get("ok"), "reason": v.get("reason", "")}
+            for k, v in _bd_raw.items()
+            if isinstance(v, dict) and "ok" in v
+        } if _bd_raw else None
         log_trade_outcome(
             email=self.email, symbol=self.symbol, side=side, mode=mode,
             trade_style=self.trade_style, grade=grade_label,
@@ -2610,6 +2616,7 @@ class AutoRunner:
             candles_open=_candles_open,
             opened_at=_opened_at, closed_at=_closed_at,
             consecutive_wins_before=self.consecutive_wins,
+            breakdown_json=_bd_slim,
         )
 
         return equity_after
@@ -3940,6 +3947,7 @@ class AutoRunner:
                             "atr_pct_open":   self.last_atr_pct,
                             "adx_at_open":    self.last_adx,
                             "pat_trail_mult": _pat_trail_mult,
+                            "breakdown_open": self.last_breakdown or {},
                         }
                         if grade == "B" or ENABLE_GRADE_B_ALL:
                             _gb_sig_lbl = "" if grade == "B" else f" [Option3 sig={grade}]"
@@ -4090,6 +4098,7 @@ class AutoRunner:
                             "atr_pct_open": self.last_atr_pct,
                             "adx_at_open":  self.last_adx,
                             "pat_trail_mult": _pat_trail_mult,
+                            "breakdown_open": self.last_breakdown or {},
                         }
                         _mtf_label = "" if res.get("mtf_confirmed", True) else f" | 15m unconfirmed→size {_mtf_sm*100:.0f}%"
                         if grade == "B" or ENABLE_GRADE_B_ALL:

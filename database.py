@@ -221,13 +221,21 @@ def init_outcome_log_table() -> None:
                 candles_open   INTEGER,
                 opened_at      TEXT,
                 closed_at      TEXT    NOT NULL,
-                consecutive_wins_before INTEGER DEFAULT 0
+                consecutive_wins_before INTEGER DEFAULT 0,
+                breakdown_json         TEXT    DEFAULT NULL
             )
         """)
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_outcomes_email_closed"
             " ON trade_outcomes(email, closed_at)"
         )
+        # Migration: add breakdown_json to existing tables
+        try:
+            cur.execute(
+                "ALTER TABLE trade_outcomes ADD COLUMN IF NOT EXISTS breakdown_json TEXT DEFAULT NULL"
+            )
+        except Exception:
+            pass
         conn.commit()
 
 
@@ -243,8 +251,10 @@ def log_trade_outcome(
     vol_adj: float, dd_adj: float,
     candles_open: int, opened_at: str, closed_at: str,
     consecutive_wins_before: int,
+    breakdown_json: str = None,
 ) -> None:
     """Insert one row into trade_outcomes. Never raises — failures are silent."""
+    import json as _json
     try:
         with db_conn() as conn:
             cur = conn.cursor()
@@ -254,12 +264,12 @@ def log_trade_outcome(
                 "outcome,entry_price,exit_price,sl_pct,tp_pct,atr_pct,"
                 "effective_size,leverage,pnl_pct,pnl_value,equity_before,equity_after,"
                 "peak_equity,t18_scale1,t18_scale2,trailing_used,vol_adj,dd_adj,"
-                "candles_open,opened_at,closed_at,consecutive_wins_before)"
+                "candles_open,opened_at,closed_at,consecutive_wins_before,breakdown_json)"
                 " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
                 "%s,%s,%s,%s,%s,%s,"
                 "%s,%s,%s,%s,%s,%s,"
                 "%s,%s,%s,%s,%s,%s,"
-                "%s,%s,%s,%s)",
+                "%s,%s,%s,%s,%s)",
                 (
                     email, symbol, side, mode, trade_style, grade, label or "",
                     signal or "-", round(score or 0.0, 4), regime or "-",
@@ -275,6 +285,8 @@ def log_trade_outcome(
                     round(vol_adj or 1.0, 4), round(dd_adj or 1.0, 4),
                     int(candles_open or 0), opened_at or "", closed_at,
                     int(consecutive_wins_before or 0),
+                    breakdown_json if isinstance(breakdown_json, str) else
+                    (_json.dumps(breakdown_json) if breakdown_json else None),
                 ),
             )
             conn.commit()

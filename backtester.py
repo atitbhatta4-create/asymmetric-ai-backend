@@ -31,6 +31,7 @@ from indicators import (
     _compute_signal_layers,
     get_market_regime, check_weekly_trend,
     check_pullback_entry, check_volume_hour_confirmed,
+    compute_grid_signal, donchian_htf_filter,
 )
 from coin_params import get_coin_params
 from mode_params import get_mode_config, get_style_config
@@ -931,6 +932,8 @@ def _run_worker(
     random_seed: Optional[int] = None,
     score_floor: float = 0.0,
     e2_hold_mult: float = 1.0,
+    enable_grid: bool = False,
+    enable_dc_core: bool = False,
 ) -> None:
     _last_db_write = [0.0]  # throttle DB progress writes
 
@@ -1239,12 +1242,47 @@ def _run_worker(
                 _ranging_thresh = _style_cfg.get("ranging_adx_threshold", 15)
                 regime, _is_parabolic = get_market_regime(btc_weekly_slice, cur_adx, _is_parabolic, ranging_threshold=_ranging_thresh)
 
-                # RANGING = no trades
+                # RANGING = no trades (unless grid module is on)
                 if regime == "RANGING":
-                    if _signal_pending:
-                        _signal_pending = False
-                        _pending_side   = ""
-                        _candles_since_sig = 0
+                    if enable_grid:
+                        _slice_h = [k["high"]  for k in klines[-20:]]
+                        _slice_l = [k["low"]   for k in klines[-20:]]
+                        _slice_c = [k["close"] for k in klines[-20:]]
+                        _cur_atr = (_precomp["atr14"][i] or 0.0)
+                        _grid = compute_grid_signal(_slice_h, _slice_l, _slice_c, _cur_atr, cur_adx)
+                        if not _grid["ok"]:
+                            if _signal_pending:
+                                _signal_pending = False
+                                _pending_side   = ""
+                                _candles_since_sig = 0
+                            continue
+                        # Grid entry: use grid tp/sl directly (override ATR-based values)
+                        _g_side = _grid["side"]
+                        _g_atr  = _cur_atr if _cur_atr > 0 else ATR_BASELINE[tf]
+                        _g_sl_pct = abs(_grid["sl"] - candle["close"]) / candle["close"]
+                        _g_tp_pct = abs(_grid["tp"] - candle["close"]) / candle["close"]
+                        _g_sl_pct = max(_g_sl_pct, 0.001)
+                        _g_tp_pct = max(_g_tp_pct, 0.001)
+                        _esize = c["size"] * _mode_cfg.get("position_size_mult", 1.0) * _post_reset_cap
+                        open_trades.append({
+                            "side":          _g_side,
+                            "entry":         candle["close"],
+                            "sl_pct":        _g_sl_pct,
+                            "tp_pct":        _g_tp_pct,
+                            "atr_pct":       _g_atr / candle["close"],
+                            "effective_size": _esize,
+                            "regime":        regime,
+                            "grade":         "B",
+                            "label":         "GRID",
+                            "open_ts":       candle["t"],
+                            "score":         0.65,
+                        })
+                        last_trade_ms = candle["t"]
+                    else:
+                        if _signal_pending:
+                            _signal_pending = False
+                            _pending_side   = ""
+                            _candles_since_sig = 0
                     continue
 
                 # ── Change 5: Mode regime guard ───────────────────────
@@ -1374,6 +1412,12 @@ def _run_worker(
                 _pending_side      = ""
                 _pending_score     = 0.0
                 _candles_since_sig = 0
+
+                # DC core: block entries against 4h Donchian HTF trend
+                if enable_dc_core and higher_slice:
+                    _dc_ok, _ = donchian_htf_filter(higher_slice, desired_side, period=20)
+                    if not _dc_ok:
+                        continue
 
                 grade         = sig.get("grade", "B")
                 atr_pct       = sig.get("atr_pct", ATR_BASELINE.get(tf, 0.009))
@@ -1512,6 +1556,8 @@ def start_backtest(
     random_seed: Optional[int] = None,
     score_floor: float = 0.0,
     e2_hold_mult: float = 1.0,
+    enable_grid: bool = False,
+    enable_dc_core: bool = False,
 ) -> str:
     """Validate inputs, create DB record, start background thread, return run_id."""
     from datetime import datetime
@@ -1567,7 +1613,8 @@ def start_backtest(
               start_ms, end_ms, start_equity, enable_t16, enable_t18, enable_s4,
               enable_mr_4h_gate, enable_regime_gate, enable_e2, enable_step2_score,
               enable_grade_b_all, enable_score_cap, score_cap,
-              t1_tp_mult, enable_floor, random_seed, score_floor, e2_hold_mult),
+              t1_tp_mult, enable_floor, random_seed, score_floor, e2_hold_mult,
+              enable_grid, enable_dc_core),
         daemon=True,
     )
     t.start()
