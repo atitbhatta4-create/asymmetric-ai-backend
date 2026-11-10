@@ -930,6 +930,7 @@ def _run_worker(
     enable_floor: bool = True,
     random_seed: Optional[int] = None,
     score_floor: float = 0.0,
+    e2_hold_mult: float = 1.0,
 ) -> None:
     _last_db_write = [0.0]  # throttle DB progress writes
 
@@ -1095,7 +1096,7 @@ def _run_worker(
                     _e2_tf_ms  = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}.get(tf, 3_600_000)
                     _e2_held   = (candle["t"] - open_trade["open_ts"]) // _e2_tf_ms
                     _e2_score  = float(open_trade.get("score", 0.65))
-                    _e2_max    = 30 if _e2_score >= 0.80 else (22 if _e2_score >= 0.70 else 15)
+                    _e2_max    = round((30 if _e2_score >= 0.80 else (22 if _e2_score >= 0.70 else 15)) * e2_hold_mult)
                     if _e2_held >= _e2_max:
                         _e2_entry = open_trade["entry"]
                         _e2_side  = open_trade["side"]
@@ -1510,6 +1511,7 @@ def start_backtest(
     enable_floor: bool = True,
     random_seed: Optional[int] = None,
     score_floor: float = 0.0,
+    e2_hold_mult: float = 1.0,
 ) -> str:
     """Validate inputs, create DB record, start background thread, return run_id."""
     from datetime import datetime
@@ -1565,7 +1567,7 @@ def start_backtest(
               start_ms, end_ms, start_equity, enable_t16, enable_t18, enable_s4,
               enable_mr_4h_gate, enable_regime_gate, enable_e2, enable_step2_score,
               enable_grade_b_all, enable_score_cap, score_cap,
-              t1_tp_mult, enable_floor, random_seed, score_floor),
+              t1_tp_mult, enable_floor, random_seed, score_floor, e2_hold_mult),
         daemon=True,
     )
     t.start()
