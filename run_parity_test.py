@@ -190,14 +190,14 @@ def fmt_ts(time_str):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def sl_pct(trade):
-    e = trade.get("entry_price", 0.0)
+    # trades.sl stores sl_pct * 100 (e.g. 2.5 for a 2.5% stop), not an absolute price
     s = trade.get("sl", 0.0)
-    return abs(e - s) / e if e > 0 and s > 0 else None
+    return s / 100.0 if s > 0 else None
 
 def tp_pct(trade):
-    e = trade.get("entry_price", 0.0)
+    # trades.tp stores tp_pct * 100 (e.g. 5.0 for a 5% target)
     t = trade.get("tp", 0.0)
-    return abs(e - t) / e if e > 0 and t > 0 else None
+    return t / 100.0 if t > 0 else None
 
 def find_bt_match(live_ts, live_side, available_bt):
     """
