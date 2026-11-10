@@ -1264,20 +1264,28 @@ def _run_worker(
                         _g_sl_pct = max(_g_sl_pct, 0.001)
                         _g_tp_pct = max(_g_tp_pct, 0.001)
                         _esize = c["size"] * _mode_cfg.get("position_size_mult", 1.0) * _post_reset_cap
-                        open_trades.append({
-                            "side":          _g_side,
-                            "entry":         candle["close"],
-                            "sl_pct":        _g_sl_pct,
-                            "tp_pct":        _g_tp_pct,
-                            "atr_pct":       _g_atr / candle["close"],
+                        open_trade = {
+                            "entry":          candle["close"],
+                            "side":           _g_side,
+                            "grade":          "B",
+                            "sl_pct":         _g_sl_pct,
+                            "tp_pct":         _g_tp_pct,
+                            "t1_tp_mult":     t1_tp_mult,
                             "effective_size": _esize,
-                            "regime":        regime,
-                            "grade":         "B",
-                            "label":         "GRID",
-                            "open_ts":       candle["t"],
-                            "score":         0.65,
-                        })
-                        last_trade_ms = candle["t"]
+                            "leverage":       c["leverage"],
+                            "equity_at_open": equity,
+                            "atr_pct":        _g_atr / candle["close"],
+                            "adx_at_open":    cur_adx,
+                            "t1_size":        _esize * 0.60,
+                            "t2_size":        _esize * 0.40,
+                            "t1_done":        False,
+                            "t2_sl_is_breakeven": False,
+                            "accumulated_pnl": 0.0,
+                            "open_ts":        candle["t"],
+                            "signal":         "GRID",
+                            "score":          0.65,
+                            "regime":         regime,
+                        }
                     else:
                         if _signal_pending:
                             _signal_pending = False
