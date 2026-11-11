@@ -962,6 +962,7 @@ def _compute_signal_layers(
     enable_regime_gate: bool = False,
     enable_step2_score: bool = False,
     enable_dc_filter: bool = False,
+    enable_mr_signal: bool = True,   # MR ON/OFF backtest gate — default True (live behaviour)
     score_floor: float = 0.0,
 ) -> Dict:
     """
@@ -1023,7 +1024,10 @@ def _compute_signal_layers(
     # return the reversal signal instead of BLOCKED.
     _rev = _reversal_signal(klines, rsi, adx, atr) if enable_t16 else {"ok": False}
     _trend_4h = get_4h_trend_direction(higher_klines or []) if enable_mr_4h_gate else "NEUTRAL"
-    _mr  = _mean_reversion_signal(klines, rsi, adx, atr, trend_4h=_trend_4h)
+    _mr  = (
+        _mean_reversion_signal(klines, rsi, adx, atr, trend_4h=_trend_4h)
+        if enable_mr_signal else {"ok": False}
+    )
 
     # ── Phase 4: Regime classification (before any layer scoring) ────────────
     regime_class = _classify_regime(highs, lows, closes, adx, atr_pct, _atr_slow_pct=_atr_slow_pct_pc)

@@ -921,6 +921,7 @@ def _run_worker(
     enable_t18: bool = True,
     enable_s4: bool = False,
     enable_mr_4h_gate: bool = False,
+    enable_mr_signal: bool = True,
     enable_regime_gate: bool = False,
     enable_e2: bool = False,
     enable_step2_score: bool = False,
@@ -1521,6 +1522,7 @@ def _run_worker(
                     daily_klines=daily_slice or None,
                     candle_ts_ms=candle["t"],
                     enable_mr_4h_gate=enable_mr_4h_gate,
+                    enable_mr_signal=enable_mr_signal,
                     enable_regime_gate=enable_regime_gate,
                     enable_step2_score=enable_step2_score,
                     score_floor=score_floor,
@@ -1532,7 +1534,9 @@ def _run_worker(
                     sig["ok"] = False
 
                 # ── Change 3: Volume hour confirmation ────────────────
-                if sig.get("ok"):
+                # Mirror main.py: score >= 0.68 bypasses volume check (high
+                # conviction — 6-7 layers already confirmed, volume redundant).
+                if sig.get("ok") and sig.get("score", 0.0) < 0.68:
                     _cp_vol = get_coin_params(symbol)
                     _vol_ok, _, _ = check_volume_hour_confirmed(klines, _cp_vol)
                     if not _vol_ok:
@@ -1755,6 +1759,7 @@ def start_backtest(
     enable_t18: bool = True,
     enable_s4: bool = False,
     enable_mr_4h_gate: bool = False,
+    enable_mr_signal: bool = True,
     enable_regime_gate: bool = False,
     enable_e2: bool = False,
     enable_step2_score: bool = False,
@@ -1831,8 +1836,8 @@ def start_backtest(
         target=_run_worker,
         args=(run_id, email, symbol.upper(), tf, mode, style, exchange,
               start_ms, end_ms, start_equity, enable_t16, enable_t18, enable_s4,
-              enable_mr_4h_gate, enable_regime_gate, enable_e2, enable_step2_score,
-              enable_grade_b_all, enable_score_cap, score_cap,
+              enable_mr_4h_gate, enable_mr_signal, enable_regime_gate, enable_e2,
+              enable_step2_score, enable_grade_b_all, enable_score_cap, score_cap,
               t1_tp_mult, enable_floor, random_seed, score_floor, e2_hold_mult,
               enable_grid, enable_dc_core, dc_long_cut, dc_short_cut,
               enable_grid_v2, gv2_adx_thresh, gv2_n_candles, gv2_max_levels,
