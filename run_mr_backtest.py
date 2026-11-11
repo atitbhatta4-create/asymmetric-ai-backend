@@ -68,17 +68,22 @@ _lock = threading.Lock()
 _done = [0]
 _total_ref = [0]
 
-def _already_done(email: str) -> bool:
+def _fetch_done(email: str):
+    """Return results dict if run is done in DB, else None."""
     try:
         with db_conn() as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT 1 FROM backtest_runs WHERE email=%s AND status='done' LIMIT 1",
+                "SELECT results FROM backtest_runs WHERE email=%s AND status='done' LIMIT 1",
                 (email,),
             )
-            return cur.fetchone() is not None
+            row = cur.fetchone()
+        if not row:
+            return None
+        raw = row[0] if isinstance(row, (list, tuple)) else row["results"]
+        return json.loads(raw) if isinstance(raw, str) else (raw or {})
     except Exception:
-        return False
+        return None
 
 
 def _run(tag, coin, dfrom, dto, mr_on: bool, seed=None):
@@ -86,13 +91,14 @@ def _run(tag, coin, dfrom, dto, mr_on: bool, seed=None):
     suffix  = f"-s{seed}" if seed is not None else ""
     email   = f"mrbt-{tag}-{variant}-{coin.lower()}{suffix}@asym-internal"
 
-    if _already_done(email):
+    cached = _fetch_done(email)
+    if cached is not None:
         with _lock:
             _done[0] += 1
             if _done[0] % 100 == 0 or _done[0] <= 4:
                 print(f"  [{_done[0]}/{_total_ref[0]}] skip (done) {tag} MR={variant} {coin}{suffix}",
                       flush=True)
-        return email, {}
+        return email, cached
 
     run_id = start_backtest(
         email=email, symbol=coin, mode=MODE, style=STYLE,
