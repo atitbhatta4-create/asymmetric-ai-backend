@@ -1955,14 +1955,19 @@ def donchian_htf_filter(
     higher_klines: List[Dict],
     side: str,
     period: int = 20,
+    long_cut: float = 0.35,
+    short_cut: float = 0.65,
 ) -> tuple:
     """
     Daily/4h Donchian trend direction gate.
 
     Blocks entries that trade against the higher-timeframe Donchian trend:
-      - LONG  blocked when HTF Donchian position < 0.35 (HTF downtrend)
-      - SHORT blocked when HTF Donchian position > 0.65 (HTF uptrend)
-      - Mid-channel (0.35–0.65) allows both directions
+      - LONG  blocked when HTF Donchian position < long_cut  (HTF downtrend)
+      - SHORT blocked when HTF Donchian position > short_cut (HTF uptrend)
+      - Mid-channel allows both directions
+
+    long_cut / short_cut default to 0.35 / 0.65 (the production values).
+    Pass different values only for plateau sensitivity testing.
 
     Returns (allowed: bool, reason: str).
     Not enough data → allow (don't block when we have no HTF view).
@@ -1983,9 +1988,9 @@ def donchian_htf_filter(
 
     position = (htf_closes[-1] - lower) / span
 
-    if side == "LONG" and position < 0.35:
+    if side == "LONG" and position < long_cut:
         return False, f"DC_HTF_BLOCK LONG vs HTF-DOWN pos={position:.2f}"
-    if side == "SHORT" and position > 0.65:
+    if side == "SHORT" and position > short_cut:
         return False, f"DC_HTF_BLOCK SHORT vs HTF-UP pos={position:.2f}"
 
     return True, f"DC_HTF_OK pos={position:.2f}"

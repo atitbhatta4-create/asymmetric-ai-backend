@@ -934,6 +934,8 @@ def _run_worker(
     e2_hold_mult: float = 1.0,
     enable_grid: bool = False,
     enable_dc_core: bool = False,
+    dc_long_cut: float = 0.35,
+    dc_short_cut: float = 0.65,
 ) -> None:
     _last_db_write = [0.0]  # throttle DB progress writes
 
@@ -1423,7 +1425,10 @@ def _run_worker(
 
                 # DC core: block entries against 4h Donchian HTF trend
                 if enable_dc_core and higher_slice:
-                    _dc_ok, _ = donchian_htf_filter(higher_slice, desired_side, period=20)
+                    _dc_ok, _ = donchian_htf_filter(
+                        higher_slice, desired_side, period=20,
+                        long_cut=dc_long_cut, short_cut=dc_short_cut,
+                    )
                     if not _dc_ok:
                         continue
 
@@ -1566,6 +1571,8 @@ def start_backtest(
     e2_hold_mult: float = 1.0,
     enable_grid: bool = False,
     enable_dc_core: bool = False,
+    dc_long_cut: float = 0.35,
+    dc_short_cut: float = 0.65,
 ) -> str:
     """Validate inputs, create DB record, start background thread, return run_id."""
     from datetime import datetime
@@ -1622,7 +1629,7 @@ def start_backtest(
               enable_mr_4h_gate, enable_regime_gate, enable_e2, enable_step2_score,
               enable_grade_b_all, enable_score_cap, score_cap,
               t1_tp_mult, enable_floor, random_seed, score_floor, e2_hold_mult,
-              enable_grid, enable_dc_core),
+              enable_grid, enable_dc_core, dc_long_cut, dc_short_cut),
         daemon=True,
     )
     t.start()

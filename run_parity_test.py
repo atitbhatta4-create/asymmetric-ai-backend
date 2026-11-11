@@ -49,11 +49,12 @@ HISTORICAL_FLAGS = {
 
 # ── Current (corrected) flags ─────────────────────────────────────────────────
 CURRENT_FLAGS = {
-    "enable_t16":        True,
-    "enable_t18":        False,  # ENABLE_T18 = False after STEP 0
-    "enable_s4":         False,
-    "enable_mr_4h_gate": False,  # ENABLE_MR_4H_GATE = False after STEP 0
-    "t1_tp_mult":        1.00,   # T1 TP fixed to 1.00x
+    "enable_t16":          True,
+    "enable_t18":          False,  # ENABLE_T18 = False after STEP 0
+    "enable_s4":           False,
+    "enable_mr_4h_gate":   False,  # ENABLE_MR_4H_GATE = False after STEP 0
+    "t1_tp_mult":          1.00,   # T1 TP fixed to 1.00x
+    "enable_grade_b_all":  True,   # Option 3 deployed to MAIN 2026-11-11
 }
 
 # ── Backtest config ────────────────────────────────────────────────────────────
@@ -132,6 +133,7 @@ def run_backtest(symbol, date_from, date_to, flags, timeout_min=30):
         enable_s4=flags["enable_s4"],
         enable_mr_4h_gate=flags["enable_mr_4h_gate"],
         t1_tp_mult=flags["t1_tp_mult"],
+        enable_grade_b_all=flags.get("enable_grade_b_all", False),
     )
     label = f"{symbol} {date_from} → {date_to}"
     deadline = time.time() + timeout_min * 60
