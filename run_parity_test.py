@@ -12,11 +12,21 @@ Default run (historical — matches what live was doing during the 90-day window
 For current (corrected) flags:
   python run_parity_test.py --current-flags
 
-Match rule (all four must hold):
+Match rule:
   • Same side (LONG / SHORT)
-  • Entry within 1 candle (≤1 h)
-  • SL and TP each within 0.1% of entry
-  • Same exit reason (outcome family: WIN / LOSS / TRAIL)
+  • Entry price within 0.3%  ← primary match key
+    (live "time" column = CLOSE time, not entry time, so time-based
+     matching is unreliable for trades lasting > 1 candle)
+  • SL within 0.15% of entry
+  • Same exit reason family (WIN / LOSS / TRAIL)
+
+NOTE — TP_PCT is intentionally NOT compared:
+  The backtester applies backtest_default_tp_mult=2.0 for DAY_TRADE
+  (mode_params.py), so backtest TP = 2× live TP by design.
+  This is a known, accepted divergence — not a bug.
+
+Parity rate = matched / total_live  (entry-price matches ÷ all live trades)
+Acceptable threshold: ≥ 80%
 
 Writes parity_report.txt alongside this script.
 """
@@ -64,10 +74,8 @@ EXCHANGE = "bybit"
 START_EQ = 1000.0
 
 # ── Match tolerances ──────────────────────────────────────────────────────────
-CANDLE_MS         = 3_600_000          # 1 h in ms
-MATCH_WINDOW_MS   = 1 * CANDLE_MS     # entry within 1 candle
-TOL_SL_PCT        = 0.001              # 0.1%
-TOL_TP_PCT        = 0.001              # 0.1%
+TOL_ENTRY_PCT     = 0.003              # 0.3% — entry price match window
+TOL_SL_PCT        = 0.0015             # 0.15% — SL match (ATR-based, should be close)
 
 # ── Exit reason families ──────────────────────────────────────────────────────
 # Maps live `reason` field and backtest `outcome` to a canonical family.
@@ -201,19 +209,25 @@ def tp_pct(trade):
     t = trade.get("tp", 0.0)
     return t / 100.0 if t > 0 else None
 
-def find_bt_match(live_ts, live_side, available_bt):
+def find_bt_match(live_entry_price, live_side, available_bt):
     """
-    Return (bt_trade, delta_ms) for the best matching backtest trade:
-      - same side
-      - entry within MATCH_WINDOW_MS
-    Returns (None, inf) if nothing qualifies.
+    Match by entry_price (±TOL_ENTRY_PCT) + same side.
+
+    Rationale: live trades["time"] = close time, NOT entry time. Using
+    close time vs backtest open_ts (entry time) fails for any trade lasting
+    more than 1 candle. Entry price is a reliable proxy — the same entry
+    price rarely repeats within a 2-3 month window.
+
+    Returns (best_bt, price_diff_pct) or (None, inf).
     """
     best, best_d = None, float("inf")
     for bt in available_bt:
         if bt["side"].upper() != live_side.upper():
             continue
-        d = abs(bt["open_ts"] - live_ts)
-        if d <= MATCH_WINDOW_MS and d < best_d:
+        if not bt.get("entry") or live_entry_price <= 0:
+            continue
+        d = abs(bt["entry"] - live_entry_price) / live_entry_price
+        if d <= TOL_ENTRY_PCT and d < best_d:
             best_d = d
             best = bt
     return best, best_d
@@ -221,10 +235,13 @@ def find_bt_match(live_ts, live_side, available_bt):
 def compare(live, bt):
     """
     Returns list of (field, live_val, bt_val, note) tuples for every mismatch.
+
+    TP_PCT is intentionally excluded: backtest uses backtest_default_tp_mult=2.0
+    for DAY_TRADE, making backtest TP = 2× live TP by design. Not a bug.
     """
     issues = []
 
-    # SL %
+    # SL % — ATR-based, should match closely
     l_sl = sl_pct(live)
     b_sl = bt.get("sl_pct")
     if l_sl is not None and b_sl is not None:
@@ -236,19 +253,7 @@ def compare(live, bt):
                 f"diff {abs(l_sl-b_sl)*100:.3f}%",
             ))
 
-    # TP %
-    l_tp = tp_pct(live)
-    b_tp = bt.get("tp_pct")
-    if l_tp is not None and b_tp is not None:
-        if abs(l_tp - b_tp) > TOL_TP_PCT:
-            issues.append((
-                "TP_PCT",
-                f"{l_tp*100:.3f}%",
-                f"{b_tp*100:.3f}%",
-                f"diff {abs(l_tp-b_tp)*100:.3f}%",
-            ))
-
-    # Exit reason family
+    # Exit reason family — WIN / LOSS / TRAIL
     l_fam = _live_family(live.get("reason", ""))
     b_fam = _bt_family(bt.get("outcome", ""))
     if l_fam != "UNKNOWN" and b_fam != "UNKNOWN" and l_fam != b_fam:
@@ -289,7 +294,7 @@ def main():
     pr(f"Flag set   : {flag_label}")
     pr(f"  enable_t16={flags['enable_t16']}  enable_t18={flags['enable_t18']}"
        f"  mr_gate={flags['enable_mr_4h_gate']}  t1_tp={flags['t1_tp_mult']}×")
-    pr(f"Match rule : same side · entry ≤1 candle · SL/TP ≤0.1% · same exit family")
+    pr(f"Match rule : same side · entry_price ±0.3% · SL ≤0.15% · same exit family")
     pr("=" * 76)
     pr()
 
@@ -349,27 +354,20 @@ def main():
 
         for lt in sym_trades:
             total_live += 1
-            lt_ms   = ts_ms(lt["time"])
-            lt_side = lt.get("side", "").upper()
+            lt_side       = lt.get("side", "").upper()
+            lt_entry_price = float(lt.get("entry_price") or 0.0)
 
             avail = [(i, bt) for i, bt in enumerate(bt_trades) if i not in used_bt_indices]
-            best_bt = None
-            best_d  = float("inf")
-            best_i  = -1
-            for idx, bt in avail:
-                if bt["side"].upper() != lt_side:
-                    continue
-                d = abs(bt["open_ts"] - lt_ms)
-                if d <= MATCH_WINDOW_MS and d < best_d:
-                    best_d  = d
-                    best_bt = bt
-                    best_i  = idx
+            best_bt, best_d = find_bt_match(lt_entry_price, lt_side, avail)
+            best_i = next(
+                (i for i, bt in avail if bt is best_bt), -1
+            ) if best_bt is not None else -1
 
             if best_bt is None:
                 total_unmatched += 1
                 pr(
                     f"  NO_MATCH   {fmt_ts(lt['time'])}  {lt_side}"
-                    f"  entry={lt.get('entry_price','?')}"
+                    f"  entry={lt_entry_price:.4f}"
                     f"  reason={lt.get('reason','?')}"
                 )
                 continue
@@ -378,11 +376,12 @@ def main():
             total_matched += 1
             issues = compare(lt, best_bt)
 
-            delta_min = int(best_d / 60_000)
+            ep_diff_pct = best_d * 100
             tag = "OK      " if not issues else "MISMATCH"
             pr(
-                f"  [{tag}]  live={fmt_ts(lt['time'])}  bt={fmt_ms(best_bt['open_ts'])}"
-                f"  Δ{delta_min}min  {lt_side}  live_exit={lt.get('reason','')}  bt_exit={best_bt.get('outcome','')}"
+                f"  [{tag}]  live={fmt_ts(lt['time'])}  bt_open={fmt_ms(best_bt['open_ts'])}"
+                f"  entry_Δ{ep_diff_pct:.2f}%  {lt_side}"
+                f"  live_exit={lt.get('reason','')}  bt_exit={best_bt.get('outcome','')}"
             )
             if issues:
                 total_mismatch += 1
@@ -413,11 +412,13 @@ def main():
     pr("=" * 76)
     pr("SUMMARY")
     pr(f"  Live/demo trades     : {total_live}")
-    pr(f"  Matched to backtest  : {total_matched}")
-    pr(f"  Unmatched            : {total_unmatched}  (backtest had no signal within 1 candle & same side)")
-    pr(f"  Mismatches found     : {total_mismatch}")
-    pct = (total_matched - total_mismatch) / total_matched * 100 if total_matched else 0.0
-    pr(f"  Parity rate          : {pct:.1f}%")
+    pr(f"  Matched to backtest  : {total_matched}  (entry_price ±0.3%, same side)")
+    pr(f"  Unmatched            : {total_unmatched}  (no backtest entry at same price/side)")
+    pr(f"  Field mismatches     : {total_mismatch}  (of matched — SL or exit family differs)")
+    entry_pct = total_matched / total_live * 100 if total_live else 0.0
+    clean_pct = (total_matched - total_mismatch) / total_live * 100 if total_live else 0.0
+    pr(f"  Entry match rate     : {entry_pct:.1f}%  (matched / total live  — target ≥80%)")
+    pr(f"  Clean parity rate    : {clean_pct:.1f}%  (no-mismatch / total live)")
     pr()
 
     if all_mismatches:

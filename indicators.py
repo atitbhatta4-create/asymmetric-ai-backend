@@ -1995,3 +1995,78 @@ def donchian_htf_filter(
 
     return True, f"DC_HTF_OK pos={position:.2f}"
 
+
+# ── Grid v2 ────────────────────────────────────────────────────────────────────
+
+def compute_grid_v2_band(
+    highs:          List[float],
+    lows:           List[float],
+    closes:         List[float],
+    atr:            float,
+    adx:            float,
+    n_candles:      int   = 4,
+    adx_threshold:  float = 15.0,
+    step_atr_mult:  float = 0.50,
+    min_fee_rt:     float = 0.0015,   # one round-trip (bybit taker+slippage ~0.075%×2)
+) -> Dict:
+    """
+    Grid v2 ranging detector.
+
+    Entry condition:
+      • adx < adx_threshold  (market is not trending)
+      • last n_candles completed candle closes all inside [band_low, band_high]
+      • band span > 3× step  (enough room for at least one level each side)
+
+    Returns dict:
+      ok          bool    — True if grid condition met
+      band_high   float
+      band_low    float
+      midpoint    float
+      step_pct    float   — max(atr×step_atr_mult, 3×round-trip-fee) / close_price
+      reason      str
+    """
+    if len(highs) < n_candles + 1 or atr <= 0:
+        return {"ok": False, "reason": "insufficient_data"}
+
+    if adx >= adx_threshold:
+        return {"ok": False, "reason": f"adx_too_high adx={adx:.1f}"}
+
+    # Band = max high / min low of the last n_candles COMPLETED candles (exclude current)
+    window_h = highs[-(n_candles + 1):-1]
+    window_l = lows[-(n_candles + 1):-1]
+    window_c = closes[-(n_candles + 1):-1]
+    band_high = max(window_h)
+    band_low  = min(window_l)
+
+    # All closes must be inside the band (price trapped, not just wicked)
+    for c in window_c:
+        if c > band_high or c < band_low:
+            return {"ok": False, "reason": "price_outside_band"}
+
+    current_close = closes[-1]
+    if current_close > band_high or current_close < band_low:
+        return {"ok": False, "reason": "current_close_outside_band"}
+
+    span = band_high - band_low
+    if span <= 0:
+        return {"ok": False, "reason": "zero_span"}
+
+    midpoint = (band_high + band_low) / 2.0
+
+    # Step: larger of ATR-based or 3× round-trip fees
+    step_price = max(atr * step_atr_mult, current_close * 3.0 * min_fee_rt)
+    step_pct   = step_price / current_close
+
+    # Need at least 3× step of room (one level per side + buffer)
+    if span < 3.0 * step_price:
+        return {"ok": False, "reason": f"band_too_narrow span={span:.4f} step={step_price:.4f}"}
+
+    return {
+        "ok":         True,
+        "band_high":  band_high,
+        "band_low":   band_low,
+        "midpoint":   midpoint,
+        "step_pct":   step_pct,
+        "reason":     f"grid_ok adx={adx:.1f} span={span:.4f}",
+    }
+

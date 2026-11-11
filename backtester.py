@@ -31,7 +31,7 @@ from indicators import (
     _compute_signal_layers,
     get_market_regime, check_weekly_trend,
     check_pullback_entry, check_volume_hour_confirmed,
-    compute_grid_signal, donchian_htf_filter,
+    compute_grid_signal, donchian_htf_filter, compute_grid_v2_band,
 )
 from coin_params import get_coin_params
 from mode_params import get_mode_config, get_style_config
@@ -936,6 +936,14 @@ def _run_worker(
     enable_dc_core: bool = False,
     dc_long_cut: float = 0.35,
     dc_short_cut: float = 0.65,
+    enable_grid_v2: bool = False,
+    gv2_adx_thresh: float = 15.0,
+    gv2_n_candles:  int   = 4,
+    gv2_max_levels: int   = 3,
+    gv2_step_mult:  float = 0.50,
+    gv2_buffer_atr: float = 0.75,
+    gv2_cooldown:   int   = 4,
+    gv2_equity_pct: float = 0.25,
 ) -> None:
     _last_db_write = [0.0]  # throttle DB progress writes
 
@@ -1045,6 +1053,16 @@ def _run_worker(
         _post_reset_active: bool  = False
         _post_reset_base:   float = 0.0
         _post_reset_cap:    float = 1.0
+
+        # Grid v2 state machine
+        _gv2_active:        bool       = False
+        _gv2_band_high:     float      = 0.0
+        _gv2_band_low:      float      = 0.0
+        _gv2_midpoint:      float      = 0.0
+        _gv2_step_pct:      float      = 0.0
+        _gv2_levels:        List[Dict] = []   # [{side, entry_price, tp_price, filled, fill_idx, size_pct, equity_at_open}]
+        _gv2_equity_locked: float      = 0.0
+        _gv2_cooldown_until: int       = 0
 
         # Precompute indicator series — eliminates ~9× O(n) computation per candle
         _all_closes = [c["close"] for c in main_candles]
@@ -1160,6 +1178,102 @@ def _run_worker(
                         })
                         equity_curve.append({"ts": result["exit_ts"], "equity": round(equity, 4)})
                         open_trade = None
+
+            # ── Grid v2 state machine ──────────────────────────────────
+            if enable_grid_v2 and _gv2_active:
+                _gv2_tf_ms  = _tf_ms.get(tf, 3_600_000)
+                _gv2_fees   = EXCHANGE_FEES[exchange]["taker"] * 2 + EXCHANGE_FEES[exchange]["slippage"]
+                _gv2_buffer = (_precomp["atr14"][i] or 0.0) * gv2_buffer_atr
+
+                # Hard exit: candle CLOSE outside band + buffer
+                if (candle["close"] < _gv2_band_low  - _gv2_buffer or
+                        candle["close"] > _gv2_band_high + _gv2_buffer):
+                    for _lv in _gv2_levels:
+                        if not _lv["filled"]:
+                            continue
+                        _lv_move = (
+                            (candle["close"] - _lv["entry_price"]) / _lv["entry_price"]
+                            if _lv["side"] == "LONG"
+                            else (_lv["entry_price"] - candle["close"]) / _lv["entry_price"]
+                        )
+                        _lv_pnl = _lv["equity_at_open"] * _lv["size_pct"] * (_lv_move - _gv2_fees)
+                        equity += _lv_pnl
+                        trades.append({
+                            "pnl":     _lv_pnl,
+                            "outcome": "gv2_hard_exit",
+                            "side":    _lv["side"],
+                            "grade":   "B",
+                            "signal":  "GRID_V2",
+                            "score":   0.60,
+                            "regime":  "RANGING",
+                            "open_ts": _lv["fill_ts"],
+                            "exit_ts": candle["t"],
+                            "entry":   _lv["entry_price"],
+                            "sl_pct":  _gv2_buffer / _lv["entry_price"],
+                            "tp_pct":  abs(_gv2_midpoint - _lv["entry_price"]) / _lv["entry_price"],
+                            "scaled":  False,
+                        })
+                    equity_curve.append({"ts": candle["t"], "equity": round(equity, 4)})
+                    _gv2_active        = False
+                    _gv2_levels        = []
+                    _gv2_cooldown_until = candle["t"] + _gv2_tf_ms * gv2_cooldown
+                else:
+                    # Fill unfilled levels (pessimistic: no exit on same candle as fill)
+                    for _lv in _gv2_levels:
+                        if _lv["filled"]:
+                            continue
+                        _touched = (
+                            candle["low"]  <= _lv["entry_price"] if _lv["side"] == "LONG"
+                            else candle["high"] >= _lv["entry_price"]
+                        )
+                        if _touched:
+                            _lv["filled"]   = True
+                            _lv["fill_ts"]  = candle["t"]
+                            _lv["fill_idx"] = i
+
+                    # Check TP for filled levels (only if not filled this same candle)
+                    _any_open = False
+                    for _lv in _gv2_levels:
+                        if not _lv["filled"]:
+                            _any_open = True
+                            continue
+                        if _lv.get("fill_idx") == i:
+                            _any_open = True
+                            continue  # pessimistic: can't exit same candle as fill
+                        if _lv.get("tp_done"):
+                            continue
+                        _tp_hit = (
+                            candle["high"] >= _lv["tp_price"] if _lv["side"] == "LONG"
+                            else candle["low"] <= _lv["tp_price"]
+                        )
+                        if _tp_hit:
+                            _lv_move = abs(_lv["tp_price"] - _lv["entry_price"]) / _lv["entry_price"]
+                            _lv_pnl  = _lv["equity_at_open"] * _lv["size_pct"] * (_lv_move - _gv2_fees)
+                            equity  += _lv_pnl
+                            trades.append({
+                                "pnl":     _lv_pnl,
+                                "outcome": "gv2_tp",
+                                "side":    _lv["side"],
+                                "grade":   "B",
+                                "signal":  "GRID_V2",
+                                "score":   0.60,
+                                "regime":  "RANGING",
+                                "open_ts": _lv["fill_ts"],
+                                "exit_ts": candle["t"],
+                                "entry":   _lv["entry_price"],
+                                "sl_pct":  _gv2_buffer / _lv["entry_price"],
+                                "tp_pct":  _lv_move,
+                                "scaled":  False,
+                            })
+                            equity_curve.append({"ts": candle["t"], "equity": round(equity, 4)})
+                            _lv["tp_done"] = True
+                        else:
+                            _any_open = True
+
+                    # All levels completed → deactivate
+                    if not _any_open:
+                        _gv2_active = False
+                        _gv2_levels = []
 
             # ── Hard floor stop (R1 Hybrid — mirrors live _compute_floor) ─
             if candle["t"] < _floor_cooldown_until:
@@ -1288,6 +1402,57 @@ def _run_worker(
                             "score":          0.65,
                             "regime":         regime,
                         }
+                    elif enable_grid_v2 and not _gv2_active and candle["t"] >= _gv2_cooldown_until:
+                        # Grid v2 activation: build multi-level mean-reversion grid
+                        _gv2_win  = max(gv2_n_candles + 2, 20)
+                        _gv2_h    = [k["high"]  for k in klines[-_gv2_win:]]
+                        _gv2_l    = [k["low"]   for k in klines[-_gv2_win:]]
+                        _gv2_c    = [k["close"] for k in klines[-_gv2_win:]]
+                        _gv2_atr  = (_precomp["atr14"][i] or 0.0)
+                        _gv2_band = compute_grid_v2_band(
+                            _gv2_h, _gv2_l, _gv2_c, _gv2_atr, cur_adx,
+                            n_candles=gv2_n_candles,
+                            adx_threshold=gv2_adx_thresh,
+                            step_atr_mult=gv2_step_mult,
+                        )
+                        if _gv2_band["ok"]:
+                            _gv2_band_high  = _gv2_band["band_high"]
+                            _gv2_band_low   = _gv2_band["band_low"]
+                            _gv2_midpoint   = _gv2_band["midpoint"]
+                            _gv2_step_pct   = _gv2_band["step_pct"]
+                            _gv2_equity_locked = equity * gv2_equity_pct
+                            _n_long  = gv2_max_levels // 2
+                            _n_short = gv2_max_levels - _n_long
+                            _n_total = _n_long + _n_short
+                            _sz_each = gv2_equity_pct / _n_total if _n_total > 0 else gv2_equity_pct
+                            _gv2_levels = []
+                            for _k in range(_n_long):
+                                _ep = _gv2_band_low * (1.0 + _k * _gv2_step_pct)
+                                _gv2_levels.append({
+                                    "side":          "LONG",
+                                    "entry_price":   _ep,
+                                    "tp_price":      _gv2_midpoint,
+                                    "filled":        False,
+                                    "fill_ts":       0,
+                                    "fill_idx":      -1,
+                                    "tp_done":       False,
+                                    "size_pct":      _sz_each,
+                                    "equity_at_open": equity,
+                                })
+                            for _k in range(_n_short):
+                                _ep = _gv2_band_high * (1.0 - _k * _gv2_step_pct)
+                                _gv2_levels.append({
+                                    "side":          "SHORT",
+                                    "entry_price":   _ep,
+                                    "tp_price":      _gv2_midpoint,
+                                    "filled":        False,
+                                    "fill_ts":       0,
+                                    "fill_idx":      -1,
+                                    "tp_done":       False,
+                                    "size_pct":      _sz_each,
+                                    "equity_at_open": equity,
+                                })
+                            _gv2_active = True
                     else:
                         if _signal_pending:
                             _signal_pending = False
@@ -1481,6 +1646,38 @@ def _run_worker(
 
                 side = desired_side
 
+                # Grid v2 mutual exclusion: trend signal wins, close any grid levels first
+                if enable_grid_v2 and _gv2_active:
+                    _gv2_fees_me = EXCHANGE_FEES[exchange]["taker"] * 2 + EXCHANGE_FEES[exchange]["slippage"]
+                    for _lv in _gv2_levels:
+                        if not _lv["filled"] or _lv.get("tp_done"):
+                            continue
+                        _lv_move = (
+                            (candle["close"] - _lv["entry_price"]) / _lv["entry_price"]
+                            if _lv["side"] == "LONG"
+                            else (_lv["entry_price"] - candle["close"]) / _lv["entry_price"]
+                        )
+                        _lv_pnl = _lv["equity_at_open"] * _lv["size_pct"] * (_lv_move - _gv2_fees_me)
+                        equity += _lv_pnl
+                        trades.append({
+                            "pnl":     _lv_pnl,
+                            "outcome": "gv2_trend_exit",
+                            "side":    _lv["side"],
+                            "grade":   "B",
+                            "signal":  "GRID_V2",
+                            "score":   0.60,
+                            "regime":  "RANGING",
+                            "open_ts": _lv["fill_ts"],
+                            "exit_ts": candle["t"],
+                            "entry":   _lv["entry_price"],
+                            "sl_pct":  0.0,
+                            "tp_pct":  abs(_gv2_midpoint - _lv["entry_price"]) / _lv["entry_price"],
+                            "scaled":  False,
+                        })
+                    equity_curve.append({"ts": candle["t"], "equity": round(equity, 4)})
+                    _gv2_active = False
+                    _gv2_levels = []
+
                 open_trade = {
                     "entry":          candle["close"],
                     "side":           side,
@@ -1573,6 +1770,14 @@ def start_backtest(
     enable_dc_core: bool = False,
     dc_long_cut: float = 0.35,
     dc_short_cut: float = 0.65,
+    enable_grid_v2: bool = False,
+    gv2_adx_thresh: float = 15.0,
+    gv2_n_candles:  int   = 4,
+    gv2_max_levels: int   = 3,
+    gv2_step_mult:  float = 0.50,
+    gv2_buffer_atr: float = 0.75,
+    gv2_cooldown:   int   = 4,
+    gv2_equity_pct: float = 0.25,
 ) -> str:
     """Validate inputs, create DB record, start background thread, return run_id."""
     from datetime import datetime
@@ -1629,7 +1834,9 @@ def start_backtest(
               enable_mr_4h_gate, enable_regime_gate, enable_e2, enable_step2_score,
               enable_grade_b_all, enable_score_cap, score_cap,
               t1_tp_mult, enable_floor, random_seed, score_floor, e2_hold_mult,
-              enable_grid, enable_dc_core, dc_long_cut, dc_short_cut),
+              enable_grid, enable_dc_core, dc_long_cut, dc_short_cut,
+              enable_grid_v2, gv2_adx_thresh, gv2_n_candles, gv2_max_levels,
+              gv2_step_mult, gv2_buffer_atr, gv2_cooldown, gv2_equity_pct),
         daemon=True,
     )
     t.start()

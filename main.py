@@ -110,6 +110,7 @@ ENABLE_STEP2_SCORE  = False  # Step 2: set True only after backtest passes
 ENABLE_GRADE_B_ALL  = True   # Option 3: all trades use Grade B T1/T2 exits regardless of signal grade
 ENABLE_GRID_MODULE  = False  # Step 4: ranging-only grid entries (Donchian channel, breakout stop)
 ENABLE_DC_FILTER    = False  # Donchian core: daily/4h trend direction gate (block against HTF trend)
+ENABLE_GRID_V2      = False  # Grid v2: multi-level mean-reversion grid for RANGING markets (backtest only)
 # ──────────────────────────────────────────────────────────────────────────────
 
 import sentry_sdk
