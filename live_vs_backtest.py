@@ -4,9 +4,14 @@ live_vs_backtest.py — Compare live account performance vs backtest projections
 Run on Render shell:  python live_vs_backtest.py
 Run locally:          DATABASE_URL=<pg_url> python live_vs_backtest.py
 
-Backtest baseline (Oct 2026, post all fixes + Test6 + Test7):
-  Sharpe +0.24 | WR 18.4% | Avg Win $89.11 | Return +131.8% | 1052 trades / 6.8yr
+Backtest baseline (Option 3, OOS 2024-2026, 10-coin avg, floor ON):
+  WR ~21% | Avg Win $89.11 | Return varies by coin | 1052 trades / 6.8yr BTC
   Trade pace: ~154/year = ~12-13/month = ~3/week
+
+NOTE: Sharpe +0.24 was a single-coin BTC figure from Oct 2026 pre-Option-3 baseline.
+      It is NOT the current production baseline. Do not use it for launch metrics.
+      Current baseline: Option 3 (ENABLE_GRADE_B_ALL=True), OOS per-coin Sharpe in
+      predeploy_report.txt Task 4. BTC OOS Sharpe = -0.11 (floor ON).
 """
 from __future__ import annotations
 import os, sys, statistics
@@ -20,17 +25,18 @@ from database import db_conn
 
 EMAIL = os.getenv("VERIFY_EMAIL", "mes29571@gmail.com")
 
-# ── Backtest reference numbers (post all fixes, Oct 2026) ─────────────────────
+# ── Backtest reference numbers (Option 3, OOS 2024-2026, 10-coin avg) ─────────
+# Source: predeploy_report.txt Task 4 (floor ON, Option 3 exits).
+# Sharpe intentionally omitted — it varies 0.23 (NEAR) to 1.08 (ADA) per coin.
+# Use per-coin dc_core_full_report.txt or predeploy_report.txt for Sharpe.
 BT = {
-    "trades_total":   1052,
+    "trades_total":   1052,       # BTC only 6.8yr; multi-coin pace differs
     "years":          6.8,
     "trades_per_yr":  154,
     "trades_per_mo":  12.8,
-    "wr_pct":         18.4,
-    "avg_win_usd":    89.11,
-    "sharpe":         0.24,
-    "return_pct":     131.8,
-    "max_dd_pct":     52.9,
+    "wr_pct":         21.0,       # Option 3 OOS avg across 10 coins
+    "avg_win_usd":    89.11,      # BTC Oct 2026 reference
+    "max_dd_pct":     52.9,       # BTC floor ON
 }
 
 SEP  = "=" * 66

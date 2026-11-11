@@ -333,6 +333,11 @@ def main():
 
     all_mismatches = []  # for summary section
 
+    # Cap date_to at yesterday so backtester never requests future candles.
+    # Without this, single-trade symbols with a recent trade project date_to
+    # weeks into the future, causing the "not enough candles" error.
+    _today_cap = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+
     for symbol in sorted(by_symbol):
         sym_trades = sorted(by_symbol[symbol], key=lambda t: t["time"])
         t_min_ms = ts_ms(sym_trades[0]["time"])
@@ -341,7 +346,10 @@ def main():
         # Minimum 30-day window so backtester always has enough candles
         span_ms  = max(t_max_ms - t_min_ms, 30 * 86_400_000)
         date_from = datetime.utcfromtimestamp((t_min_ms - pad_ms) / 1000).strftime("%Y-%m-%d")
-        date_to   = datetime.utcfromtimestamp((t_min_ms + span_ms + pad_ms) / 1000).strftime("%Y-%m-%d")
+        date_to   = min(
+            datetime.utcfromtimestamp((t_min_ms + span_ms + pad_ms) / 1000).strftime("%Y-%m-%d"),
+            _today_cap,
+        )
 
         raw_count   = len(sym_trades)
         entry_events = _dedup_entries(sym_trades)  # T1/T2 collapsed
@@ -382,11 +390,33 @@ def main():
 
             if best_bt is None:
                 total_unmatched += 1
+                # Diagnose the nearest BT trade to explain the gap.
+                # Find the closest-price BT trade of either side to show the delta.
+                _near_bt = min(
+                    bt_trades,
+                    key=lambda b: abs(b.get("entry", 0) - lt_entry_price) / (lt_entry_price or 1),
+                    default=None,
+                ) if bt_trades else None
+                _diag = ""
+                if _near_bt:
+                    _ep_gap = abs(_near_bt.get("entry", 0) - lt_entry_price) / (lt_entry_price or 1) * 100
+                    _side_ok = _near_bt.get("side", "").upper() == lt_side
+                    if not _side_ok:
+                        _diag = f"  nearest_bt={fmt_ms(_near_bt['open_ts'])} side={_near_bt['side']} Δprice={_ep_gap:.2f}% — SIDE_MISMATCH"
+                    elif _ep_gap > TOL_ENTRY_PCT * 100:
+                        _diag = f"  nearest_bt={fmt_ms(_near_bt['open_ts'])} side={_near_bt['side']} Δprice={_ep_gap:.2f}% — PRICE_TOO_FAR (>{TOL_ENTRY_PCT*100:.1f}%)"
+                    else:
+                        _diag = f"  nearest_bt matched on price but already consumed"
+                else:
+                    _diag = "  backtest fired 0 trades for this symbol+period"
                 pr(
                     f"  NO_MATCH   {fmt_ts(lt['time'])}  {lt_side}"
                     f"  entry={lt_entry_price:.4f}"
-                    f"  reason={lt.get('reason','?')}"
+                    f"  score={lt.get('score') or '?'}"
+                    f"  exit={lt.get('reason','?')}"
                 )
+                if _diag:
+                    pr(f"             {_diag}")
                 continue
 
             used_bt_indices.add(best_i)
@@ -449,12 +479,16 @@ def main():
         pr()
 
     if total_unmatched > 0:
-        pr("UNMATCHED TRADES — possible causes:")
-        pr("  • Live entered but backtest score was just below threshold")
-        pr("  • Session quality gate blocked backtest entry at that hour")
-        pr("  • Daily bias (BULL/BEAR/NEUTRAL) differed — daily klines diverged")
-        pr("  • RANGING regime blocked backtest but live traded anyway")
-        pr("  • enable_mr_4h_gate blocked backtest signal")
+        pr("KNOWN STRUCTURAL GAPS (backtester vs live):")
+        pr("  1. Volume bypass: live skips volume check at score ≥ 0.68 — backtester now")
+        pr("     matches this behaviour (volume_bypass fix applied 2026-11-12).")
+        pr("  2. Economic calendar gate: live blocks 2h before high-impact events.")
+        pr("     Backtester has no calendar gate → orphan BT trades near macro events.")
+        pr("  3. HTF timeout: after 12h/24h of blocking, live lowers score floor.")
+        pr("     Not replicable in backtester (live-only state machine).")
+        pr("  4. Date range: very recent coins project date_to into the future.")
+        pr("     Fixed 2026-11-12: date_to now capped at yesterday.")
+        pr("  Any remaining gap after (1) and (4) are fixed = structural (items 2+3).")
         pr()
 
     pr("=" * 76)

@@ -1,0 +1,96 @@
+================================================================================
+  ASYMMETRIC AI — DEC 10 LAUNCH READINESS CHECKLIST
+  Updated: 2026-11-12
+================================================================================
+
+STATUS KEY:  ✅ DONE  |  ⏳ IN PROGRESS  |  ❌ BLOCKED  |  ○ NOT STARTED
+
+--------------------------------------------------------------------------------
+INFRASTRUCTURE (confirmed live on Render)
+--------------------------------------------------------------------------------
+✅  Backend (FastAPI) deployed to Render MAIN service
+✅  PostgreSQL database live
+✅  Frontend (React/Vercel) deployed
+✅  Sentry error monitoring — live (SENTRY_DSN set, 5% sample rate)
+✅  Telegram alerts — live (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID set)
+✅  ENABLE_GRADE_B_ALL=True deployed to MAIN (2026-11-11)
+
+--------------------------------------------------------------------------------
+ENGINE / BACKTEST (what's actually ON in production)
+--------------------------------------------------------------------------------
+✅  Option 3 (Grade B T1/T2 exits for all trades) — deployed MAIN 2026-11-11
+✅  Hard floor (Scenario C hybrid 2×) — deployed both branches
+✅  7-level trailing ratchet — always active
+✅  Daily klines bias (EMA21 slope) — active
+✅  Volume hour confirmation (with score ≥0.68 bypass) — active
+      NOTE: backtester volume bypass fix applied 2026-11-12
+
+WHAT IS OFF — DO NOT LIST AS DEPLOYED/VALIDATED IN LAUNCH MATERIALS:
+❌  ENABLE_MR_4H_GATE = False  (backtest Sharpe -0.29 — OFF)
+❌  ENABLE_T18        = False  (backtest Sharpe -0.22 — OFF; T6 MR exemption also reverted)
+❌  ENABLE_PAT_EXEC   = False  (backtest Sharpe -0.76 — OFF)
+❌  ENABLE_DC_FILTER  = False  (PASSED backtest — pending parity gate ≥80%)
+❌  ENABLE_GRID_V2    = False  (FAILED backtest 2/10 OOS)
+❌  ENABLE_GRID_MODULE = False (FAILED backtest 3/10 OOS)
+
+--------------------------------------------------------------------------------
+PENDING BEFORE LAUNCH (minimum requirements)
+--------------------------------------------------------------------------------
+⏳  Parity test ≥80% on MAIN after Option 3 live ≥1 week
+      Current: 41.4%  |  Target: 80%
+      Fixes applied 2026-11-12: volume bypass + date cap
+      Re-run: python3 run_parity_test.py --current-flags  (on Render MAIN shell)
+
+⏳  DC filter deploy (after parity passes):
+      ENABLE_DC_FILTER=True on MAIN only — REAL unchanged
+
+○   MR signal backtest (run_mr_backtest.py — ~90 min)
+      Pre-registered: MR ON vs OFF, same 4-gate protocol
+      Do NOT deploy result until backtest passes
+
+--------------------------------------------------------------------------------
+LEGAL / USER-FACING (must exist before accepting payment)
+--------------------------------------------------------------------------------
+○   User registration — currently DISABLED (routes_auth.py 403 on signup)
+      Action: admin toggle-signup endpoint, or enable via admin panel
+      Toggle: POST /admin/toggle-signup  (admin@demo.com credentials)
+
+○   Terms of Service page — does NOT exist in frontend
+      Required before charging $20/month
+      Minimum: risk disclaimer, refund policy, no-guarantee clause
+
+○   Risk disclaimer — does NOT exist on dashboard
+      Required: "Past performance does not guarantee future results.
+                 Crypto trading carries substantial risk of loss."
+
+○   Pricing page — no $20/month price set anywhere in codebase
+      $20/month was a planning target — not wired to Stripe or any payment flow
+      Action: stripe_price_id needs to be set + payment webhook wired
+
+--------------------------------------------------------------------------------
+PERFORMANCE REALITY (admin@demo.com — user-facing benchmark)
+--------------------------------------------------------------------------------
+  Net return Apr–Nov 2026: -$36.31 from $1,000 start
+  Peak: $1,181 (May 2026)  |  Current: $963.69
+  Real account (mes29571): -$3.70 from ~$37 start (NOT profitable)
+
+  DO NOT claim:
+  × "Real account profitable" — it is not
+  × "Sharpe +0.24" — this was a stale single-coin pre-Option-3 figure
+  × "30-45% yearly projection" — removed (backtest only shows this in trending months)
+
+  HONEST LAUNCH NARRATIVE:
+  "Demo account tracked from $1,000. Best month: +19% (May 2026, trending market).
+   Engine filters choppy conditions; DC filter (validated) pending deploy.
+   Past performance is not a guarantee."
+
+--------------------------------------------------------------------------------
+NEXT MILESTONES TO DEC 10
+--------------------------------------------------------------------------------
+  Week 1 (Nov 12-18): parity re-run after fixes; R:R analysis on live trades
+  Week 2 (Nov 19-25): DC filter deploy if parity ≥80%; MR backtest run
+  Week 3 (Nov 26–Dec 2): registration + ToS + risk disclaimer built into frontend
+  Week 4 (Dec 3-9):  Stripe payment flow; final pre-launch checks
+  Dec 10: SOFT LAUNCH — registration open to invited users only
+
+================================================================================
