@@ -83,12 +83,14 @@ def _live_family(reason: str) -> str:
     if not reason:
         return "UNKNOWN"
     r = reason.upper()
-    if any(k in r for k in ("SL", "STOP", "LOSS")):
-        return "LOSS"
-    if any(k in r for k in ("TP", "TARGET", "PROFIT")):
-        return "WIN"
-    if any(k in r for k in ("TRAIL", "BE", "BREAKEVEN")):
+    # Use full phrases — the reason field contains "SL (1×ATR): X%" in position
+    # details which would falsely match "SL". Full phrases avoid this.
+    if "TRAILING STOP" in r or "TRAIL STOP" in r:
         return "TRAIL"
+    if "TAKE PROFIT HIT" in r or "PROFIT HIT" in r:
+        return "WIN"
+    if "STOP LOSS HIT" in r or "STOP-LOSS" in r:
+        return "LOSS"
     return "UNKNOWN"
 
 def _bt_family(outcome: str) -> str:
@@ -108,18 +110,39 @@ def _bt_family(outcome: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fetch_trades(emails, days):
-    """Return trades for the given email list, last `days` days, sorted by time."""
+    """Return MINI_ASYM DAY_TRADE trades for the given email list, last `days` days."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
     placeholders = ",".join(["%s"] * len(emails))
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute(
             f"SELECT * FROM trades WHERE email IN ({placeholders}) AND time >= %s"
+            f" AND mode = 'MINI_ASYM'"
             f" ORDER BY time ASC",
             list(emails) + [cutoff],
         )
         rows = cur.fetchall()
     return [dict(r) for r in rows]
+
+
+def _dedup_entries(sym_trades):
+    """
+    Collapse T1/T2 Grade B pairs into one entry event per signal.
+
+    Live fires Grade B as two separate trade records (T1 60% + T2 40%) with
+    the SAME entry_price and side. The backtest has ONE record per signal.
+    Dedup by (side, entry_price) so T2 duplicates don't inflate the
+    unmatched count. We keep the first record (T1) as the representative.
+    """
+    seen = set()
+    deduped = []
+    for t in sym_trades:
+        ep  = round(float(t.get("entry_price") or 0.0), 4)
+        key = (t.get("side", "").upper(), ep)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(t)
+    return deduped
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Backtest runner
@@ -236,22 +259,11 @@ def compare(live, bt):
     """
     Returns list of (field, live_val, bt_val, note) tuples for every mismatch.
 
-    TP_PCT is intentionally excluded: backtest uses backtest_default_tp_mult=2.0
-    for DAY_TRADE, making backtest TP = 2× live TP by design. Not a bug.
+    SL_PCT excluded: live stores the FINAL sl (trailing-moved), not entry sl.
+    TP_PCT excluded: backtest_default_tp_mult=2.0 makes BT TP = 2× live by design.
+    Only EXIT_FAMILY is compared — the most meaningful behavioral check.
     """
     issues = []
-
-    # SL % — ATR-based, should match closely
-    l_sl = sl_pct(live)
-    b_sl = bt.get("sl_pct")
-    if l_sl is not None and b_sl is not None:
-        if abs(l_sl - b_sl) > TOL_SL_PCT:
-            issues.append((
-                "SL_PCT",
-                f"{l_sl*100:.3f}%",
-                f"{b_sl*100:.3f}%",
-                f"diff {abs(l_sl-b_sl)*100:.3f}%",
-            ))
 
     # Exit reason family — WIN / LOSS / TRAIL
     l_fam = _live_family(live.get("reason", ""))
@@ -259,7 +271,7 @@ def compare(live, bt):
     if l_fam != "UNKNOWN" and b_fam != "UNKNOWN" and l_fam != b_fam:
         issues.append((
             "EXIT_FAMILY",
-            f"{l_fam} ({live.get('reason','')})",
+            f"{l_fam}",
             f"{b_fam} ({bt.get('outcome','')})",
             "different exit type",
         ))
@@ -294,7 +306,7 @@ def main():
     pr(f"Flag set   : {flag_label}")
     pr(f"  enable_t16={flags['enable_t16']}  enable_t18={flags['enable_t18']}"
        f"  mr_gate={flags['enable_mr_4h_gate']}  t1_tp={flags['t1_tp_mult']}×")
-    pr(f"Match rule : same side · entry_price ±0.3% · SL ≤0.15% · same exit family")
+    pr(f"Match rule : same side · entry_price ±0.3% · same exit family (WIN/LOSS/TRAIL)")
     pr("=" * 76)
     pr()
 
@@ -304,7 +316,7 @@ def main():
         pr("No live/demo trades found in the last %d days. Exiting." % args.days)
         return
 
-    pr(f"Found {len(live_trades)} trade(s) across both accounts.")
+    pr(f"Found {len(live_trades)} trade(s) across both accounts (MINI_ASYM only).")
     pr()
 
     # 2. Group by symbol
@@ -313,10 +325,11 @@ def main():
         by_symbol[t["symbol"].upper()].append(t)
 
     # 3. Per-symbol: backtest + compare
-    total_live     = 0
-    total_matched  = 0
-    total_mismatch = 0
-    total_unmatched= 0
+    total_raw_trades = 0   # all individual live trade records
+    total_live       = 0   # deduplicated entry events (T1/T2 collapsed)
+    total_matched    = 0
+    total_mismatch   = 0
+    total_unmatched  = 0
 
     all_mismatches = []  # for summary section
 
@@ -330,29 +343,33 @@ def main():
         date_from = datetime.utcfromtimestamp((t_min_ms - pad_ms) / 1000).strftime("%Y-%m-%d")
         date_to   = datetime.utcfromtimestamp((t_min_ms + span_ms + pad_ms) / 1000).strftime("%Y-%m-%d")
 
+        raw_count   = len(sym_trades)
+        entry_events = _dedup_entries(sym_trades)  # T1/T2 collapsed
+        total_raw_trades += raw_count
+
         pr(f"{'─'*76}")
-        pr(f"SYMBOL: {symbol}   live trades: {len(sym_trades)}   period: {date_from} → {date_to}")
+        pr(f"SYMBOL: {symbol}   live trades: {raw_count} ({len(entry_events)} unique entries)   period: {date_from} → {date_to}")
         pr(f"{'─'*76}")
 
         try:
             bt_trades = run_backtest(symbol, date_from, date_to, flags)
         except Exception as exc:
             pr(f"  ERROR: backtest failed — {exc}")
-            total_unmatched += len(sym_trades)
-            total_live += len(sym_trades)
+            total_unmatched += len(entry_events)
+            total_live += len(entry_events)
             continue
 
         if not bt_trades:
             pr(f"  Backtest returned 0 trades.")
-            for lt in sym_trades:
-                pr(f"  NO_BT_SIGNAL  {fmt_ts(lt['time'])}  {lt['side']}")
+            for lt in entry_events:
+                pr(f"  NO_BT_SIGNAL  {fmt_ts(lt['time'])}  {lt['side']}  entry={float(lt.get('entry_price') or 0):.4f}")
                 total_unmatched += 1
-            total_live += len(sym_trades)
+            total_live += len(entry_events)
             continue
 
         used_bt_indices = set()
 
-        for lt in sym_trades:
+        for lt in entry_events:
             total_live += 1
             lt_side       = lt.get("side", "").upper()
             lt_entry_price = float(lt.get("entry_price") or 0.0)
@@ -411,14 +428,15 @@ def main():
     # ── Summary ───────────────────────────────────────────────────────────────
     pr("=" * 76)
     pr("SUMMARY")
-    pr(f"  Live/demo trades     : {total_live}")
+    pr(f"  Raw live trades      : {total_raw_trades}  (all T1+T2 records, MINI_ASYM only)")
+    pr(f"  Unique entry events  : {total_live}  (T1/T2 pairs collapsed to 1)")
     pr(f"  Matched to backtest  : {total_matched}  (entry_price ±0.3%, same side)")
     pr(f"  Unmatched            : {total_unmatched}  (no backtest entry at same price/side)")
-    pr(f"  Field mismatches     : {total_mismatch}  (of matched — SL or exit family differs)")
+    pr(f"  Exit-family mismatch : {total_mismatch}  (WIN/LOSS/TRAIL differs)")
     entry_pct = total_matched / total_live * 100 if total_live else 0.0
     clean_pct = (total_matched - total_mismatch) / total_live * 100 if total_live else 0.0
-    pr(f"  Entry match rate     : {entry_pct:.1f}%  (matched / total live  — target ≥80%)")
-    pr(f"  Clean parity rate    : {clean_pct:.1f}%  (no-mismatch / total live)")
+    pr(f"  Entry match rate     : {entry_pct:.1f}%  (matched / unique events — target ≥80%)")
+    pr(f"  Clean parity rate    : {clean_pct:.1f}%  (no exit mismatch / unique events)")
     pr()
 
     if all_mismatches:
