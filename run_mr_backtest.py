@@ -31,12 +31,13 @@ Output:
   mr_full_results.json
 """
 
-import json, os, sqlite3, statistics, sys, threading, time
+import json, os, statistics, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
 from backtester import start_backtest, get_run, init_backtest_tables
+from database import db_conn
 init_backtest_tables()
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -67,19 +68,17 @@ _lock = threading.Lock()
 _done = [0]
 _total_ref = [0]
 
-DB = "asymmetric_demo.db"
-
-
 def _already_done(email: str) -> bool:
-    conn = sqlite3.connect(DB)
-    cur  = conn.cursor()
-    cur.execute(
-        "SELECT 1 FROM backtest_runs WHERE email=? AND status='done' LIMIT 1",
-        (email,),
-    )
-    found = cur.fetchone() is not None
-    conn.close()
-    return found
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM backtest_runs WHERE email=%s AND status='done' LIMIT 1",
+                (email,),
+            )
+            return cur.fetchone() is not None
+    except Exception:
+        return False
 
 
 def _run(tag, coin, dfrom, dto, mr_on: bool, seed=None):
