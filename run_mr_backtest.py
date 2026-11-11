@@ -74,14 +74,16 @@ def _fetch_done(email: str):
         with db_conn() as conn:
             cur = conn.cursor()
             cur.execute(
-                "SELECT results FROM backtest_runs WHERE email=%s AND status='done' LIMIT 1",
+                "SELECT result_json FROM backtest_runs WHERE email=%s AND status='done' LIMIT 1",
                 (email,),
             )
             row = cur.fetchone()
         if not row:
             return None
-        raw = row[0] if isinstance(row, (list, tuple)) else row["results"]
-        return json.loads(raw) if isinstance(raw, str) else (raw or {})
+        raw = row[0] if isinstance(row, (list, tuple)) else row["result_json"]
+        if not raw:
+            return {}
+        return json.loads(raw) if isinstance(raw, str) else raw
     except Exception:
         return None
 
