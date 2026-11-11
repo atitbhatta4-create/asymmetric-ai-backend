@@ -221,7 +221,7 @@ def find_bt_match(live_entry_price, live_side, available_bt):
     Returns (best_bt, price_diff_pct) or (None, inf).
     """
     best, best_d = None, float("inf")
-    for bt in available_bt:
+    for _idx, bt in available_bt:  # available_bt is list of (i, bt) tuples
         if bt["side"].upper() != live_side.upper():
             continue
         if not bt.get("entry") or live_entry_price <= 0:
