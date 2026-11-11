@@ -17,7 +17,7 @@ Usage:
     nohup python3 run_revalidate.py >> revalidate.log 2>&1 &
 """
 
-import os, sys, sqlite3, statistics, time, json
+import os, sys, time, json
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -34,8 +34,6 @@ START_EQ = 1000.0
 OOS_FROM = "2024-01-01"
 OOS_TO   = "2026-11-01"
 TIMEOUT  = 25 * 60    # 25 min per run
-DB       = "asymmetric_demo.db"
-
 # Original OOS results from dc_core_full_report.txt (pre-volume-bypass-fix)
 REF_DC_OOS_WINNERS = {"ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT",
                       "ADAUSDT","LINKUSDT","BTCUSDT"}
@@ -45,32 +43,9 @@ SEP  = "=" * 68
 SEP2 = "-" * 68
 
 
-def _cached(email: str):
-    """Return cached results dict if run already done, else None."""
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    cur  = conn.cursor()
-    cur.execute(
-        "SELECT results FROM backtest_runs WHERE email=? AND status='done' LIMIT 1",
-        (email,)
-    )
-    row = conn.fetchone() if False else cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    try:
-        return json.loads(row["results"]) if row["results"] else {}
-    except Exception:
-        return {}
-
-
 def _run_one(tag: str, coin: str, dc: bool) -> dict:
-    email = f"reval-{tag}-{coin.lower()}@asym-internal"
-    cached = _cached(email)
-    if cached is not None:
-        print(f"  [cached] {tag} {coin}", flush=True)
-        return cached
-
+    # No caching — 20 runs take ~10 min, not worth the complexity on Render PG
+    email  = f"reval-{tag}-{coin.lower()}@asym-internal"
     run_id = start_backtest(
         email=email, symbol=coin, mode=MODE, style=STYLE,
         exchange=EXCHANGE, date_from=OOS_FROM, date_to=OOS_TO,
