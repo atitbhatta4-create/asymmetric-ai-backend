@@ -962,7 +962,8 @@ def _compute_signal_layers(
     enable_regime_gate: bool = False,
     enable_step2_score: bool = False,
     enable_dc_filter: bool = False,
-    enable_mr_signal: bool = True,   # MR ON/OFF backtest gate — default True (live behaviour)
+    enable_mr_signal: bool = True,    # MR ON/OFF backtest gate — default True (live behaviour)
+    enable_mr_4h_signal: bool = False, # 4h MR variant — fires on 4h BB/RSI instead of 1h
     score_floor: float = 0.0,
 ) -> Dict:
     """
@@ -1029,6 +1030,21 @@ def _compute_signal_layers(
         if enable_mr_signal else {"ok": False}
     )
 
+    # 4h MR variant: Bollinger/RSI/ADX checks on 4h candles, TP/SL in 1h ATR units.
+    # Fires only inside the regime block (same as 1h MR) — not in TRENDING.
+    _mr_4h: Dict = {"ok": False}
+    if enable_mr_4h_signal and higher_klines and len(higher_klines) >= 25:
+        _h4_closes = [k["close"] for k in higher_klines]
+        _h4_highs  = [k["high"]  for k in higher_klines]
+        _h4_lows   = [k["low"]   for k in higher_klines]
+        _h4_rsi    = _rsi(_h4_closes, 14)
+        _h4_adx    = _adx(_h4_highs, _h4_lows, _h4_closes, 14)
+        # Pass 1h atr so tp_atr_override is expressed in 1h ATR units (backtester sizing)
+        _mr_4h = _mean_reversion_signal(higher_klines, _h4_rsi, _h4_adx, atr, trend_4h="NEUTRAL")
+        if _mr_4h.get("ok"):
+            _mr_4h["signal_type"] = "MR_4H"
+            _mr_4h["log"] = _mr_4h.get("log", "").replace("MEAN REVERSION:", "MR_4H (4h klines):")
+
     # ── Phase 4: Regime classification (before any layer scoring) ────────────
     regime_class = _classify_regime(highs, lows, closes, adx, atr_pct, _atr_slow_pct=_atr_slow_pct_pc)
 
@@ -1047,9 +1063,9 @@ def _compute_signal_layers(
         )
 
     if regime_class["block"] or _regime_gate_blocked:
-        # Pick the highest-scoring alternative signal (T16 reversal or mean reversion)
+        # Pick the highest-scoring alternative signal (T16 reversal, 1h MR, or 4h MR)
         _alt = max(
-            [r for r in [_rev, _mr] if r.get("ok")],
+            [r for r in [_rev, _mr, _mr_4h] if r.get("ok")],
             key=lambda r: r["score"],
             default=None,
         )
