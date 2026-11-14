@@ -947,6 +947,8 @@ def _run_worker(
     gv2_cooldown:   int   = 4,
     gv2_equity_pct: float = 0.25,
     enable_sentiment_filter: bool = False,
+    enable_pattern_gate: bool = False,
+    enable_pattern_boost: bool = False,
 ) -> None:
     _last_db_write = [0.0]  # throttle DB progress writes
 
@@ -1548,6 +1550,8 @@ def _run_worker(
                     enable_sentiment_filter=enable_sentiment_filter,
                     fng_score=_fng_score,
                     score_floor=score_floor,
+                    enable_pattern_gate=enable_pattern_gate,
+                    enable_pattern_boost=enable_pattern_boost,
                     _precomp={**_precomp, "idx": i},
                 )
 
@@ -1807,6 +1811,8 @@ def start_backtest(
     gv2_cooldown:   int   = 4,
     gv2_equity_pct: float = 0.25,
     enable_sentiment_filter: bool = False,
+    enable_pattern_gate: bool = False,
+    enable_pattern_boost: bool = False,
 ) -> str:
     """Validate inputs, create DB record, start background thread, return run_id."""
     from datetime import datetime
@@ -1866,7 +1872,7 @@ def start_backtest(
               enable_grid, enable_dc_core, dc_long_cut, dc_short_cut,
               enable_grid_v2, gv2_adx_thresh, gv2_n_candles, gv2_max_levels,
               gv2_step_mult, gv2_buffer_atr, gv2_cooldown, gv2_equity_pct,
-              enable_sentiment_filter),
+              enable_sentiment_filter, enable_pattern_gate, enable_pattern_boost),
         daemon=True,
     )
     t.start()

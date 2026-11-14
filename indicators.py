@@ -968,6 +968,8 @@ def _compute_signal_layers(
     enable_sentiment_filter: bool = False, # Step 7: F&G extreme gate
     fng_score: Optional[int] = None,     # pre-fetched F&G score (0-100); None = no filter
     score_floor: float = 0.0,
+    enable_pattern_gate: bool = False,   # require _raw_pat >= 0.65 (momentum+) to fire — blocks basic bullish/bearish closes
+    enable_pattern_boost: bool = False,  # upgrade grade B → A when _raw_pat >= 0.85 (hammer/engulfing/three_white_soldiers)
 ) -> Dict:
     """
     4-layer scored signal analysis.
@@ -1422,12 +1424,17 @@ def _compute_signal_layers(
     # the EMA21 zone but the last candle is still bearish on a LONG setup,
     # the entry is not ready yet. Wait for a bullish close to confirm the bounce.
     against_trend_candle = pattern_name == "against_trend"
+    # Pattern gate: when enabled, also block micro candles and basic directional closes
+    # (bullish/bearish score 0.50) — only momentum or stronger patterns allowed.
+    _pat_gate_block = enable_pattern_gate and _raw_pat < 0.65 and not against_trend_candle
+    _entry_blocked = against_trend_candle or _pat_gate_block
     ent_reason = (
         f"RSI divergence noted — ignored in strong trend (ADX {adx:.0f}≥45)" if (div_detected and _strong_trend_adx)
         else f"RSI divergence — price at new extreme but RSI disagrees, trend may be weakening" if div_detected
         else f"Price {pb_pct*100:.1f}% from EMA21 — need <{p['pullback_max']*100:.1f}% to enter" if pullback_score == 0
         else f"RSI {rsi:.0f} outside entry zone {p['rsi_min']}–{p['rsi_max']}" if not rsi_in_range
         else f"Candle closed against trade direction — wait for {'bullish' if desired_side == 'LONG' else 'bearish'} close to confirm bounce" if against_trend_candle
+        else f"Pattern gate: {pattern_name} (score {_raw_pat:.2f}) — need momentum/inside_bar/hammer/engulfing to confirm entry" if _pat_gate_block
         else f"Candle pattern weak ({pattern_name}) — wait for pin bar or engulfing at EMA21" if pattern_score < 0.40
         else f"Weak bounce — reversal candle body too small vs prior opposing move" if struct_label == "WEAK_BOUNCE"
         else ""
@@ -1442,8 +1449,7 @@ def _compute_signal_layers(
         "rsi":                round(rsi or 0, 1),
         "rsi_range":          f"{p['rsi_min']}–{p['rsi_max']}",
         "rsi_divergence":     div_detected,
-        # against_trend is a hard fail regardless of RSI/pullback quality
-        "score": entry_score, "ok": entry_score > 0.25 and not against_trend_candle, "reason": ent_reason,
+        "score": entry_score, "ok": entry_score > 0.25 and not _entry_blocked, "reason": ent_reason,
     }
 
     # ── Layer 4: Momentum — candle alignment + volume confirmation ────────
@@ -1560,6 +1566,14 @@ def _compute_signal_layers(
     # then fell to the else-branch in _run_loop and fired as accidental Grade A.
     grade = "A" if total_score >= 0.78 else "B"
 
+    # Pattern boost: strong entry candle (hammer/engulfing/three_white_soldiers)
+    # upgrades Grade B → A for full position sizing. Score already confirmed
+    # by other layers — the pattern is a final high-conviction signal.
+    _pat_boosted = False
+    if enable_pattern_boost and grade == "B" and _raw_pat >= 0.85:
+        grade = "A"
+        _pat_boosted = True
+
     # ── 15m Multi-Timeframe Momentum Confirmation ─────────────────────────
     # DAY_TRADE and SWING: check 15m chart as a 3rd confirmation layer after
     # the 4h (regime/direction) and 1h (entry) both pass.
@@ -1658,6 +1672,7 @@ def _compute_signal_layers(
         "mtf_size_mult": mtf_size_mult,
         "strong_trend_override": strong_trend_override,
         "candle_pattern": pattern_name,
+        "pattern_boosted": _pat_boosted,
     }
 
 

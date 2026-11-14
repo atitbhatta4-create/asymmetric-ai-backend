@@ -113,7 +113,9 @@ ENABLE_GRID_MODULE  = False  # Step 4: ranging-only grid entries (Donchian chann
 ENABLE_DC_FILTER    = False  # Donchian core: daily/4h trend direction gate (block against HTF trend)
 ENABLE_GRID_V2      = False  # Grid v2: multi-level mean-reversion grid for RANGING markets (backtest only)
 ENABLE_MR_4H_SIGNAL      = False  # 4h MR variant: replace 1h MR with 4h BB/RSI signal (PASSED backtest 2026-11-14)
-ENABLE_SENTIMENT_FILTER  = False  # Step 7: F&G extreme gate (backtest pending)
+ENABLE_SENTIMENT_FILTER  = False  # Step 7: F&G extreme gate (FAILED backtest 2026-11-14)
+ENABLE_PATTERN_GATE      = False  # Pattern confirmation: require momentum/hammer/engulfing+ to fire (backtest pending)
+ENABLE_PATTERN_BOOST     = False  # Pattern boost: upgrade Grade B→A on strong patterns (backtest pending)
 # ──────────────────────────────────────────────────────────────────────────────
 
 import sentry_sdk
@@ -2917,6 +2919,8 @@ class AutoRunner:
             enable_mr_4h_signal=ENABLE_MR_4H_SIGNAL,
             enable_sentiment_filter=ENABLE_SENTIMENT_FILTER,
             fng_score=get_live_fng() if ENABLE_SENTIMENT_FILTER else None,
+            enable_pattern_gate=ENABLE_PATTERN_GATE,
+            enable_pattern_boost=ENABLE_PATTERN_BOOST,
         )
 
         # Enforce side restriction from weekly filter or parabolic regime
