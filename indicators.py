@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Literal
 from config import now_dubai, DUBAI_TZ
 from coin_params import get_coin_params
+from sentiment import apply_sentiment_gate
 
 RiskMode = Literal["ULTRA_SAFE", "SAFE", "NORMAL", "MINI_ASYM", "AGGRESSIVE"]
 
@@ -962,8 +963,10 @@ def _compute_signal_layers(
     enable_regime_gate: bool = False,
     enable_step2_score: bool = False,
     enable_dc_filter: bool = False,
-    enable_mr_signal: bool = True,    # MR ON/OFF backtest gate — default True (live behaviour)
-    enable_mr_4h_signal: bool = False, # 4h MR variant — fires on 4h BB/RSI instead of 1h
+    enable_mr_signal: bool = True,       # MR ON/OFF backtest gate — default True (live behaviour)
+    enable_mr_4h_signal: bool = False,   # 4h MR variant — fires on 4h BB/RSI instead of 1h
+    enable_sentiment_filter: bool = False, # Step 7: F&G extreme gate
+    fng_score: Optional[int] = None,     # pre-fetched F&G score (0-100); None = no filter
     score_floor: float = 0.0,
 ) -> Dict:
     """
@@ -1070,6 +1073,17 @@ def _compute_signal_layers(
             default=None,
         )
         if _alt and not _regime_gate_blocked:
+            _sent_block = (
+                apply_sentiment_gate(_alt["side"], fng_score)
+                if enable_sentiment_filter else None
+            )
+            if _sent_block:
+                return {
+                    "ok": False, "blocked": _sent_block,
+                    "signal": "BLOCKED", "score": 0.0, "breakdown": {},
+                    "side": None, "adaptive_strictness": adaptive_strictness,
+                    "market_regime": regime_class["regime"],
+                }
             return {
                 "ok": True, "signal": _alt["signal_type"], "side": _alt["side"],
                 "score": _alt["score"], "grade": _alt["grade"],
@@ -1618,6 +1632,18 @@ def _compute_signal_layers(
             "mtf_confirmed": mtf_confirmed,
             "mtf_size_mult": mtf_size_mult,
         }
+
+    # Step 7: Sentiment gate — applied last so all other layers already confirmed
+    if enable_sentiment_filter:
+        _sent_block = apply_sentiment_gate(desired_side, fng_score)
+        if _sent_block:
+            return {
+                "ok": False, "blocked": _sent_block,
+                "signal": "BLOCKED", "score": 0.0, "breakdown": breakdown,
+                "side": desired_side, "atr_pct": atr_pct,
+                "market_regime": regime_class["regime"],
+                "adaptive_strictness": adaptive_strictness,
+            }
 
     return {
         "ok": True, "blocked": None,

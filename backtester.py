@@ -946,6 +946,7 @@ def _run_worker(
     gv2_buffer_atr: float = 0.75,
     gv2_cooldown:   int   = 4,
     gv2_equity_pct: float = 0.25,
+    enable_sentiment_filter: bool = False,
 ) -> None:
     _last_db_write = [0.0]  # throttle DB progress writes
 
@@ -1082,6 +1083,15 @@ def _run_worker(
             "adx":   _adx_vals,
             "atr50": _atr_series(_all_highs, _all_lows, _all_closes, 50),
         }
+
+        # Load F&G history once per run (tiny — ~2000 rows, negligible memory)
+        _fng_history: dict = {}
+        if enable_sentiment_filter:
+            try:
+                from sentiment import load_fng_history, fng_at_ts
+                _fng_history = load_fng_history()
+            except Exception:
+                pass
 
         # Random-entry benchmark: deterministic RNG, bypasses signal computation
         _rng = _random_module.Random(random_seed) if random_seed is not None else None
@@ -1516,6 +1526,14 @@ def _run_worker(
                         }
                     continue  # skip full signal chain regardless
 
+                _fng_score = None
+                if enable_sentiment_filter and _fng_history:
+                    try:
+                        from sentiment import fng_at_ts as _fng_at_ts
+                        _fng_score = _fng_at_ts(_fng_history, candle["t"])
+                    except Exception:
+                        pass
+
                 sig = _compute_signal_layers(
                     klines, mode, 1.0, higher_slice, style, mtf_slice,
                     enable_t16=enable_t16, enable_s4=enable_s4, symbol=symbol,
@@ -1527,6 +1545,8 @@ def _run_worker(
                     enable_mr_4h_signal=enable_mr_4h_signal,
                     enable_regime_gate=enable_regime_gate,
                     enable_step2_score=enable_step2_score,
+                    enable_sentiment_filter=enable_sentiment_filter,
+                    fng_score=_fng_score,
                     score_floor=score_floor,
                     _precomp={**_precomp, "idx": i},
                 )
@@ -1786,6 +1806,7 @@ def start_backtest(
     gv2_buffer_atr: float = 0.75,
     gv2_cooldown:   int   = 4,
     gv2_equity_pct: float = 0.25,
+    enable_sentiment_filter: bool = False,
 ) -> str:
     """Validate inputs, create DB record, start background thread, return run_id."""
     from datetime import datetime
@@ -1844,7 +1865,8 @@ def start_backtest(
               t1_tp_mult, enable_floor, random_seed, score_floor, e2_hold_mult,
               enable_grid, enable_dc_core, dc_long_cut, dc_short_cut,
               enable_grid_v2, gv2_adx_thresh, gv2_n_candles, gv2_max_levels,
-              gv2_step_mult, gv2_buffer_atr, gv2_cooldown, gv2_equity_pct),
+              gv2_step_mult, gv2_buffer_atr, gv2_cooldown, gv2_equity_pct,
+              enable_sentiment_filter),
         daemon=True,
     )
     t.start()

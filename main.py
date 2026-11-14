@@ -47,6 +47,7 @@ from indicators import (
 from coin_params import get_coin_params
 from mode_params import get_mode_config, get_style_config
 from data_feeds import _fetch_btc_weekly_candles, _fetch_economic_calendar
+from sentiment import get_live_fng
 from auth_helpers import require_user, require_admin, ADMIN_EMAILS
 from user_state import (
     encrypt_key, decrypt_key, mask_key,
@@ -111,7 +112,8 @@ ENABLE_GRADE_B_ALL  = True   # Option 3: all trades use Grade B T1/T2 exits rega
 ENABLE_GRID_MODULE  = False  # Step 4: ranging-only grid entries (Donchian channel, breakout stop)
 ENABLE_DC_FILTER    = False  # Donchian core: daily/4h trend direction gate (block against HTF trend)
 ENABLE_GRID_V2      = False  # Grid v2: multi-level mean-reversion grid for RANGING markets (backtest only)
-ENABLE_MR_4H_SIGNAL = False  # 4h MR variant: replace 1h MR with 4h BB/RSI signal (PASSED backtest 2026-11-14)
+ENABLE_MR_4H_SIGNAL      = False  # 4h MR variant: replace 1h MR with 4h BB/RSI signal (PASSED backtest 2026-11-14)
+ENABLE_SENTIMENT_FILTER  = False  # Step 7: F&G extreme gate (backtest pending)
 # ──────────────────────────────────────────────────────────────────────────────
 
 import sentry_sdk
@@ -2913,6 +2915,8 @@ class AutoRunner:
             enable_dc_filter=ENABLE_DC_FILTER,
             enable_mr_signal=(not ENABLE_MR_4H_SIGNAL),  # OFF when 4h MR takes over
             enable_mr_4h_signal=ENABLE_MR_4H_SIGNAL,
+            enable_sentiment_filter=ENABLE_SENTIMENT_FILTER,
+            fng_score=get_live_fng() if ENABLE_SENTIMENT_FILTER else None,
         )
 
         # Enforce side restriction from weekly filter or parabolic regime
