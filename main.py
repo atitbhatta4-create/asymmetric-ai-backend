@@ -111,6 +111,7 @@ ENABLE_GRADE_B_ALL  = True   # Option 3: all trades use Grade B T1/T2 exits rega
 ENABLE_GRID_MODULE  = False  # Step 4: ranging-only grid entries (Donchian channel, breakout stop)
 ENABLE_DC_FILTER    = False  # Donchian core: daily/4h trend direction gate (block against HTF trend)
 ENABLE_GRID_V2      = False  # Grid v2: multi-level mean-reversion grid for RANGING markets (backtest only)
+ENABLE_MR_4H_SIGNAL = False  # 4h MR variant: replace 1h MR with 4h BB/RSI signal (PASSED backtest 2026-11-14)
 # ──────────────────────────────────────────────────────────────────────────────
 
 import sentry_sdk
@@ -2910,6 +2911,8 @@ class AutoRunner:
             enable_regime_gate=ENABLE_REGIME_GATE,
             enable_step2_score=ENABLE_STEP2_SCORE,
             enable_dc_filter=ENABLE_DC_FILTER,
+            enable_mr_signal=(not ENABLE_MR_4H_SIGNAL),  # OFF when 4h MR takes over
+            enable_mr_4h_signal=ENABLE_MR_4H_SIGNAL,
         )
 
         # Enforce side restriction from weekly filter or parabolic regime
