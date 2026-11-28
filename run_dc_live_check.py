@@ -103,19 +103,19 @@ def get_trade_counts(days: int):
         # Last N days
         cur.execute("""
             SELECT COUNT(*) FROM trades
-            WHERE created_at >= %s
+            WHERE opened_at >= %s
               AND signal_type = 'MINI_ASYM'
               AND entry_type = 'T1'
-        """, (cut1,))
+        """, (cut1.isoformat(),))
         recent = cur.fetchone()[0]
 
         # Prior N days
         cur.execute("""
             SELECT COUNT(*) FROM trades
-            WHERE created_at >= %s AND created_at < %s
+            WHERE opened_at >= %s AND opened_at < %s
               AND signal_type = 'MINI_ASYM'
               AND entry_type = 'T1'
-        """, (cut2, cut1))
+        """, (cut2.isoformat(), cut1.isoformat()))
         prior = cur.fetchone()[0]
 
     return recent, prior
@@ -127,15 +127,15 @@ def get_recent_trades(days: int):
     with db_conn() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT t.symbol, t.side, t.entry_price, t.created_at,
+            SELECT t.symbol, t.side, t.entry_price, t.opened_at,
                    t.outcome, t.pnl_pct
             FROM trades t
-            WHERE t.created_at >= %s
+            WHERE t.opened_at >= %s
               AND t.signal_type = 'MINI_ASYM'
               AND t.entry_type = 'T1'
-            ORDER BY t.created_at DESC
+            ORDER BY t.opened_at DESC
             LIMIT 20
-        """, (since,))
+        """, (since.isoformat(),))
         return cur.fetchall()
 
 
